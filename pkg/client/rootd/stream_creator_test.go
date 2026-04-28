@@ -1,11 +1,36 @@
 package rootd
 
 import (
+	"context"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+
+	rpc "github.com/telepresenceio/telepresence/rpc/v2/daemon"
+	"github.com/telepresenceio/telepresence/v2/pkg/client"
 )
+
+func TestCreateSessionCleansDNSRoutingBeforeKubeconfig(t *testing.T) {
+	ctx := client.WithConfig(context.Background(), client.GetDefaultConfig())
+
+	called := false
+	oldCleanupDNSRouting := cleanupDNSRouting
+	cleanupDNSRouting = func(context.Context) {
+		called = true
+	}
+	t.Cleanup(func() {
+		cleanupDNSRouting = oldCleanupDNSRouting
+	})
+
+	_, err := createSession(ctx, ctx, &rpc.NetworkConfig{
+		KubeconfigData: []byte("not: [valid"),
+	}, make(chan time.Time))
+
+	require.Error(t, err)
+	require.True(t, called)
+}
 
 func TestIsAlsoProxyDestination(t *testing.T) {
 	s := &session{

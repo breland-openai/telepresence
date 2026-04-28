@@ -55,6 +55,8 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/vif"
 )
 
+var cleanupDNSRouting = dns.CleanupRouting
+
 type agentSubnet struct {
 	netip.Prefix
 	workload string
@@ -205,6 +207,7 @@ type session struct {
 // createSession will establish a connection to the traffic-manager and return a new properly initialized session object.
 func createSession(sessionCtx, dialCtx context.Context, mi *rpc.NetworkConfig, activity chan<- time.Time) (s *session, err error) {
 	clog.Info(sessionCtx, "-- Starting new session")
+	cleanupDNSRouting(sessionCtx)
 	kc, err := k8s.NewKubeconfig(sessionCtx, true, mi.KubeFlags, mi.ManagerNamespace, mi.KubeconfigData)
 	if err != nil {
 		return nil, err
