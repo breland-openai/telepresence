@@ -526,7 +526,7 @@ func CheckTimeout(ctx context.Context, err error) error {
 const (
 	defaultTimeoutsClusterConnect        = 20 * time.Second
 	defaultTimeoutsConnectivityCheck     = 500 * time.Millisecond
-	defaultTimeoutsEndpointDial          = 3 * time.Second
+	defaultTimeoutsEndpointDial          = 15 * time.Second
 	defaultTimeoutsHelm                  = 30 * time.Second
 	defaultTimeoutsIntercept             = 30 * time.Second
 	defaultTimeoutsInterceptEndpointDial = 15 * time.Second
