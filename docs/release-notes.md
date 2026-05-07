@@ -243,12 +243,19 @@ Injected init containers now route pod IP output traffic through the same traffi
 Selected-intercept dial responders are now capped so bursty workloads cannot make the client daemon fan out unbounded goroutines and gRPC tunnels. VIF open failures also return a plain nil device and tolerate partially initialized Linux devices during cleanup, making failed setup paths safer.
 </div>
 
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Improve selected-intercept tunnel stability</div></div>
+<div style="margin-left: 15px">
+
+Selected-intercept tunnels now reconnect agent dial watchers with backoff, clean up pending forward state more carefully, and use dedicated timeouts for traffic-agent connects and intercepted endpoint dials. Telepresence also rejects queued dial requests when responder capacity is saturated, giving busy intercepts a clearer failure mode instead of letting work grow without limit.
+</div>
+
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[Use loopback address for kubeauth exec stub](https://github.com/telepresenceio/telepresence/issues/4107)</div></div>
 <div style="margin-left: 15px">
 
 The patched kubeconfig that the root daemon uses embeds the user daemon's gRPC address for the <code>telepresence kubeauth</code> exec stub. When the user daemon listens on an unspecified address (for example <code>[::]:PORT</code> on a dual-stack host), that literal address was embedded as the dial target, which fails on macOS and causes exec-based authenticators such as kubelogin to return a broken pipe. The embedded address now normalizes an unspecified listener address to the matching loopback (<code>127.0.0.1</code> or <code>::1</code>) so the stub can always reach the user daemon.
 </div>
 
+## Version 2.27.5
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[Clear agent intercept snapshot on reconnect to prevent stale intercepts](https://github.com/telepresenceio/telepresence/issues/4095)</div></div>
 <div style="margin-left: 15px">
 
@@ -2249,4 +2256,3 @@ The helm chart now correctly handles custom agentInjector.webhook.port that was 
 
 Params .intercept.disableGlobal and .timeouts.agentArrival are now correctly honored.
 </div>
-

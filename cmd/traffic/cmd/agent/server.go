@@ -109,7 +109,12 @@ func (s *state) WatchDial(session *rpc.SessionInfo, server agent.Agent_WatchDial
 	sid := tunnel.SessionID(session.SessionId)
 	s.dialWatchers.Store(sid, drCh)
 	defer func() {
-		s.dialWatchers.Delete(sid)
+		s.dialWatchers.Compute(sid, func(current chan *rpc.DialRequest, loaded bool) (chan *rpc.DialRequest, xsync.ComputeOp) {
+			if loaded && current == drCh {
+				return nil, xsync.DeleteOp
+			}
+			return current, xsync.CancelOp
+		})
 	}()
 
 	for {
@@ -132,6 +137,8 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 ) (tunnel.Stream, error) {
 	clog.Debugf(ctx, "Creating tunnel to client %s for id %s", sessionID, id)
 	var drCh chan<- *rpc.DialRequest
+	var awc *xsync.Map[tunnel.ConnID, *awaitingForward]
+	var aw *awaitingForward
 	var stCh <-chan tunnel.Stream
 
 	// A retry is needed here because what actually happens is that the dial watcher channel drCh is inserted when the
@@ -141,10 +148,10 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 		var ok bool
 		drCh, ok = s.dialWatchers.Load(sessionID)
 		if ok {
-			awc, _ := s.awaitingForwards.LoadOrCompute(sessionID, func() (*xsync.Map[tunnel.ConnID, *awaitingForward], bool) {
+			awc, _ = s.awaitingForwards.LoadOrCompute(sessionID, func() (*xsync.Map[tunnel.ConnID, *awaitingForward], bool) {
 				return xsync.NewMap[tunnel.ConnID, *awaitingForward](), false
 			})
-			aw, _ := awc.LoadOrCompute(id, func() (*awaitingForward, bool) {
+			aw, _ = awc.LoadOrCompute(id, func() (*awaitingForward, bool) {
 				return &awaitingForward{
 					streamCh: make(chan tunnel.Stream),
 					doneCh:   ctx.Done(),
@@ -158,15 +165,34 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if awc != nil && aw != nil {
+			awc.Compute(id, func(current *awaitingForward, loaded bool) (*awaitingForward, xsync.ComputeOp) {
+				if loaded && current == aw {
+					return nil, xsync.DeleteOp
+				}
+				return current, xsync.CancelOp
+			})
+		}
+	}()
 
-	drCh <- &rpc.DialRequest{ConnId: []byte(id), DialTimeout: int64(dialTimeout), RoundtripLatency: int64(roundTripLatency)}
+	requestStart := time.Now()
+	select {
+	case <-ctx.Done():
+		clog.Errorf(ctx, "unable to send DialRequest to client %s for id %s: %v", sessionID, id, ctx.Err())
+		return nil, ctx.Err()
+	case drCh <- &rpc.DialRequest{ConnId: []byte(id), DialTimeout: int64(dialTimeout), RoundtripLatency: int64(roundTripLatency)}:
+		if sendDuration := time.Since(requestStart); sendDuration > 100*time.Millisecond {
+			clog.Debugf(ctx, "Sent DialRequest to client %s for id %s after %s", sessionID, id, sendDuration)
+		}
+	}
 
 	select {
 	case <-ctx.Done():
-		clog.Errorf(ctx, "unable to create tunnel to client %s for id %s: %v", sessionID, id, ctx.Done())
+		clog.Errorf(ctx, "unable to create tunnel to client %s for id %s after %s: %v", sessionID, id, time.Since(requestStart), ctx.Err())
 		return nil, ctx.Err()
 	case stream := <-stCh:
-		clog.Debugf(ctx, "Created tunnel to client %s for id %s", sessionID, id)
+		clog.Debugf(ctx, "Created tunnel to client %s for id %s in %s", sessionID, id, time.Since(requestStart))
 		return stream, nil
 	}
 }
