@@ -320,10 +320,10 @@ func (ac *client) runDialWatcher(ctx context.Context, watchID uint64) {
 
 		if err != nil {
 			clog.Warnf(ctx, "dial watcher for %s ended; reconnecting: %v", ac, err)
+			ac.resetAgentClient()
 		} else {
 			clog.Warnf(ctx, "dial watcher for %s ended unexpectedly; reconnecting", ac)
 		}
-		ac.resetAgentClient()
 
 		delay := bo.NextBackOff()
 		timer := time.NewTimer(delay)

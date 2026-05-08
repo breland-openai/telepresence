@@ -162,7 +162,7 @@ func (h *dialer) Start(ctx context.Context) {
 			if dstAddr.Is6() {
 				addr, err := sr.Resolve(dstAddr)
 				if err != nil {
-					clog.Errorf(ctx, "!> %s %s, failed to establish connection: %v", tag, id, err)
+					clog.Errorf(ctx, "!> %s %s session=%s timeout=%s, failed to establish connection: %v", tag, id, h.stream.SessionID(), dto, err)
 					h.connected = notConnected
 					return
 				}
@@ -194,7 +194,7 @@ func (h *dialer) Start(ctx context.Context) {
 				return err
 			}, backoff.WithContext(backoff.NewConstantBackOff(time.Second), dtoCtx))
 			if err != nil {
-				clog.Errorf(ctx, "!> %s %s, failed to establish connection after %s: %v", tag, id, time.Since(dialStart), err)
+				clog.Errorf(ctx, "!> %s %s session=%s timeout=%s, failed to establish connection after %s: %v", tag, id, h.stream.SessionID(), dto, time.Since(dialStart), err)
 				if err = h.stream.Send(ctx, NewMessage(DialReject, nil)); err != nil {
 					clog.Errorf(ctx, "!> %s %s, failed to send DialReject: %v", tag, id, err)
 				}
