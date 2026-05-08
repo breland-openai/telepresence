@@ -76,7 +76,7 @@ func (s *state) Tunnel(server agent.Agent_TunnelServer) error {
 			awf.streamCh <- stream
 			<-awf.doneCh
 			if elapsed := time.Since(tunnelStart); elapsed > clientTunnelSlowAfter {
-				clog.Warnf(ctx, "agent tunnel for awaited client stream stayed open for %s: session=%s conn=%s", elapsed.Round(time.Millisecond), stream.SessionID(), stream.ID())
+				clog.Debugf(ctx, "agent tunnel for awaited client stream stayed open for %s: session=%s conn=%s", elapsed.Round(time.Millisecond), stream.SessionID(), stream.ID())
 			}
 			return nil
 		}
@@ -92,7 +92,7 @@ func (s *state) Tunnel(server agent.Agent_TunnelServer) error {
 	endPoint.Start(ctx)
 	<-endPoint.Done()
 	if elapsed := time.Since(tunnelStart); elapsed > clientTunnelSlowAfter {
-		clog.Warnf(ctx, "agent tunnel endpoint stayed open for %s: session=%s conn=%s", elapsed.Round(time.Millisecond), stream.SessionID(), stream.ID())
+		clog.Debugf(ctx, "agent tunnel endpoint stayed open for %s: session=%s conn=%s", elapsed.Round(time.Millisecond), stream.SessionID(), stream.ID())
 	}
 
 	if reporting {
