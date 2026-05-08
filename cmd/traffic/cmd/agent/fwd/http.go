@@ -26,8 +26,8 @@ import (
 )
 
 const (
-	httpInterceptSlowAfter = time.Second
-	httpInterceptVerySlow  = 5 * time.Second
+	httpInterceptSlowAfter = 2 * time.Second
+	httpInterceptVerySlow  = 10 * time.Second
 
 	httpInterceptMaxIdleConns        = 512
 	httpInterceptMaxIdleConnsPerHost = 128
