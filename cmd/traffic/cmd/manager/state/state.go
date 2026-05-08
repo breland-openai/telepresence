@@ -710,7 +710,7 @@ func (s *State) clientTunnel(ctx context.Context, client *ClientSession, stream 
 	endPoint.Start(ctx)
 	<-endPoint.Done()
 	if elapsed := time.Since(start); elapsed > time.Second {
-		clog.Warnf(ctx, "manager client tunnel stayed open for %s: session=%s conn=%s", elapsed.Round(time.Millisecond), stream.SessionID(), stream.ID())
+		clog.Debugf(ctx, "manager client tunnel stayed open for %s: session=%s conn=%s", elapsed.Round(time.Millisecond), stream.SessionID(), stream.ID())
 	}
 	return nil
 }
