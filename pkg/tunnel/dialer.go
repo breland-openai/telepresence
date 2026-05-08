@@ -30,6 +30,7 @@ const (
 	tcpConnTTL       = 2 * time.Hour // Default tcp_keepalive_time on Linux
 	udpConnTTL       = 2 * time.Second
 	localDialTimeout = 2 * time.Second
+	slowDialResponse = 2 * time.Second
 )
 
 // Limit selected-intercept dial responders so bursty workloads cannot create
@@ -574,6 +575,13 @@ func dialReject(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.D
 
 func dialRespond(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.DialRequest, sessionID SessionID, metrics DialMetrics) {
 	id := ConnID(dr.ConnId)
+	respondStart := time.Now()
+	var slowLogged atomic.Bool
+	slowTimer := time.AfterFunc(slowDialResponse, func() {
+		slowLogged.Store(true)
+		clog.Warnf(ctx, "!! %s %s, dial response still active after %s for session %s", tag, id, time.Since(respondStart).Round(time.Millisecond), sessionID)
+	})
+	defer slowTimer.Stop()
 	ctx, cancel := context.WithCancel(ctx)
 	tunnelStart := time.Now()
 	mt, err := tunnelProvider.Tunnel(ctx)
@@ -586,7 +594,9 @@ func dialRespond(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.
 		return
 	}
 	tunnelDuration := time.Since(tunnelStart)
-	if tunnelDuration > 100*time.Millisecond {
+	if tunnelDuration > time.Second {
+		clog.Warnf(ctx, "   %s %s, Tunnel stream established slowly in %s", tag, id, tunnelDuration.Round(time.Millisecond))
+	} else if tunnelDuration > 100*time.Millisecond {
 		clog.Debugf(ctx, "   %s %s, Tunnel stream established in %s", tag, id, tunnelDuration)
 	}
 	streamStart := time.Now()
@@ -600,10 +610,28 @@ func dialRespond(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.
 		return
 	}
 	streamDuration := time.Since(streamStart)
-	if streamDuration > 100*time.Millisecond {
+	if streamDuration > time.Second {
+		clog.Warnf(ctx, "   %s %s, client stream handshake completed slowly in %s", tag, id, streamDuration.Round(time.Millisecond))
+	} else if streamDuration > 100*time.Millisecond {
 		clog.Debugf(ctx, "   %s %s, client stream handshake completed in %s", tag, id, streamDuration)
 	}
-	d := NewDialer(s, cancel, nil, nil)
+	ingressBytes := NewCounterProbe("FromClientBytes")
+	egressBytes := NewCounterProbe("ToClientBytes")
+	d := NewDialer(s, cancel, ingressBytes, egressBytes)
 	d.Start(ctx)
 	<-d.Done()
+	if elapsed := time.Since(respondStart); slowLogged.Load() || elapsed > slowDialResponse {
+		clog.Warnf(
+			ctx,
+			"!! %s %s, dial response ended after %s for session %s: ingressBytes=%d egressBytes=%d context=%v cause=%v",
+			tag,
+			id,
+			elapsed.Round(time.Millisecond),
+			sessionID,
+			ingressBytes.GetValue(),
+			egressBytes.GetValue(),
+			ctx.Err(),
+			context.Cause(ctx),
+		)
+	}
 }
