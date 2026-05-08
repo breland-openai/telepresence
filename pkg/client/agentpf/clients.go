@@ -250,12 +250,25 @@ func (ac *client) resetAgentClient() {
 }
 
 func (ac *client) runDialWatcher(ctx context.Context, watchID uint64) {
+	started := time.Now()
+	clog.Debugf(ctx, "dial watcher %d starting for %s", watchID, ac)
 	defer func() {
 		ac.Lock()
 		if ac.dialWatchID == watchID {
 			ac.cancelDialWatch = nil
 		}
 		ac.Unlock()
+		clog.Debugf(
+			ctx,
+			"dial watcher %d stopped for %s after %s: context=%v cause=%v activeTunnels=%d intercepted=%t",
+			watchID,
+			ac,
+			time.Since(started).Round(time.Millisecond),
+			ctx.Err(),
+			context.Cause(ctx),
+			atomic.LoadInt32(&ac.tunnelCount),
+			ac.intercepted(),
+		)
 	}()
 
 	bo := backoff.NewExponentialBackOff()
@@ -274,6 +287,7 @@ func (ac *client) runDialWatcher(ctx context.Context, watchID uint64) {
 			ac.RUnlock()
 
 			clog.Debugf(ctx, "watching dials from agent pod %s(%s)", ai.PodName, net.IP(ai.PodIp))
+			watchStarted := time.Now()
 			dialStream, watchErr := cli.WatchDial(ctx, session)
 			if watchErr == nil {
 				if time.Since(lastConnected) > dialWatcherReconnectResetTime {
@@ -281,6 +295,17 @@ func (ac *client) runDialWatcher(ctx context.Context, watchID uint64) {
 				}
 				lastConnected = time.Now()
 				watchErr = tunnel.DialWaitLoop(ctx, tunnel.AgentToClient, tunnel.AgentProvider(cli), dialStream, tunnel.SessionID(session.SessionId))
+			}
+			if watchErr != nil {
+				clog.Warnf(
+					ctx,
+					"dial watcher %d stream for %s ended after %s: %v activeTunnels=%d",
+					watchID,
+					ac,
+					time.Since(watchStarted).Round(time.Millisecond),
+					watchErr,
+					atomic.LoadInt32(&ac.tunnelCount),
+				)
 			}
 			err = watchErr
 		}
@@ -507,7 +532,7 @@ func (s *clients) WatchAgentPods(rmc manager.ManagerClient) error {
 			}
 			return true
 		})
-		clog.Debugf(s, "WatchAgentPods ending with %d clients still active", activeCount)
+		clog.Infof(s, "WatchAgentPods ending with %d clients still active", activeCount)
 		s.disabled.Store(true)
 	}()
 

@@ -246,6 +246,7 @@ func (s *session) GetService() userd.Service {
 //     Services, and
 //   - (4) mount the appropriate remote volumes.
 func (s *session) Run() {
+	started := time.Now()
 	g := log.NewGroup(s)
 	defer func() {
 		_ = s.WithRootClient(context.WithoutCancel(s), func(ctx context.Context, rd rootdRpc.DaemonClient) error {
@@ -257,8 +258,13 @@ func (s *session) Run() {
 	}()
 	s.startServices(g)
 	err := g.Wait()
+	elapsed := time.Since(started).Round(time.Millisecond)
 	if err != nil {
-		clog.Errorf(s, "session ended with error: %v", err)
+		clog.Errorf(s, "session ended after %s with error: %v context=%v cause=%v", elapsed, err, s.Err(), context.Cause(s))
+	} else if s.Err() != nil {
+		clog.Infof(s, "session context ended after %s: context=%v cause=%v", elapsed, s.Err(), context.Cause(s))
+	} else {
+		clog.Infof(s, "session services stopped cleanly after %s", elapsed)
 	}
 }
 

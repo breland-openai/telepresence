@@ -208,7 +208,12 @@ func (h *dialer) Start(ctx context.Context) {
 				clog.Errorf(ctx, "!> %s %s, failed to send DialOK: %v", tag, id, err)
 				return
 			}
-			clog.Debugf(ctx, "<- %s %s, dial answered in %s", tag, id, time.Since(dialStart))
+			dialDuration := time.Since(dialStart)
+			if dialDuration > time.Second {
+				clog.Warnf(ctx, "<- %s %s, slow dial answered in %s (timeout %s)", tag, id, dialDuration, dto)
+			} else {
+				clog.Debugf(ctx, "<- %s %s, dial answered in %s", tag, id, dialDuration)
+			}
 			h.conn = conn
 
 		case connecting:
