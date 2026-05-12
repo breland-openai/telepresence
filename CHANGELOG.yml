@@ -39,6 +39,15 @@ items:
           when no engagement namespace is specified.
         docs: reference/engagements/cli
       - type: bugfix
+        title: Reject unmanaged mapped namespaces
+        body: >-
+          Clients now reject <code>--mapped-namespaces</code> values that are outside
+          the namespace set managed by a namespace-limited traffic-manager. Invalid
+          mapped namespace requests now fail during connect with a helpful error
+          instead of leaving the client connected with namespaces that cannot be
+          handled by the in-cluster manager or traffic-agents.
+        docs: reference/engagements/cli
+      - type: bugfix
         title: Preserve the default gateway for never-proxy routes
         body: >-
           Static routes installed for <code>--never-proxy</code> and

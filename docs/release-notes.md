@@ -8,6 +8,12 @@
 The <code>intercept</code>, <code>wiretap</code>, and <code>replace</code> commands now accept <code>--namespace</code> to select the workload namespace for that engagement without changing the namespace used by <code>telepresence connect</code>. This allows a single connection with multiple mapped namespaces to run simultaneous personal HTTP intercepts in different namespaces, while preserving the connected namespace as the default when no engagement namespace is specified.
 </div>
 
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[Reject unmanaged mapped namespaces](reference/engagements/cli)</div></div>
+<div style="margin-left: 15px">
+
+Clients now reject <code>--mapped-namespaces</code> values that are outside the namespace set managed by a namespace-limited traffic-manager. Invalid mapped namespace requests now fail during connect with a helpful error instead of leaving the client connected with namespaces that cannot be handled by the in-cluster manager or traffic-agents.
+</div>
+
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Preserve the default gateway for never-proxy routes</div></div>
 <div style="margin-left: 15px">
 
