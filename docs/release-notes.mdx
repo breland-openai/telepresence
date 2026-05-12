@@ -15,6 +15,12 @@ The <code>intercept</code>, <code>wiretap</code>, and <code>replace</code> comma
   </Body>
 </Note>
 <Note>
+	<Title type="bugfix" docs="reference/engagements/cli">Reject unmanaged mapped namespaces</Title>
+	<Body>
+Clients now reject <code>--mapped-namespaces</code> values that are outside the namespace set managed by a namespace-limited traffic-manager. Invalid mapped namespace requests now fail during connect with a helpful error instead of leaving the client connected with namespaces that cannot be handled by the in-cluster manager or traffic-agents.
+  </Body>
+</Note>
+<Note>
 	<Title type="bugfix">Preserve the default gateway for never-proxy routes</Title>
 	<Body>
 Static routes installed for <code>--never-proxy</code> and <code>client.routing.neverProxySubnets</code> now preserve the matching default route gateway and source address. This prevents routed client environments, such as VMs that reach cluster networks through a default gateway, from receiving unusable on-link routes for never-proxied destinations.
