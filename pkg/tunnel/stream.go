@@ -30,6 +30,8 @@ type (
 
 const (
 	TunToClient     = Tag("TUN⇄CLI")
+	TunToLocal      = Tag("TUN⇄LOC")
+	LocalToTun      = Tag("LOC⇄TUN")
 	TunToDNS        = Tag("TUN⇄DNS")
 	DnsToTun        = Tag("DNS⇄TUN")
 	ClientToAgent   = Tag("CLI⇄AGN")

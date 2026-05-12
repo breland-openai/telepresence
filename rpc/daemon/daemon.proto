@@ -60,6 +60,15 @@ service Daemon {
   // RerouteRemotePort makes a netip.AddrPort available on a new port on the same address.
   rpc RerouteRemotePort(ReroutePortRequest) returns (google.protobuf.Empty);
 
+  // AddLocalClientRedirect redirects traffic for a netip.AddrPort to localhost on a different port.
+  rpc AddLocalClientRedirect(ReroutePortRequest) returns (google.protobuf.Empty);
+
+  // RemoveLocalClientRedirect stops redirecting traffic for a netip.AddrPort to localhost.
+  rpc RemoveLocalClientRedirect(ReroutePortRequest) returns (google.protobuf.Empty);
+
+  // ListLocalClientRedirects lists active local client redirects.
+  rpc ListLocalClientRedirects(google.protobuf.Empty) returns (LocalClientRedirects);
+
   rpc ActivityWatcher(google.protobuf.Empty) returns (stream Activity);
 }
 
@@ -206,6 +215,18 @@ message ReroutePortRequest {
 
   // port is will be rerouted to the host_port.
   uint32 src_port = 2;
+}
+
+message LocalClientRedirect {
+  // host_port is a iputil.ProtoAddrPort in binary format
+  bytes dst_host_port = 1;
+
+  // local_port is the port on localhost that traffic is redirected to.
+  uint32 local_port = 2;
+}
+
+message LocalClientRedirects {
+  repeated LocalClientRedirect redirects = 1;
 }
 
 message QuitResponse {

@@ -199,6 +199,9 @@ type session struct {
 	// Maps one UDP or TCP AddrPort to another
 	l4PortMap *xsync.Map[types.AddrPortProto, uint16]
 
+	// Redirects a remote UDP or TCP AddrPort to a local host port.
+	localClientRedirects *xsync.Map[types.AddrPortProto, netip.AddrPort]
+
 	lookupSequencer *xsync.Map[string, clusterLookupResult]
 }
 
@@ -255,6 +258,7 @@ func newSession(
 		localTranslationTable: xsync.NewMap[netip.Addr, netip.Addr](),
 		virtualIPs:            xsync.NewMap[netip.Addr, agentVIP](),
 		l4PortMap:             xsync.NewMap[types.AddrPortProto, uint16](),
+		localClientRedirects:  xsync.NewMap[types.AddrPortProto, netip.AddrPort](),
 	}
 	cfg := client.GetConfig(s)
 
@@ -352,8 +356,45 @@ func (s *session) rerouteRemotePort(ap types.AddrPortProto, newPort uint16) {
 		// Swap ports so that the port map reroutes requests for the new port to the original port.
 		toPort := ap.Port()
 		ap.AddrPort = netip.AddrPortFrom(ap.Addr(), newPort)
+		if s.l4PortMap == nil {
+			s.l4PortMap = xsync.NewMap[types.AddrPortProto, uint16]()
+		}
 		s.l4PortMap.Store(ap, toPort)
 	}
+}
+
+func (s *session) addLocalClientRedirect(ap types.AddrPortProto, localPort uint16) {
+	target := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), localPort)
+	clog.Debugf(s, "Redirecting local client traffic for %s to %s", ap, target)
+	if s.localClientRedirects == nil {
+		s.localClientRedirects = xsync.NewMap[types.AddrPortProto, netip.AddrPort]()
+	}
+	s.localClientRedirects.Store(ap, target)
+}
+
+func (s *session) removeLocalClientRedirect(ap types.AddrPortProto) {
+	clog.Debugf(s, "Removing local client redirect for %s", ap)
+	if s.localClientRedirects != nil {
+		s.localClientRedirects.Delete(ap)
+	}
+}
+
+func (s *session) listLocalClientRedirects() []*rpc.LocalClientRedirect {
+	if s.localClientRedirects == nil {
+		return nil
+	}
+	redirects := make([]*rpc.LocalClientRedirect, 0, s.localClientRedirects.Size())
+	s.localClientRedirects.Range(func(remote types.AddrPortProto, target netip.AddrPort) bool {
+		hpb, err := remote.MarshalBinary()
+		if err == nil {
+			redirects = append(redirects, &rpc.LocalClientRedirect{
+				DstHostPort: hpb,
+				LocalPort:   uint32(target.Port()),
+			})
+		}
+		return true
+	})
+	return redirects
 }
 
 type clusterLookupResult struct {
