@@ -194,11 +194,9 @@ func (s *session) Ingest(ctx context.Context, rq *rpc.IngestRequest) (ir *rpc.In
 func (s *session) startIngestPodAccess(ctx context.Context, ig *ingest, initial bool) {
 	err := s.WithRootClient(ctx, func(_ context.Context, rd daemon.DaemonClient) error {
 		if initial {
-			s.ingestTracker.initialStart(ig.podAccess(rd))
-		} else {
-			s.ingestTracker.start(ig.podAccess(rd))
+			return s.ingestTracker.initialStart(ig.podAccess(rd))
 		}
-		return nil
+		return s.ingestTracker.start(ig.podAccess(rd))
 	})
 	if err != nil {
 		clog.Errorf(ctx, "failed to start ingest pod access: %v", err)

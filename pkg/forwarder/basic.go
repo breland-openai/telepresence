@@ -44,8 +44,11 @@ type Forwarder interface {
 type basic struct {
 	tag        tunnel.Tag
 	target     netip.AddrPort
+	listenAddr netip.Addr
 	listenPort int32
 }
+
+var ipv4Loopback = netip.MustParseAddr("127.0.0.1")
 
 // New creates a TCP or UDP forwarder that will forward connections from the given port to the given target.
 func New(from types.PortAndProto, tag tunnel.Tag, target netip.AddrPort) Forwarder {
@@ -53,6 +56,14 @@ func New(from types.PortAndProto, tag tunnel.Tag, target netip.AddrPort) Forward
 		return NewUDP(from.Port, tag, target)
 	}
 	return NewTCP(from.Port, tag, target)
+}
+
+// NewLoopback creates a TCP or UDP forwarder that only accepts connections from localhost.
+func NewLoopback(from types.PortAndProto, tag tunnel.Tag, target netip.AddrPort) Forwarder {
+	if from.Proto == types.ProtoUDP {
+		return newUDP(from.Port, tag, target, ipv4Loopback)
+	}
+	return newTCP(from.Port, tag, target, ipv4Loopback)
 }
 
 func (f *basic) Tag() tunnel.Tag {

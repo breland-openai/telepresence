@@ -89,9 +89,9 @@ func (pa *podAccess) shouldForward() bool {
 	return len(pa.localPorts) > 0
 }
 
-// startForwards starts port forwards and mounts for the given podAccessKey.
+// startForwards starts port forwards for the given podAccessKey.
 // It assumes that the user has called shouldForward and is sure that something will be started.
-func (pa *podAccess) startForwards(ctx context.Context, wg *sync.WaitGroup) {
+func (pa *podAccess) startForwards(ctx context.Context, wg *sync.WaitGroup) error {
 	for _, port := range pa.localPorts {
 		var pfCtx context.Context
 		if iputil.IsIpV6Addr(pa.podIP) {
@@ -99,9 +99,32 @@ func (pa *podAccess) startForwards(ctx context.Context, wg *sync.WaitGroup) {
 		} else {
 			pfCtx = clog.WithGroup(ctx, fmt.Sprintf("%s:%s", pa.podIP, port))
 		}
+		pp, err := types.ParsePortAndProto(port)
+		if err != nil {
+			return fmt.Errorf("malformed extra port %q: %w", port, err)
+		}
+		addr, err := netip.ParseAddr(pa.podIP)
+		if err != nil {
+			return fmt.Errorf("error parsing pod IP address %q: %w", pa.podIP, err)
+		}
+		f := forwarder.NewLoopback(
+			pp,
+			tunnel.ClientToAgent,
+			netip.AddrPortFrom(addr, pp.Port),
+		)
+		ready := make(chan netip.AddrPort)
+		result := make(chan error, 1)
 		wg.Add(1)
-		go pa.workerPortForward(pfCtx, port, wg)
+		go pa.workerPortForward(pfCtx, f, ready, result, wg)
+		select {
+		case <-ready:
+		case err = <-result:
+			return fmt.Errorf("unable to forward localhost:%s to pod: %w", port, err)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+	return nil
 }
 
 func (pa *podAccess) ensureAccess(ctx context.Context, rd daemon.DaemonClient) error {
@@ -134,20 +157,16 @@ func (pa *podAccess) ensureAccess(ctx context.Context, rd daemon.DaemonClient) e
 	return nil
 }
 
-func (pa *podAccess) workerPortForward(ctx context.Context, port string, wg *sync.WaitGroup) {
+func (pa *podAccess) workerPortForward(
+	ctx context.Context,
+	f forwarder.Forwarder,
+	ready chan<- netip.AddrPort,
+	result chan<- error,
+	wg *sync.WaitGroup,
+) {
 	defer wg.Done()
-	pp, err := types.ParsePortAndProto(port)
-	if err != nil {
-		clog.Errorf(ctx, "malformed extra port %q: %v", port, err)
-		return
-	}
-	addr, err := netip.ParseAddr(pa.podIP)
-	if err != nil {
-		clog.Errorf(ctx, "error parsing pod IP address %q: %v", pa.podIP, err)
-		return
-	}
-	f := forwarder.New(pp, tunnel.ClientToAgent, netip.AddrPortFrom(addr, pp.Port))
-	err = f.Serve(ctx, nil)
+	err := f.Serve(ctx, ready)
+	result <- err
 	if err != nil && ctx.Err() == nil {
 		clog.Errorf(ctx, "port-forwarder failed with %v", err)
 	}
@@ -158,7 +177,7 @@ func newPodAccessTracker() *podAccessTracker {
 }
 
 // start a port forward for the given ingest or intercept and remembers that it's alive.
-func (lpf *podAccessTracker) start(pa *podAccess) {
+func (lpf *podAccessTracker) start(pa *podAccess) error {
 	// The mounts performed here are synced on by podIP + port to keep track of active
 	// mounts. This is not enough in situations when a pod is deleted and another pod
 	// takes over. That is two different IPs so an additional synchronization on the actual
@@ -181,21 +200,23 @@ func (lpf *podAccessTracker) start(pa *podAccess) {
 	// Make part of current snapshot tracking so that it isn't removed once the
 	// snapshot has been completely handled
 	lpf.snapshot[fk] = struct{}{}
-	lpf.privateStart(pa)
+	err := lpf.privateStart(pa)
 	lpf.Unlock()
+	return err
 }
 
-func (lpf *podAccessTracker) initialStart(ic *podAccess) {
+func (lpf *podAccessTracker) initialStart(ic *podAccess) error {
 	lpf.Lock()
-	lpf.privateStart(ic)
+	err := lpf.privateStart(ic)
 	lpf.Unlock()
+	return err
 }
 
-func (lpf *podAccessTracker) privateStart(pa *podAccess) {
+func (lpf *podAccessTracker) privateStart(pa *podAccess) error {
 	ctx := pa.ctx
 	if !pa.shouldForward() && !pa.shouldMount() {
 		clog.Debugf(ctx, "No mounts or port-forwards needed for pod-ip %s, container %s", pa.podIP, pa.container)
-		return
+		return nil
 	}
 
 	// Already started?
@@ -206,19 +227,24 @@ func (lpf *podAccessTracker) privateStart(pa *podAccess) {
 	}
 	if _, isLive := lpf.alivePods[fk]; isLive {
 		clog.Debugf(ctx, "Mounts and port-forwards already active for %+v", fk)
-		return
+		return nil
 	}
 
 	ctx, cancel := context.WithCancel(pa.ctx)
 	lp := &podAccessSync{workload: pa.workload, cancelPod: cancel}
+	if pa.shouldForward() {
+		if err := pa.startForwards(ctx, &lp.wg); err != nil {
+			cancel()
+			lp.wg.Wait()
+			return err
+		}
+	}
 	if pa.shouldMount() {
 		pa.startMount(ctx, pa.wg, &lp.wg)
 	}
-	if pa.shouldForward() {
-		pa.startForwards(ctx, &lp.wg)
-	}
 	lpf.alivePods[fk] = lp
 	clog.Debugf(ctx, "Started mounts and port-forwards for pod-ip %s, container %s", pa.podIP, pa.container)
+	return nil
 }
 
 // initSnapshot prepares this instance for a new round of start calls followed by a cancelUnwanted.

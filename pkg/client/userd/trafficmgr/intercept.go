@@ -195,20 +195,28 @@ func (s *session) handleInterceptSnapshot(pat *podAccessTracker, intercepts []*m
 			err = fmt.Errorf("intercept in error state %v: %v", ii.Disposition, ii.Message)
 		}
 
-		// Notify waiters for active intercepts
+		var mountsDone <-chan struct{}
+		if aw != nil && err == nil {
+			mountsDone = pat.getOrCreateMountsDone(pa)
+		}
+		if err == nil {
+			if s.isPodDaemon {
+				// disable mount point logic
+				pa.ftpPort = 0
+				pa.sftpPort = 0
+			}
+			err = pat.start(pa)
+		}
+
+		// Notify waiters after local access, including --to-pod listeners, is ready.
 		if aw != nil {
 			clog.Debugf(s, "wait status: intercept id=%q is no longer WAITING; is now %v", ii.Id, ii.Disposition)
-			ir := interceptResult{
-				intercept: ic,
-				err:       err,
-			}
-			if err == nil {
-				ir.mountsDone = pat.getOrCreateMountsDone(pa)
-			} else {
+			if mountsDone == nil || err != nil {
 				md := make(chan struct{})
 				close(md)
-				ir.mountsDone = md
+				mountsDone = md
 			}
+			ir := interceptResult{intercept: ic, err: err, mountsDone: mountsDone}
 			select {
 			case aw.waitCh <- ir:
 				if err != nil {
@@ -224,13 +232,6 @@ func (s *session) handleInterceptSnapshot(pat *podAccessTracker, intercepts []*m
 			clog.Error(s, err)
 			continue
 		}
-
-		if s.isPodDaemon {
-			// disable mount point logic
-			pa.ftpPort = 0
-			pa.sftpPort = 0
-		}
-		pat.start(pa)
 	}
 	pat.cancelUnwanted(s)
 }

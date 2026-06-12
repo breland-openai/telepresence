@@ -17,9 +17,14 @@ type tcp struct{ basic }
 
 // NewTCP creates a new TCP forwarder that will forward connections from the given port to the given target.
 func NewTCP(from uint16, tag tunnel.Tag, target netip.AddrPort) Forwarder {
+	return newTCP(from, tag, target, netip.Addr{})
+}
+
+func newTCP(from uint16, tag tunnel.Tag, target netip.AddrPort, listenAddr netip.Addr) Forwarder {
 	return &tcp{basic{
 		tag:        tag,
 		target:     target,
+		listenAddr: listenAddr,
 		listenPort: int32(from),
 	}}
 }
@@ -76,7 +81,14 @@ func (f *tcp) Forward(ctx context.Context, clientConn net.Conn) error {
 
 func (f *tcp) Listen(ctx context.Context) (net.Listener, error) {
 	lc := net.ListenConfig{}
-	listener, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", atomic.LoadInt32(&f.listenPort)))
+	listenAddr := fmt.Sprintf(":%d", atomic.LoadInt32(&f.listenPort))
+	if f.listenAddr.IsValid() {
+		listenAddr = netip.AddrPortFrom(
+			f.listenAddr,
+			uint16(atomic.LoadInt32(&f.listenPort)),
+		).String()
+	}
+	listener, err := lc.Listen(ctx, "tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
