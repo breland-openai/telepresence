@@ -54,10 +54,15 @@ type Watcher interface {
 	Subscribe(ctx context.Context) <-chan []Event
 }
 
+type subscription struct {
+	ch   chan<- []Event
+	done <-chan struct{}
+}
+
 type watcher struct {
 	sync.Mutex
 	namespace            string
-	subscriptions        map[uuid.UUID]chan<- []Event
+	subscriptions        map[uuid.UUID]subscription
 	timer                *time.Timer
 	events               []Event
 	enabledWorkloadKinds k8sapi.Kinds
@@ -67,25 +72,9 @@ func NewWatcher(ctx context.Context, ns string, enabledWorkloadKinds k8sapi.Kind
 	w := new(watcher)
 	w.namespace = ns
 	w.enabledWorkloadKinds = enabledWorkloadKinds
-	w.subscriptions = make(map[uuid.UUID]chan<- []Event)
+	w.subscriptions = make(map[uuid.UUID]subscription)
 	w.timer = time.AfterFunc(time.Duration(math.MaxInt64), func() {
-		w.Lock()
-		ss := make([]chan<- []Event, len(w.subscriptions))
-		i := 0
-		for _, sub := range w.subscriptions {
-			ss[i] = sub
-			i++
-		}
-		events := w.events
-		w.events = nil
-		w.Unlock()
-		for _, s := range ss {
-			select {
-			case <-ctx.Done():
-				return
-			case s <- events:
-			}
-		}
+		w.dispatch(ctx)
 	})
 
 	err := w.addEventHandler(ctx, ns)
@@ -93,6 +82,25 @@ func NewWatcher(ctx context.Context, ns string, enabledWorkloadKinds k8sapi.Kind
 		return nil, err
 	}
 	return w, nil
+}
+
+func (w *watcher) dispatch(ctx context.Context) {
+	w.Lock()
+	ss := make([]subscription, 0, len(w.subscriptions))
+	for _, sub := range w.subscriptions {
+		ss = append(ss, sub)
+	}
+	events := w.events
+	w.events = nil
+	w.Unlock()
+	for _, s := range ss {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.done:
+		case s.ch <- events:
+		}
+	}
 }
 
 func hasValidReplicasetOwner(wl k8sapi.Workload, enabledKinds k8sapi.Kinds) bool {
@@ -167,14 +175,15 @@ func (w *watcher) Subscribe(ctx context.Context) <-chan []Event {
 	ch <- initialEvents
 
 	w.Lock()
-	w.subscriptions[id] = ch
+	w.subscriptions[id] = subscription{ch: ch, done: ctx.Done()}
 	w.Unlock()
 	go func() {
 		<-ctx.Done()
-		close(ch)
 		w.Lock()
 		delete(w.subscriptions, id)
 		w.Unlock()
+		// Do not close ch. dispatch snapshots subscriptions before sending, so
+		// closing here can race with a send from an in-flight snapshot.
 	}()
 	return ch
 }
