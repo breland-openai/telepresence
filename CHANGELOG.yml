@@ -28,6 +28,12 @@ items:
     date: (TBD)
     notes:
       - type: bugfix
+        title: Recover promptly from stalled manager sessions
+        body: >-
+          Manager keepalive failures are once again propagated to the client
+          session, allowing the existing session restart path to replace a
+          half-dead connection instead of logging timeouts indefinitely.
+      - type: bugfix
         title: Preserve agent images during concurrent pod injection
         body: >-
           The agent injector reused a cached sidecar config across concurrent
