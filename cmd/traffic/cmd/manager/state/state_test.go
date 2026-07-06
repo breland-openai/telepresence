@@ -3,7 +3,6 @@ package state
 import (
 	"context"
 	"log/slog"
-	"net/netip"
 	"testing"
 	"time"
 
@@ -196,6 +195,13 @@ func TestIsInterceptedBy(t *testing.T) {
 	}
 
 	clientID := tunnel.SessionID("client")
+	agent := func(ip, name, namespace string) *AgentSession {
+		return &AgentSession{AgentInfo: &manager.AgentInfo{
+			Name:      name,
+			Namespace: namespace,
+			PodIp:     ip,
+		}}
+	}
 
 	st.intercepts.Store("http", &Intercept{InterceptInfo: &manager.InterceptInfo{
 		Id:          "http",
@@ -227,12 +233,12 @@ func TestIsInterceptedBy(t *testing.T) {
 		},
 	}})
 
-	require.True(t, st.IsInterceptedBy(netip.MustParseAddr("10.0.0.1"), "demo", "default", clientID))
-	require.True(t, st.IsInterceptedBy(netip.MustParseAddr("10.0.0.2"), "demo", "default", clientID))
-	require.True(t, st.IsInterceptedBy(netip.MustParseAddr("10.0.0.3"), "api", "default", clientID))
-	require.False(t, st.IsInterceptedBy(netip.MustParseAddr("10.0.0.4"), "api", "default", clientID))
-	require.False(t, st.IsInterceptedBy(netip.MustParseAddr("10.0.0.2"), "other", "default", clientID))
-	require.False(t, st.IsInterceptedBy(netip.MustParseAddr("10.0.0.2"), "demo", "other", clientID))
+	require.True(t, st.IsInterceptedBy(agent("10.0.0.1", "demo", "default"), clientID))
+	require.True(t, st.IsInterceptedBy(agent("10.0.0.2", "demo", "default"), clientID))
+	require.True(t, st.IsInterceptedBy(agent("10.0.0.3", "api", "default"), clientID))
+	require.False(t, st.IsInterceptedBy(agent("10.0.0.4", "api", "default"), clientID))
+	require.False(t, st.IsInterceptedBy(agent("10.0.0.2", "other", "default"), clientID))
+	require.False(t, st.IsInterceptedBy(agent("10.0.0.2", "demo", "other"), clientID))
 }
 
 func TestSuiteState(testing *testing.T) {

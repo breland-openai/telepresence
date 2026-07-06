@@ -531,7 +531,7 @@ func (s *service) watchAgentPods(ctx context.Context, namespaces []string, strea
 				Namespace:    a.Namespace,
 				PodIp:        aip.AsSlice(),
 				ApiPort:      a.ApiPort,
-				Intercepted:  s.state.IsInterceptedBy(aip, a.Name, a.Namespace, clientSessionID),
+				Intercepted:  s.state.IsInterceptedBy(a, clientSessionID),
 			}
 			agents = append(agents, ap)
 			return true
@@ -605,7 +605,7 @@ func (s *service) watchAgentPodsDelta(ctx context.Context, namespaces []string, 
 						Namespace:    a.Namespace,
 						PodIp:        aip.AsSlice(),
 						ApiPort:      a.ApiPort,
-						Intercepted:  s.state.IsInterceptedBy(aip, a.Name, a.Namespace, clientSessionID),
+						Intercepted:  s.state.IsInterceptedBy(a, clientSessionID),
 					}
 					agentPodInfos.Store(string(k), ap)
 				}
@@ -621,8 +621,8 @@ func (s *service) watchAgentPodsDelta(ctx context.Context, namespaces []string, 
 			if m.IsInactive(types.UID(a.PodId)) {
 				return true
 			}
-			aip, _ := netip.AddrFromSlice(a.PodIp)
-			intercepted := s.state.IsInterceptedBy(aip, a.WorkloadName, a.Namespace, clientSessionID)
+			agent := s.state.GetAgent(tunnel.SessionID(state.AgentSessionIDPrefix + a.PodId))
+			intercepted := s.state.IsInterceptedBy(agent, clientSessionID)
 			agentPodInfos.Compute(k, func(a *rpc.AgentPodInfo, loaded bool) (*rpc.AgentPodInfo, xsync.ComputeOp) {
 				if loaded && a.Intercepted != intercepted {
 					a := proto.Clone(a).(*rpc.AgentPodInfo)
@@ -777,7 +777,7 @@ func (s *service) watchIntercepts(ctx context.Context, session *rpc.SessionInfo)
 
 		if agent := s.state.GetAgent(sessionID); agent != nil {
 			filter = func(id string, info *state.Intercept) bool {
-				if info.Spec.Namespace != agent.Namespace || info.Spec.Agent != agent.Name {
+				if !state.AgentMatchesIntercept(agent.AgentInfo, info.Spec) {
 					// Don't return intercepts for different agents.
 					return false
 				}
@@ -1019,31 +1019,7 @@ func (s *service) ReviewIntercept(ctx context.Context, rIReq *rpc.ReviewIntercep
 
 	s.removeExcludedEnvVars(rIReq.Environment)
 
-	intercept := s.state.UpdateIntercept(ceptID, func(intercept *state.Intercept) {
-		// Sanity check: The reviewing agent must be an agent for the intercept.
-		if intercept.Spec.Namespace != agent.Namespace || intercept.Spec.Agent != agent.Name {
-			return
-		}
-		if mutator.GetMap(ctx).IsInactive(types.UID(agent.PodUid)) {
-			clog.Debugf(ctx, "Pod %s(%s) is blacklisted", agent.PodName, agent.PodIp)
-			return
-		}
-
-		// Only update intercepts in the waiting or no agent states.  Agents race to review an intercept, but we
-		// expect they will always produce compatible answers.
-		if intercept.Disposition == rpc.InterceptDispositionType_NO_AGENT || intercept.Disposition == rpc.InterceptDispositionType_WAITING {
-			intercept.Disposition = rIReq.Disposition
-			intercept.Message = rIReq.Message
-			intercept.PodIp = rIReq.PodIp
-			intercept.PodName = agent.PodName
-			intercept.FtpPort = rIReq.FtpPort
-			intercept.SftpPort = rIReq.SftpPort
-			intercept.MountPoint = rIReq.MountPoint
-			intercept.MechanismArgsDesc = rIReq.MechanismArgsDesc
-			intercept.Environment = rIReq.Environment
-			intercept.Mounts = rIReq.Mounts
-		}
-	})
+	intercept := s.state.ApplyAgentReview(ctx, ceptID, agent, rIReq)
 
 	if intercept == nil {
 		return nil, status.Errorf(codes.NotFound, "Intercept with ID %q not found for this session", ceptID)
