@@ -460,7 +460,7 @@ func (s *session) remain() error {
 	if err != nil {
 		clog.Errorf(ctx, "error calling Remain: %v", client.CheckTimeout(ctx, err))
 	}
-	return nil
+	return err
 }
 
 // updateDaemonNamespacesLocked will create a new DNS search path from the given namespaces and
