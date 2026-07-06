@@ -72,6 +72,30 @@ message AgentInfo {
   }
   map<string,ContainerInfo> containers = 12;
 
+  // InterceptTarget describes one service-backed target that this agent can
+  // handle. The traffic-manager uses these claims when a single Service
+  // selects pods owned by more than one workload.
+  message InterceptTarget {
+    // .metadata.uid of the Service associated with the target.
+    string service_uid = 1;
+
+    // Name of the Service, retained for diagnostics.
+    string service_name = 2;
+
+    // Name and number of the selected Service port.
+    string service_port_name = 3;
+    int32 service_port = 4;
+
+    // Protocol and local container target used by this agent.
+    string protocol = 5;
+    string container_name = 6;
+    int32 container_port = 7;
+  }
+
+  // Service-backed targets advertised by this agent. Older agents leave this
+  // empty and continue to use workload-scoped intercept matching.
+  repeated InterceptTarget intercept_targets = 15;
+
   reserved 6;
 }
 
