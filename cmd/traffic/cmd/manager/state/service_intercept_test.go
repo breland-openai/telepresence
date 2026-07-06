@@ -87,6 +87,9 @@ func TestServiceInterceptWaitsForEveryWorkload(t *testing.T) {
 	}}
 	st.initializeParticipants(intercept)
 	require.Len(t, intercept.participants, 2)
+	require.Len(t, intercept.ServiceWorkloads, 2)
+	require.Equal(t, "plugin-service", intercept.ServiceWorkloads[0].WorkloadName)
+	require.Equal(t, "plugin-service-canary", intercept.ServiceWorkloads[1].WorkloadName)
 	st.intercepts.Store(intercept.Id, intercept)
 
 	stableReview := &rpc.ReviewInterceptRequest{
@@ -109,6 +112,28 @@ func TestServiceInterceptWaitsForEveryWorkload(t *testing.T) {
 	require.Equal(t, map[string]string{"TRACK": "stable"}, updated.Environment)
 	require.True(t, st.IsInterceptedBy(stable, "client"))
 	require.True(t, st.IsInterceptedBy(canary, "client"))
+}
+
+func TestServiceInterceptPublishesLateWorkload(t *testing.T) {
+	_, st := newServiceInterceptState(t)
+	stable := serviceAgent("plugin-service", "stable-pod", "10.0.0.1")
+	canary := serviceAgent("plugin-service-canary", "canary-pod", "10.0.0.2")
+	st.agents.Store("stable", stable)
+
+	intercept := &Intercept{InterceptInfo: &rpc.InterceptInfo{
+		Id:            "client:plugin-service",
+		Spec:          sharedServiceSpec(),
+		Disposition:   rpc.InterceptDispositionType_ACTIVE,
+		ClientSession: &rpc.SessionInfo{SessionId: "client"},
+	}}
+	st.initializeParticipants(intercept)
+	require.Len(t, intercept.ServiceWorkloads, 1)
+	require.Equal(t, "plugin-service", intercept.ServiceWorkloads[0].WorkloadName)
+
+	intercept.addParticipant(canary.AgentInfo)
+	require.Len(t, intercept.ServiceWorkloads, 2)
+	require.Equal(t, "plugin-service", intercept.ServiceWorkloads[0].WorkloadName)
+	require.Equal(t, "plugin-service-canary", intercept.ServiceWorkloads[1].WorkloadName)
 }
 
 func TestAgentMatchesServiceInterceptByClaim(t *testing.T) {

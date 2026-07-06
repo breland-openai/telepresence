@@ -128,6 +128,7 @@ func (s *State) initializeParticipants(intercept *Intercept) {
 		}
 		return true
 	})
+	intercept.syncServiceWorkloads()
 }
 
 func (is *Intercept) addParticipant(agent *rpc.AgentInfo) *interceptParticipant {
@@ -144,7 +145,26 @@ func (is *Intercept) addParticipant(agent *rpc.AgentInfo) *interceptParticipant 
 		is.participants = make(map[string]*interceptParticipant)
 	}
 	is.participants[key] = participant
+	is.syncServiceWorkloads()
 	return participant
+}
+
+func (is *Intercept) syncServiceWorkloads() {
+	if len(is.participants) == 0 {
+		is.ServiceWorkloads = nil
+		return
+	}
+	keys := is.participantKeys()
+	workloads := make([]*rpc.InterceptWorkload, 0, len(keys))
+	for _, key := range keys {
+		participant := is.participants[key]
+		workloads = append(workloads, &rpc.InterceptWorkload{
+			Namespace:    participant.namespace,
+			WorkloadKind: participant.kind,
+			WorkloadName: participant.name,
+		})
+	}
+	is.ServiceWorkloads = workloads
 }
 
 func (is *Intercept) pendingParticipants() []string {
