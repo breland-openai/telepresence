@@ -550,17 +550,29 @@ func (s *State) AddAgent(ctx context.Context, agent *rpc.AgentInfo, now time.Tim
 func (s *State) RestoreAgent(ctx context.Context, id tunnel.SessionID, agent *rpc.AgentInfo, now time.Time) (tunnel.SessionID, error) {
 	as := newAgentSessionState(s.backgroundCtx, id, agent, now)
 	if _, exists := s.agents.LoadOrStore(id, as); exists {
-		return "", nil
+		as.cancel()
+		// ArriveAsAgent can be retried after the manager committed this session
+		// but the response was lost or timed out. Return the stable pod-UID based
+		// session ID so that the retry remains idempotent.
+		return id, nil
 	}
 
 	s.intercepts.Range(func(interceptID string, intercept *Intercept) bool {
-		if intercept.Disposition == rpc.InterceptDispositionType_REMOVED {
+		if intercept.Disposition == rpc.InterceptDispositionType_REMOVED || !AgentMatchesIntercept(agent, intercept.Spec) {
 			return true
 		}
-		if serviceScopedIntercept(intercept.Spec) && AgentMatchesIntercept(agent, intercept.Spec) {
-			intercept = s.UpdateIntercept(interceptID, func(intercept *Intercept) {
-				intercept.addParticipant(agent)
-			})
+		if serviceScopedIntercept(intercept.Spec) {
+			// All pods in one workload share a participant key. Avoid entering
+			// UpdateIntercept once the workload is already represented; otherwise a
+			// burst of pods needlessly contends on the same intercept record.
+			if _, exists := intercept.participants[agentParticipantKey(agent)]; !exists {
+				intercept = s.UpdateIntercept(interceptID, func(intercept *Intercept) {
+					intercept.addParticipant(agent)
+				})
+				if intercept == nil {
+					return true
+				}
+			}
 		}
 		// Check whether each intercept needs to either (1) be moved in to a NO_AGENT state
 		// because this agent made things inconsistent, or (2) be moved out of a NO_AGENT
@@ -653,6 +665,12 @@ func (s *State) UpdateIntercept(interceptID string, apply func(*Intercept)) *Int
 
 		newInfo := cur.Clone()
 		apply(newInfo)
+		// A pod-level arrival can discover a workload participant that another
+		// concurrent arrival already added. Do not turn that semantic no-op into a
+		// fresh ModifiedAt value and a contended CAS write.
+		if interceptEqual(cur, newInfo) {
+			return cur
+		}
 		newInfo.ModifiedAt = timestamppb.Now()
 
 		swapped := s.intercepts.CompareAndSwap(newInfo.Id, cur, newInfo)
