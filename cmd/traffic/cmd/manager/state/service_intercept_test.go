@@ -136,6 +136,25 @@ func TestServiceInterceptPublishesLateWorkload(t *testing.T) {
 	require.Equal(t, "plugin-service-canary", intercept.ServiceWorkloads[1].WorkloadName)
 }
 
+func TestUpdateInterceptSkipsExistingParticipantNoOp(t *testing.T) {
+	_, st := newServiceInterceptState(t)
+	stable := serviceAgent("plugin-service", "stable-pod", "10.0.0.1")
+	intercept := &Intercept{InterceptInfo: &rpc.InterceptInfo{
+		Id:            "client:plugin-service",
+		Spec:          sharedServiceSpec(),
+		Disposition:   rpc.InterceptDispositionType_ACTIVE,
+		ClientSession: &rpc.SessionInfo{SessionId: "client"},
+	}}
+	intercept.addParticipant(stable.AgentInfo)
+	st.intercepts.Store(intercept.Id, intercept)
+
+	updated := st.UpdateIntercept(intercept.Id, func(intercept *Intercept) {
+		intercept.addParticipant(stable.AgentInfo)
+	})
+
+	require.Same(t, intercept, updated)
+}
+
 func TestAgentMatchesServiceInterceptByClaim(t *testing.T) {
 	spec := sharedServiceSpec()
 	require.True(t, AgentMatchesIntercept(serviceAgent("plugin-service-canary", "pod", "10.0.0.2").AgentInfo, spec))
