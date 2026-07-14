@@ -121,6 +121,34 @@ func (s *session) getCurrentAgent(name, namespace string) *manager.AgentInfo {
 	return nil
 }
 
+// fullAgentInfo returns ai unchanged when it already contains container
+// environments. Compact watch snapshots intentionally omit those maps, so
+// ingest paths fetch the full AgentInfo only for the selected workload.
+func (s *session) fullAgentInfo(ctx context.Context, ai *manager.AgentInfo) (*manager.AgentInfo, error) {
+	if ai == nil || !ai.ContainerEnvironmentOmitted {
+		return ai, nil
+	}
+	timeoutCtx, cancel := client.GetConfig(s).Timeouts().TimeoutContext(ctx, client.TimeoutIntercept)
+	defer cancel()
+	as, err := s.ManagerClient().EnsureAgent(timeoutCtx, &manager.EnsureAgentRequest{
+		Session:   s.sessionInfo,
+		Name:      ai.Name,
+		Namespace: ai.Namespace,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, full := range as.Agents {
+		if full.PodName == ai.PodName {
+			return full, nil
+		}
+	}
+	if len(as.Agents) == 0 {
+		return nil, fmt.Errorf("no agent found for workload %s.%s", ai.Name, ai.Namespace)
+	}
+	return as.Agents[0], nil
+}
+
 func (s *session) Ingest(ctx context.Context, rq *rpc.IngestRequest) (ir *rpc.IngestInfo, err error) {
 	if err = requireAgentPortForward(ctx, "ingest"); err != nil {
 		return nil, err
@@ -173,6 +201,10 @@ func (s *session) Ingest(ctx context.Context, rq *rpc.IngestRequest) (ir *rpc.In
 			return nil, err
 		}
 		ai = as.Agents[0]
+	}
+	ai, err = s.fullAgentInfo(ctx, ai)
+	if err != nil {
+		return nil, err
 	}
 	if err = s.validateAgentForIngest(ai); err != nil {
 		return nil, err
