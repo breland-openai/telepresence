@@ -140,15 +140,15 @@ func ServeMutator(ctx context.Context, g log.Group, injectorCertGetter InjectorC
 		}
 	})
 	mux.HandleFunc("/uninstall", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		clog.Debug(ctx, "Received uninstall request...")
-		statusCode, err := serveRequest(ctx, r, http.MethodDelete, ai.Uninstall)
+		requestCtx := r.Context()
+		clog.Debug(requestCtx, "Received uninstall request...")
+		statusCode, err := serveUninstallRequest(ctx, r, ai)
 		if err != nil {
-			clog.Errorf(ctx, "error handling uninstall request: %v", err)
+			clog.Errorf(requestCtx, "error handling uninstall request: %v", err)
 			w.WriteHeader(statusCode)
 			_, _ = w.Write([]byte(err.Error()))
 		} else {
-			clog.Debug(ctx, "uninstall request handled successfully")
+			clog.Debug(requestCtx, "uninstall request handled successfully")
 			w.WriteHeader(http.StatusOK)
 		}
 	})
@@ -246,6 +246,12 @@ func serveAndWatchTLS(ctx context.Context, s *http.Server, addr string, certGett
 	rdyClose.Do(func() { close(rdy) })
 	<-ctx.Done()
 	return s.Shutdown(ctx)
+}
+
+func serveUninstallRequest(managerCtx context.Context, r *http.Request, ai AgentInjector) (int, error) {
+	// The Helm hook gives up after 60 seconds. Keep synchronous teardown attached to the
+	// manager lifecycle so disconnecting the hook does not cancel in-flight pod recovery.
+	return serveRequest(managerCtx, r, http.MethodDelete, ai.Uninstall)
 }
 
 // Skip mutate requests in these namespaces.

@@ -68,6 +68,44 @@ type workloadEvictionState struct {
 	replacementPending bool
 }
 
+func (c *configWatcher) lockEvictionState(key WorkloadKey) *workloadEvictionState {
+	for {
+		state, _ := c.evictionStates.LoadOrCompute(key, func() (*workloadEvictionState, bool) {
+			return &workloadEvictionState{}, false
+		})
+		state.Lock()
+		if current, ok := c.evictionStates.Load(key); ok && current == state {
+			return state
+		}
+		state.Unlock()
+	}
+}
+
+func (c *configWatcher) deleteEvictionState(key WorkloadKey) {
+	for {
+		state, ok := c.evictionStates.Load(key)
+		if !ok {
+			return
+		}
+		state.Lock()
+		if current, ok := c.evictionStates.Load(key); ok && current == state {
+			c.evictionStates.Delete(key)
+			state.Unlock()
+			return
+		}
+		state.Unlock()
+	}
+}
+
+func (c *configWatcher) deleteNamespaceEvictionStates(namespace string) {
+	c.evictionStates.Range(func(key WorkloadKey, _ *workloadEvictionState) bool {
+		if key.Namespace == namespace {
+			c.deleteEvictionState(key)
+		}
+		return true
+	})
+}
+
 type mapKey struct{}
 
 func WithMap(ctx context.Context, m Map) context.Context {
@@ -536,6 +574,7 @@ func (c *configWatcher) deleteMapsAndRolloutNS(ctx context.Context, ns string, i
 	defer func() {
 		iwc.cancel()
 		c.informers.Delete(ns)
+		c.deleteNamespaceEvictionStates(ns)
 		informer.DropFactory(ctx, ns)
 	}()
 

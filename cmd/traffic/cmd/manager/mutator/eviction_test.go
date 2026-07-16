@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	argoRollouts "github.com/datawire/argo-rollouts-go-client/pkg/apis/rollouts/v1alpha1"
 	argorolloutsfake "github.com/datawire/argo-rollouts-go-client/pkg/client/clientset/versioned/fake"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -117,6 +118,25 @@ func TestWorkloadRolloutInProgress(t *testing.T) {
 	assert.False(t, workloadRolloutInProgress(k8sapi.StatefulSet(statefulSet)), "completed partitioned rollout")
 	statefulSet.Status.UpdatedReplicas = 2
 	assert.True(t, workloadRolloutInProgress(k8sapi.StatefulSet(statefulSet)), "partitioned rollout in progress")
+
+	rollout := &argoRollouts.Rollout{
+		ObjectMeta: meta.ObjectMeta{Generation: 12},
+		Spec:       argoRollouts.RolloutSpec{Replicas: &replicas},
+		Status: argoRollouts.RolloutStatus{
+			ObservedGeneration: "12",
+			Replicas:           6,
+			UpdatedReplicas:    6,
+			ReadyReplicas:      6,
+			AvailableReplicas:  6,
+			Phase:              argoRollouts.RolloutPhaseHealthy,
+		},
+	}
+	assert.False(t, workloadRolloutInProgress(k8sapi.Rollout(rollout)), "healthy rollout")
+	rollout.Status.Phase = argoRollouts.RolloutPhaseProgressing
+	assert.True(t, workloadRolloutInProgress(k8sapi.Rollout(rollout)), "analysis in progress")
+	rollout.Status.Phase = argoRollouts.RolloutPhaseHealthy
+	rollout.Status.ReadyReplicas = 5
+	assert.True(t, workloadRolloutInProgress(k8sapi.Rollout(rollout)), "rollout awaiting readiness")
 }
 
 func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
@@ -125,7 +145,7 @@ func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 		status            apps.DeploymentStatus
 		wantEvictionCount int
 		wantPatchCount    int
-		wantDidRollout    bool
+		wantResult        podEvictionResult
 	}{
 		{
 			name: "stable workload",
@@ -137,7 +157,7 @@ func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 			},
 			wantEvictionCount: 1,
 			wantPatchCount:    1,
-			wantDidRollout:    true,
+			wantResult:        podEvictionStarted,
 		},
 		{
 			name: "stable workload with unavailable replica",
@@ -154,7 +174,7 @@ func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 			},
 			wantEvictionCount: 1,
 			wantPatchCount:    1,
-			wantDidRollout:    true,
+			wantResult:        podEvictionStarted,
 		},
 		{
 			name: "update in progress",
@@ -164,7 +184,7 @@ func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 				UpdatedReplicas:    3,
 				AvailableReplicas:  5,
 			},
-			wantDidRollout: true,
+			wantResult: podEvictionDeferred,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -187,9 +207,9 @@ func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 
 			ctx := k8sapi.WithK8sInterface(context.Background(), client)
 			ctx = managerutil.WithEnv(ctx, &managerutil.Env{})
-			didRollout, err := evictOrRollout(ctx, k8sapi.Deployment(deployment), pod, 0)
+			result, err := evictOrRollout(ctx, k8sapi.Deployment(deployment), pod)
 			require.NoError(t, err)
-			assert.Equal(t, tc.wantDidRollout, didRollout)
+			assert.Equal(t, tc.wantResult, result)
 			assert.Equal(t, tc.wantEvictionCount, evictionCount)
 
 			patchCount := 0
@@ -201,6 +221,227 @@ func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 			assert.Equal(t, tc.wantPatchCount, patchCount)
 		})
 	}
+}
+
+func TestPodsWithAgentConfigMismatchIgnoresManualInjection(t *testing.T) {
+	pod := &core.Pod{ObjectMeta: meta.ObjectMeta{
+		Name: "echo",
+		Annotations: map[string]string{
+			annotation.Config:           "stale",
+			annotation.ManuallyInjected: "true",
+		},
+	}}
+	assert.Empty(t, podsWithAgentConfigMismatch(context.Background(), []*core.Pod{pod}, ""))
+}
+
+func TestDeferredEvictionIsNotMarkedDeleted(t *testing.T) {
+	replicas := int32(2)
+	stable := &apps.Deployment{
+		ObjectMeta: meta.ObjectMeta{Name: "echo", Namespace: "default", Generation: 3},
+		Spec:       apps.DeploymentSpec{Replicas: &replicas},
+		Status: apps.DeploymentStatus{
+			ObservedGeneration: 3,
+			Replicas:           2,
+			UpdatedReplicas:    2,
+			AvailableReplicas:  2,
+		},
+	}
+	updating := stable.DeepCopy()
+	updating.Status.Replicas = 3
+	updating.Status.UpdatedReplicas = 1
+	pod := &core.Pod{ObjectMeta: meta.ObjectMeta{Name: "echo-old", Namespace: "default", UID: "old"}}
+	client := fake.NewSimpleClientset(stable.DeepCopy(), pod.DeepCopy())
+	getCount := 0
+	client.PrependReactor("get", "deployments", func(k8sTesting.Action) (bool, runtime.Object, error) {
+		getCount++
+		if getCount == 1 {
+			return true, stable.DeepCopy(), nil
+		}
+		return true, updating.DeepCopy(), nil
+	})
+
+	ctx := k8sapi.WithK8sInterface(context.Background(), client)
+	cw := NewWatcher().(*configWatcher)
+	require.NoError(t, cw.evictPods(ctx, k8sapi.Deployment(stable), []*core.Pod{pod}))
+	assert.False(t, cw.isEvicted(pod.UID))
+}
+
+func TestAbsentPodDoesNotConsumeSuccessfulEvictionCount(t *testing.T) {
+	replicas := int32(2)
+	deployment := &apps.Deployment{
+		ObjectMeta: meta.ObjectMeta{Name: "echo", Namespace: "default", Generation: 3},
+		Spec: apps.DeploymentSpec{
+			Replicas: &replicas,
+			Template: core.PodTemplateSpec{ObjectMeta: meta.ObjectMeta{Annotations: map[string]string{}}},
+		},
+		Status: apps.DeploymentStatus{
+			ObservedGeneration: 3,
+			Replicas:           2,
+			UpdatedReplicas:    2,
+			AvailableReplicas:  2,
+		},
+	}
+	oldPods := []*core.Pod{
+		{ObjectMeta: meta.ObjectMeta{Name: "echo-gone", Namespace: "default", UID: "gone"}},
+		{ObjectMeta: meta.ObjectMeta{Name: "echo-blocked", Namespace: "default", UID: "blocked"}},
+	}
+	client := fake.NewSimpleClientset(deployment.DeepCopy())
+	evictionCount := 0
+	client.PrependReactor("create", "pods", func(action k8sTesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		evictionCount++
+		if evictionCount == 1 {
+			return true, nil, apierrors.NewNotFound(core.Resource("pods"), oldPods[0].Name)
+		}
+		return true, nil, apierrors.NewTooManyRequests("eviction would violate the pod's disruption budget", 0)
+	})
+
+	ctx := k8sapi.WithK8sInterface(context.Background(), client)
+	ctx = informer.WithFactory(ctx, "")
+	store := informer.GetK8sFactory(ctx, "default").Core().V1().Pods().Informer().GetStore()
+	for _, pod := range oldPods {
+		require.NoError(t, store.Add(pod.DeepCopy()))
+	}
+	cw := NewWatcher().(*configWatcher)
+	require.NoError(t, cw.evictPods(ctx, k8sapi.Deployment(deployment), oldPods))
+	assert.Equal(t, 2, evictionCount)
+	assert.Equal(t, 1, countActions(client.Actions(), "patch", "deployments"))
+}
+
+func TestEvictPodConflictPreservesReplacementInStore(t *testing.T) {
+	oldPod := &core.Pod{ObjectMeta: meta.ObjectMeta{Name: "echo", Namespace: "default", UID: "old"}}
+	replacement := oldPod.DeepCopy()
+	replacement.UID = "new"
+	client := fake.NewSimpleClientset(replacement.DeepCopy())
+	client.PrependReactor("create", "pods", func(action k8sTesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() == "eviction" {
+			return true, nil, apierrors.NewConflict(core.Resource("pods"), oldPod.Name, fmt.Errorf("UID precondition failed"))
+		}
+		return false, nil, nil
+	})
+
+	ctx := k8sapi.WithK8sInterface(context.Background(), client)
+	ctx = informer.WithFactory(ctx, "")
+	store := informer.GetK8sFactory(ctx, "default").Core().V1().Pods().Informer().GetStore()
+	require.NoError(t, store.Add(replacement.DeepCopy()))
+	evicted, err := evictPod(ctx, oldPod)
+	require.NoError(t, err)
+	assert.False(t, evicted)
+	cached, exists, err := store.Get(oldPod)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, replacement.UID, cached.(*core.Pod).UID)
+}
+
+func TestWaitForWorkloadRecoveryFollowsDesiredReplicaChanges(t *testing.T) {
+	oldReplicas := int32(3)
+	newReplicas := int32(4)
+	original := &apps.Deployment{
+		ObjectMeta: meta.ObjectMeta{Name: "echo", Namespace: "default", Generation: 1},
+		Spec:       apps.DeploymentSpec{Replicas: &oldReplicas},
+	}
+	rescaled := original.DeepCopy()
+	rescaled.Spec.Replicas = &newReplicas
+	rescaled.Status = apps.DeploymentStatus{
+		ObservedGeneration: 1,
+		Replicas:           4,
+		UpdatedReplicas:    4,
+		ReadyReplicas:      4,
+		AvailableReplicas:  4,
+	}
+	client := fake.NewSimpleClientset(rescaled)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ctx = k8sapi.WithK8sInterface(ctx, client)
+	require.NoError(t, waitForWorkloadRecovery(ctx, k8sapi.Deployment(original)))
+}
+
+func TestTeardownContinuesAfterWorkloadFailure(t *testing.T) {
+	const namespace = "default"
+	replicas := int32(1)
+	objects := make([]runtime.Object, 0, 4)
+	for _, name := range []string{"echo-one", "echo-two"} {
+		selector := map[string]string{"app": name}
+		objects = append(objects,
+			&apps.ReplicaSet{
+				ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace, Generation: 1},
+				Spec: apps.ReplicaSetSpec{
+					Replicas: &replicas,
+					Selector: &meta.LabelSelector{MatchLabels: selector},
+				},
+				Status: apps.ReplicaSetStatus{
+					ObservedGeneration:   1,
+					Replicas:             1,
+					ReadyReplicas:        1,
+					AvailableReplicas:    1,
+					FullyLabeledReplicas: 1,
+				},
+			},
+			&core.Pod{
+				ObjectMeta: meta.ObjectMeta{
+					Name:      name + "-old",
+					Namespace: namespace,
+					UID:       types.UID(name + "-old"),
+					Labels: map[string]string{
+						"app":                         name,
+						agentconfig.WorkloadNameLabel: name,
+						agentconfig.WorkloadKindLabel: string(k8sapi.ReplicaSetKind),
+					},
+					Annotations: map[string]string{annotation.Config: "stale"},
+				},
+				Status: core.PodStatus{Phase: core.PodRunning},
+			},
+		)
+	}
+
+	client := fake.NewSimpleClientset(objects...)
+	attempted := make(map[string]bool)
+	client.PrependReactor("get", "replicasets", func(action k8sTesting.Action) (bool, runtime.Object, error) {
+		name := action.(k8sTesting.GetAction).GetName()
+		attempted[name] = true
+		return true, nil, apierrors.NewForbidden(apps.Resource("replicasets"), name, fmt.Errorf("denied"))
+	})
+
+	ctx := k8sapi.WithJoinedClientSetInterface(context.Background(), client, argorolloutsfake.NewSimpleClientset())
+	ctx = informer.WithFactory(ctx, "")
+	ctx = managerutil.WithEnv(ctx, &managerutil.Env{EnabledWorkloadKinds: k8sapi.Kinds{k8sapi.ReplicaSetKind}})
+	factory := informer.GetK8sFactory(ctx, namespace)
+	podStore := factory.Core().V1().Pods().Informer().GetStore()
+	replicaSetStore := factory.Apps().V1().ReplicaSets().Informer().GetStore()
+	for _, object := range objects {
+		switch object := object.(type) {
+		case *core.Pod:
+			require.NoError(t, podStore.Add(object.DeepCopy()))
+		case *apps.ReplicaSet:
+			require.NoError(t, replicaSetStore.Add(object.DeepCopy()))
+		}
+	}
+
+	cw := NewWatcher().(*configWatcher)
+	require.Error(t, cw.evictAllPodsWithAgentConfigAndWait(ctx, namespace))
+	assert.Equal(t, map[string]bool{"echo-one": true, "echo-two": true}, attempted)
+}
+
+func TestEvictionStateIsReclaimed(t *testing.T) {
+	cw := NewWatcher().(*configWatcher)
+	key := WorkloadKey{Name: "echo", Namespace: "default", Kind: k8sapi.DeploymentKind}
+	state := cw.lockEvictionState(key)
+	state.Unlock()
+	require.Equal(t, 1, cw.evictionStates.Size())
+	cw.deleteEvictionState(key)
+	assert.Zero(t, cw.evictionStates.Size())
+}
+
+func countActions(actions []k8sTesting.Action, verb, resource string) int {
+	count := 0
+	for _, action := range actions {
+		if action.GetVerb() == verb && action.GetResource().Resource == resource {
+			count++
+		}
+	}
+	return count
 }
 
 func TestRefreshWorkloadRetriesTransientError(t *testing.T) {
