@@ -1102,6 +1102,104 @@ func (x *SetInterceptShortcutsRequest) GetShortcuts() []*InterceptShortcut {
 	return nil
 }
 
+type LocalClientRedirect struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// host_port is a iputil.ProtoAddrPort in binary format
+	DstHostPort []byte `protobuf:"bytes,1,opt,name=dst_host_port,json=dstHostPort,proto3" json:"dst_host_port,omitempty"`
+	// local_port is the port on localhost that traffic is redirected to.
+	LocalPort     uint32 `protobuf:"varint,2,opt,name=local_port,json=localPort,proto3" json:"local_port,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LocalClientRedirect) Reset() {
+	*x = LocalClientRedirect{}
+	mi := &file_daemon_daemon_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LocalClientRedirect) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LocalClientRedirect) ProtoMessage() {}
+
+func (x *LocalClientRedirect) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_daemon_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LocalClientRedirect.ProtoReflect.Descriptor instead.
+func (*LocalClientRedirect) Descriptor() ([]byte, []int) {
+	return file_daemon_daemon_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *LocalClientRedirect) GetDstHostPort() []byte {
+	if x != nil {
+		return x.DstHostPort
+	}
+	return nil
+}
+
+func (x *LocalClientRedirect) GetLocalPort() uint32 {
+	if x != nil {
+		return x.LocalPort
+	}
+	return 0
+}
+
+type LocalClientRedirects struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Redirects     []*LocalClientRedirect `protobuf:"bytes,1,rep,name=redirects,proto3" json:"redirects,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LocalClientRedirects) Reset() {
+	*x = LocalClientRedirects{}
+	mi := &file_daemon_daemon_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LocalClientRedirects) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LocalClientRedirects) ProtoMessage() {}
+
+func (x *LocalClientRedirects) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_daemon_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LocalClientRedirects.ProtoReflect.Descriptor instead.
+func (*LocalClientRedirects) Descriptor() ([]byte, []int) {
+	return file_daemon_daemon_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *LocalClientRedirects) GetRedirects() []*LocalClientRedirect {
+	if x != nil {
+		return x.Redirects
+	}
+	return nil
+}
+
 type QuitResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Set to true when the root daemon runs as a service.
@@ -1112,7 +1210,7 @@ type QuitResponse struct {
 
 func (x *QuitResponse) Reset() {
 	*x = QuitResponse{}
-	mi := &file_daemon_daemon_proto_msgTypes[18]
+	mi := &file_daemon_daemon_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1124,7 +1222,7 @@ func (x *QuitResponse) String() string {
 func (*QuitResponse) ProtoMessage() {}
 
 func (x *QuitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_daemon_proto_msgTypes[18]
+	mi := &file_daemon_daemon_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1137,7 +1235,7 @@ func (x *QuitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QuitResponse.ProtoReflect.Descriptor instead.
 func (*QuitResponse) Descriptor() ([]byte, []int) {
-	return file_daemon_daemon_proto_rawDescGZIP(), []int{18}
+	return file_daemon_daemon_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *QuitResponse) GetRootDaemonWillContinue() bool {
@@ -1178,7 +1276,7 @@ type Activity struct {
 
 func (x *Activity) Reset() {
 	*x = Activity{}
-	mi := &file_daemon_daemon_proto_msgTypes[19]
+	mi := &file_daemon_daemon_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1190,7 +1288,7 @@ func (x *Activity) String() string {
 func (*Activity) ProtoMessage() {}
 
 func (x *Activity) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_daemon_proto_msgTypes[19]
+	mi := &file_daemon_daemon_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1203,7 +1301,7 @@ func (x *Activity) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Activity.ProtoReflect.Descriptor instead.
 func (*Activity) Descriptor() ([]byte, []int) {
-	return file_daemon_daemon_proto_rawDescGZIP(), []int{19}
+	return file_daemon_daemon_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *Activity) GetActivity() *timestamppb.Timestamp {
@@ -1337,7 +1435,13 @@ const file_daemon_daemon_proto_rawDesc = "" +
 	"\x0econtainer_port\x18\x05 \x01(\rR\rcontainerPort\x12\x16\n" +
 	"\x06target\x18\x06 \x01(\fR\x06target\"d\n" +
 	"\x1cSetInterceptShortcutsRequest\x12D\n" +
-	"\tshortcuts\x18\x01 \x03(\v2&.telepresence.daemon.InterceptShortcutR\tshortcuts\"I\n" +
+	"\tshortcuts\x18\x01 \x03(\v2&.telepresence.daemon.InterceptShortcutR\tshortcuts\"X\n" +
+	"\x13LocalClientRedirect\x12\"\n" +
+	"\rdst_host_port\x18\x01 \x01(\fR\vdstHostPort\x12\x1d\n" +
+	"\n" +
+	"local_port\x18\x02 \x01(\rR\tlocalPort\"^\n" +
+	"\x14LocalClientRedirects\x12F\n" +
+	"\tredirects\x18\x01 \x03(\v2(.telepresence.daemon.LocalClientRedirectR\tredirects\"I\n" +
 	"\fQuitResponse\x129\n" +
 	"\x19root_daemon_will_continue\x18\x01 \x01(\bR\x16rootDaemonWillContinue\"\xe3\x02\n" +
 	"\bActivity\x126\n" +
@@ -1348,7 +1452,7 @@ const file_daemon_daemon_proto_rawDesc = "" +
 	"\x10outbound_tunnels\x18\x04 \x01(\x03R\x0foutboundTunnels\x124\n" +
 	"\x16outbound_tunnel_errors\x18\x05 \x01(\x03R\x14outboundTunnelErrors\x12%\n" +
 	"\x0eincoming_dials\x18\x06 \x01(\x03R\rincomingDials\x120\n" +
-	"\x14incoming_dial_errors\x18\a \x01(\x03R\x12incomingDialErrors2\xc3\v\n" +
+	"\x14incoming_dial_errors\x18\a \x01(\x03R\x12incomingDialErrors2\xdb\r\n" +
 	"\x06Daemon\x12C\n" +
 	"\aVersion\x12\x16.google.protobuf.Empty\x1a .telepresence.common.VersionInfo\x12C\n" +
 	"\x06Status\x12\x16.google.protobuf.Empty\x1a!.telepresence.daemon.DaemonStatus\x12A\n" +
@@ -1367,7 +1471,10 @@ const file_daemon_daemon_proto_rawDesc = "" +
 	"\bLookupIP\x12$.telepresence.daemon.LookupIPRequest\x1a%.telepresence.daemon.LookupIPResponse\x12`\n" +
 	"\vResolvePort\x12'.telepresence.daemon.ResolvePortRequest\x1a(.telepresence.daemon.ResolvePortResponse\x12T\n" +
 	"\x11RerouteRemotePort\x12'.telepresence.daemon.ReroutePortRequest\x1a\x16.google.protobuf.Empty\x12b\n" +
-	"\x15SetInterceptShortcuts\x121.telepresence.daemon.SetInterceptShortcutsRequest\x1a\x16.google.protobuf.Empty\x12J\n" +
+	"\x15SetInterceptShortcuts\x121.telepresence.daemon.SetInterceptShortcutsRequest\x1a\x16.google.protobuf.Empty\x12Y\n" +
+	"\x16AddLocalClientRedirect\x12'.telepresence.daemon.ReroutePortRequest\x1a\x16.google.protobuf.Empty\x12\\\n" +
+	"\x19RemoveLocalClientRedirect\x12'.telepresence.daemon.ReroutePortRequest\x1a\x16.google.protobuf.Empty\x12]\n" +
+	"\x18ListLocalClientRedirects\x12\x16.google.protobuf.Empty\x1a).telepresence.daemon.LocalClientRedirects\x12J\n" +
 	"\x0fActivityWatcher\x12\x16.google.protobuf.Empty\x1a\x1d.telepresence.daemon.Activity0\x01B6Z4github.com/telepresenceio/telepresence/rpc/v2/daemonb\x06proto3"
 
 var (
@@ -1382,7 +1489,7 @@ func file_daemon_daemon_proto_rawDescGZIP() []byte {
 	return file_daemon_daemon_proto_rawDescData
 }
 
-var file_daemon_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_daemon_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_daemon_daemon_proto_goTypes = []any{
 	(*DaemonStatus)(nil),                 // 0: telepresence.daemon.DaemonStatus
 	(*Domains)(nil),                      // 1: telepresence.daemon.Domains
@@ -1402,72 +1509,81 @@ var file_daemon_daemon_proto_goTypes = []any{
 	(*ReroutePortRequest)(nil),           // 15: telepresence.daemon.ReroutePortRequest
 	(*InterceptShortcut)(nil),            // 16: telepresence.daemon.InterceptShortcut
 	(*SetInterceptShortcutsRequest)(nil), // 17: telepresence.daemon.SetInterceptShortcutsRequest
-	(*QuitResponse)(nil),                 // 18: telepresence.daemon.QuitResponse
-	(*Activity)(nil),                     // 19: telepresence.daemon.Activity
-	nil,                                  // 20: telepresence.daemon.NetworkConfig.KubeFlagsEntry
-	nil,                                  // 21: telepresence.daemon.Environment.EnvEntry
-	(*common.VersionInfo)(nil),           // 22: telepresence.common.VersionInfo
-	(*durationpb.Duration)(nil),          // 23: google.protobuf.Duration
-	(*manager.SessionInfo)(nil),          // 24: telepresence.manager.SessionInfo
-	(*timestamppb.Timestamp)(nil),        // 25: google.protobuf.Timestamp
-	(*emptypb.Empty)(nil),                // 26: google.protobuf.Empty
-	(*manager.LogLevelRequest)(nil),      // 27: telepresence.manager.LogLevelRequest
+	(*LocalClientRedirect)(nil),          // 18: telepresence.daemon.LocalClientRedirect
+	(*LocalClientRedirects)(nil),         // 19: telepresence.daemon.LocalClientRedirects
+	(*QuitResponse)(nil),                 // 20: telepresence.daemon.QuitResponse
+	(*Activity)(nil),                     // 21: telepresence.daemon.Activity
+	nil,                                  // 22: telepresence.daemon.NetworkConfig.KubeFlagsEntry
+	nil,                                  // 23: telepresence.daemon.Environment.EnvEntry
+	(*common.VersionInfo)(nil),           // 24: telepresence.common.VersionInfo
+	(*durationpb.Duration)(nil),          // 25: google.protobuf.Duration
+	(*manager.SessionInfo)(nil),          // 26: telepresence.manager.SessionInfo
+	(*timestamppb.Timestamp)(nil),        // 27: google.protobuf.Timestamp
+	(*emptypb.Empty)(nil),                // 28: google.protobuf.Empty
+	(*manager.LogLevelRequest)(nil),      // 29: telepresence.manager.LogLevelRequest
 }
 var file_daemon_daemon_proto_depIdxs = []int32{
 	5,  // 0: telepresence.daemon.DaemonStatus.outbound_config:type_name -> telepresence.daemon.NetworkConfig
-	22, // 1: telepresence.daemon.DaemonStatus.version:type_name -> telepresence.common.VersionInfo
+	24, // 1: telepresence.daemon.DaemonStatus.version:type_name -> telepresence.common.VersionInfo
 	2,  // 2: telepresence.daemon.DNSConfig.mappings:type_name -> telepresence.daemon.DNSMapping
-	23, // 3: telepresence.daemon.DNSConfig.lookup_timeout:type_name -> google.protobuf.Duration
-	24, // 4: telepresence.daemon.NetworkConfig.session:type_name -> telepresence.manager.SessionInfo
+	25, // 3: telepresence.daemon.DNSConfig.lookup_timeout:type_name -> google.protobuf.Duration
+	26, // 4: telepresence.daemon.NetworkConfig.session:type_name -> telepresence.manager.SessionInfo
 	4,  // 5: telepresence.daemon.NetworkConfig.subnet_via_workloads:type_name -> telepresence.daemon.SubnetViaWorkload
-	20, // 6: telepresence.daemon.NetworkConfig.kube_flags:type_name -> telepresence.daemon.NetworkConfig.KubeFlagsEntry
+	22, // 6: telepresence.daemon.NetworkConfig.kube_flags:type_name -> telepresence.daemon.NetworkConfig.KubeFlagsEntry
 	2,  // 7: telepresence.daemon.SetDNSMappingsRequest.mappings:type_name -> telepresence.daemon.DNSMapping
-	23, // 8: telepresence.daemon.WaitForAgentIPRequest.timeout:type_name -> google.protobuf.Duration
-	21, // 9: telepresence.daemon.Environment.env:type_name -> telepresence.daemon.Environment.EnvEntry
+	25, // 8: telepresence.daemon.WaitForAgentIPRequest.timeout:type_name -> google.protobuf.Duration
+	23, // 9: telepresence.daemon.Environment.env:type_name -> telepresence.daemon.Environment.EnvEntry
 	16, // 10: telepresence.daemon.SetInterceptShortcutsRequest.shortcuts:type_name -> telepresence.daemon.InterceptShortcut
-	25, // 11: telepresence.daemon.Activity.activity:type_name -> google.protobuf.Timestamp
-	23, // 12: telepresence.daemon.Activity.session_duration:type_name -> google.protobuf.Duration
-	26, // 13: telepresence.daemon.Daemon.Version:input_type -> google.protobuf.Empty
-	26, // 14: telepresence.daemon.Daemon.Status:input_type -> google.protobuf.Empty
-	26, // 15: telepresence.daemon.Daemon.Quit:input_type -> google.protobuf.Empty
-	5,  // 16: telepresence.daemon.Daemon.Connect:input_type -> telepresence.daemon.NetworkConfig
-	26, // 17: telepresence.daemon.Daemon.Disconnect:input_type -> google.protobuf.Empty
-	26, // 18: telepresence.daemon.Daemon.GetNetworkConfig:input_type -> google.protobuf.Empty
-	1,  // 19: telepresence.daemon.Daemon.SetDNSTopLevelDomains:input_type -> telepresence.daemon.Domains
-	6,  // 20: telepresence.daemon.Daemon.SetDNSExcludes:input_type -> telepresence.daemon.SetDNSExcludesRequest
-	7,  // 21: telepresence.daemon.Daemon.SetDNSMappings:input_type -> telepresence.daemon.SetDNSMappingsRequest
-	27, // 22: telepresence.daemon.Daemon.SetLogLevel:input_type -> telepresence.manager.LogLevelRequest
-	12, // 23: telepresence.daemon.Daemon.TranslateEnvIPs:input_type -> telepresence.daemon.Environment
-	26, // 24: telepresence.daemon.Daemon.WaitForNetwork:input_type -> google.protobuf.Empty
-	8,  // 25: telepresence.daemon.Daemon.WaitForAgentIP:input_type -> telepresence.daemon.WaitForAgentIPRequest
-	10, // 26: telepresence.daemon.Daemon.LookupIP:input_type -> telepresence.daemon.LookupIPRequest
-	13, // 27: telepresence.daemon.Daemon.ResolvePort:input_type -> telepresence.daemon.ResolvePortRequest
-	15, // 28: telepresence.daemon.Daemon.RerouteRemotePort:input_type -> telepresence.daemon.ReroutePortRequest
-	17, // 29: telepresence.daemon.Daemon.SetInterceptShortcuts:input_type -> telepresence.daemon.SetInterceptShortcutsRequest
-	26, // 30: telepresence.daemon.Daemon.ActivityWatcher:input_type -> google.protobuf.Empty
-	22, // 31: telepresence.daemon.Daemon.Version:output_type -> telepresence.common.VersionInfo
-	0,  // 32: telepresence.daemon.Daemon.Status:output_type -> telepresence.daemon.DaemonStatus
-	18, // 33: telepresence.daemon.Daemon.Quit:output_type -> telepresence.daemon.QuitResponse
-	0,  // 34: telepresence.daemon.Daemon.Connect:output_type -> telepresence.daemon.DaemonStatus
-	26, // 35: telepresence.daemon.Daemon.Disconnect:output_type -> google.protobuf.Empty
-	5,  // 36: telepresence.daemon.Daemon.GetNetworkConfig:output_type -> telepresence.daemon.NetworkConfig
-	26, // 37: telepresence.daemon.Daemon.SetDNSTopLevelDomains:output_type -> google.protobuf.Empty
-	26, // 38: telepresence.daemon.Daemon.SetDNSExcludes:output_type -> google.protobuf.Empty
-	26, // 39: telepresence.daemon.Daemon.SetDNSMappings:output_type -> google.protobuf.Empty
-	26, // 40: telepresence.daemon.Daemon.SetLogLevel:output_type -> google.protobuf.Empty
-	12, // 41: telepresence.daemon.Daemon.TranslateEnvIPs:output_type -> telepresence.daemon.Environment
-	26, // 42: telepresence.daemon.Daemon.WaitForNetwork:output_type -> google.protobuf.Empty
-	9,  // 43: telepresence.daemon.Daemon.WaitForAgentIP:output_type -> telepresence.daemon.WaitForAgentIPResponse
-	11, // 44: telepresence.daemon.Daemon.LookupIP:output_type -> telepresence.daemon.LookupIPResponse
-	14, // 45: telepresence.daemon.Daemon.ResolvePort:output_type -> telepresence.daemon.ResolvePortResponse
-	26, // 46: telepresence.daemon.Daemon.RerouteRemotePort:output_type -> google.protobuf.Empty
-	26, // 47: telepresence.daemon.Daemon.SetInterceptShortcuts:output_type -> google.protobuf.Empty
-	19, // 48: telepresence.daemon.Daemon.ActivityWatcher:output_type -> telepresence.daemon.Activity
-	31, // [31:49] is the sub-list for method output_type
-	13, // [13:31] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	18, // 11: telepresence.daemon.LocalClientRedirects.redirects:type_name -> telepresence.daemon.LocalClientRedirect
+	27, // 12: telepresence.daemon.Activity.activity:type_name -> google.protobuf.Timestamp
+	25, // 13: telepresence.daemon.Activity.session_duration:type_name -> google.protobuf.Duration
+	28, // 14: telepresence.daemon.Daemon.Version:input_type -> google.protobuf.Empty
+	28, // 15: telepresence.daemon.Daemon.Status:input_type -> google.protobuf.Empty
+	28, // 16: telepresence.daemon.Daemon.Quit:input_type -> google.protobuf.Empty
+	5,  // 17: telepresence.daemon.Daemon.Connect:input_type -> telepresence.daemon.NetworkConfig
+	28, // 18: telepresence.daemon.Daemon.Disconnect:input_type -> google.protobuf.Empty
+	28, // 19: telepresence.daemon.Daemon.GetNetworkConfig:input_type -> google.protobuf.Empty
+	1,  // 20: telepresence.daemon.Daemon.SetDNSTopLevelDomains:input_type -> telepresence.daemon.Domains
+	6,  // 21: telepresence.daemon.Daemon.SetDNSExcludes:input_type -> telepresence.daemon.SetDNSExcludesRequest
+	7,  // 22: telepresence.daemon.Daemon.SetDNSMappings:input_type -> telepresence.daemon.SetDNSMappingsRequest
+	29, // 23: telepresence.daemon.Daemon.SetLogLevel:input_type -> telepresence.manager.LogLevelRequest
+	12, // 24: telepresence.daemon.Daemon.TranslateEnvIPs:input_type -> telepresence.daemon.Environment
+	28, // 25: telepresence.daemon.Daemon.WaitForNetwork:input_type -> google.protobuf.Empty
+	8,  // 26: telepresence.daemon.Daemon.WaitForAgentIP:input_type -> telepresence.daemon.WaitForAgentIPRequest
+	10, // 27: telepresence.daemon.Daemon.LookupIP:input_type -> telepresence.daemon.LookupIPRequest
+	13, // 28: telepresence.daemon.Daemon.ResolvePort:input_type -> telepresence.daemon.ResolvePortRequest
+	15, // 29: telepresence.daemon.Daemon.RerouteRemotePort:input_type -> telepresence.daemon.ReroutePortRequest
+	17, // 30: telepresence.daemon.Daemon.SetInterceptShortcuts:input_type -> telepresence.daemon.SetInterceptShortcutsRequest
+	15, // 31: telepresence.daemon.Daemon.AddLocalClientRedirect:input_type -> telepresence.daemon.ReroutePortRequest
+	15, // 32: telepresence.daemon.Daemon.RemoveLocalClientRedirect:input_type -> telepresence.daemon.ReroutePortRequest
+	28, // 33: telepresence.daemon.Daemon.ListLocalClientRedirects:input_type -> google.protobuf.Empty
+	28, // 34: telepresence.daemon.Daemon.ActivityWatcher:input_type -> google.protobuf.Empty
+	24, // 35: telepresence.daemon.Daemon.Version:output_type -> telepresence.common.VersionInfo
+	0,  // 36: telepresence.daemon.Daemon.Status:output_type -> telepresence.daemon.DaemonStatus
+	20, // 37: telepresence.daemon.Daemon.Quit:output_type -> telepresence.daemon.QuitResponse
+	0,  // 38: telepresence.daemon.Daemon.Connect:output_type -> telepresence.daemon.DaemonStatus
+	28, // 39: telepresence.daemon.Daemon.Disconnect:output_type -> google.protobuf.Empty
+	5,  // 40: telepresence.daemon.Daemon.GetNetworkConfig:output_type -> telepresence.daemon.NetworkConfig
+	28, // 41: telepresence.daemon.Daemon.SetDNSTopLevelDomains:output_type -> google.protobuf.Empty
+	28, // 42: telepresence.daemon.Daemon.SetDNSExcludes:output_type -> google.protobuf.Empty
+	28, // 43: telepresence.daemon.Daemon.SetDNSMappings:output_type -> google.protobuf.Empty
+	28, // 44: telepresence.daemon.Daemon.SetLogLevel:output_type -> google.protobuf.Empty
+	12, // 45: telepresence.daemon.Daemon.TranslateEnvIPs:output_type -> telepresence.daemon.Environment
+	28, // 46: telepresence.daemon.Daemon.WaitForNetwork:output_type -> google.protobuf.Empty
+	9,  // 47: telepresence.daemon.Daemon.WaitForAgentIP:output_type -> telepresence.daemon.WaitForAgentIPResponse
+	11, // 48: telepresence.daemon.Daemon.LookupIP:output_type -> telepresence.daemon.LookupIPResponse
+	14, // 49: telepresence.daemon.Daemon.ResolvePort:output_type -> telepresence.daemon.ResolvePortResponse
+	28, // 50: telepresence.daemon.Daemon.RerouteRemotePort:output_type -> google.protobuf.Empty
+	28, // 51: telepresence.daemon.Daemon.SetInterceptShortcuts:output_type -> google.protobuf.Empty
+	28, // 52: telepresence.daemon.Daemon.AddLocalClientRedirect:output_type -> google.protobuf.Empty
+	28, // 53: telepresence.daemon.Daemon.RemoveLocalClientRedirect:output_type -> google.protobuf.Empty
+	19, // 54: telepresence.daemon.Daemon.ListLocalClientRedirects:output_type -> telepresence.daemon.LocalClientRedirects
+	21, // 55: telepresence.daemon.Daemon.ActivityWatcher:output_type -> telepresence.daemon.Activity
+	35, // [35:56] is the sub-list for method output_type
+	14, // [14:35] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_daemon_daemon_proto_init() }
@@ -1482,7 +1598,7 @@ func file_daemon_daemon_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_daemon_daemon_proto_rawDesc), len(file_daemon_daemon_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   22,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

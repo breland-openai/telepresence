@@ -22,24 +22,27 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Daemon_Version_FullMethodName               = "/telepresence.daemon.Daemon/Version"
-	Daemon_Status_FullMethodName                = "/telepresence.daemon.Daemon/Status"
-	Daemon_Quit_FullMethodName                  = "/telepresence.daemon.Daemon/Quit"
-	Daemon_Connect_FullMethodName               = "/telepresence.daemon.Daemon/Connect"
-	Daemon_Disconnect_FullMethodName            = "/telepresence.daemon.Daemon/Disconnect"
-	Daemon_GetNetworkConfig_FullMethodName      = "/telepresence.daemon.Daemon/GetNetworkConfig"
-	Daemon_SetDNSTopLevelDomains_FullMethodName = "/telepresence.daemon.Daemon/SetDNSTopLevelDomains"
-	Daemon_SetDNSExcludes_FullMethodName        = "/telepresence.daemon.Daemon/SetDNSExcludes"
-	Daemon_SetDNSMappings_FullMethodName        = "/telepresence.daemon.Daemon/SetDNSMappings"
-	Daemon_SetLogLevel_FullMethodName           = "/telepresence.daemon.Daemon/SetLogLevel"
-	Daemon_TranslateEnvIPs_FullMethodName       = "/telepresence.daemon.Daemon/TranslateEnvIPs"
-	Daemon_WaitForNetwork_FullMethodName        = "/telepresence.daemon.Daemon/WaitForNetwork"
-	Daemon_WaitForAgentIP_FullMethodName        = "/telepresence.daemon.Daemon/WaitForAgentIP"
-	Daemon_LookupIP_FullMethodName              = "/telepresence.daemon.Daemon/LookupIP"
-	Daemon_ResolvePort_FullMethodName           = "/telepresence.daemon.Daemon/ResolvePort"
-	Daemon_RerouteRemotePort_FullMethodName     = "/telepresence.daemon.Daemon/RerouteRemotePort"
-	Daemon_SetInterceptShortcuts_FullMethodName = "/telepresence.daemon.Daemon/SetInterceptShortcuts"
-	Daemon_ActivityWatcher_FullMethodName       = "/telepresence.daemon.Daemon/ActivityWatcher"
+	Daemon_Version_FullMethodName                   = "/telepresence.daemon.Daemon/Version"
+	Daemon_Status_FullMethodName                    = "/telepresence.daemon.Daemon/Status"
+	Daemon_Quit_FullMethodName                      = "/telepresence.daemon.Daemon/Quit"
+	Daemon_Connect_FullMethodName                   = "/telepresence.daemon.Daemon/Connect"
+	Daemon_Disconnect_FullMethodName                = "/telepresence.daemon.Daemon/Disconnect"
+	Daemon_GetNetworkConfig_FullMethodName          = "/telepresence.daemon.Daemon/GetNetworkConfig"
+	Daemon_SetDNSTopLevelDomains_FullMethodName     = "/telepresence.daemon.Daemon/SetDNSTopLevelDomains"
+	Daemon_SetDNSExcludes_FullMethodName            = "/telepresence.daemon.Daemon/SetDNSExcludes"
+	Daemon_SetDNSMappings_FullMethodName            = "/telepresence.daemon.Daemon/SetDNSMappings"
+	Daemon_SetLogLevel_FullMethodName               = "/telepresence.daemon.Daemon/SetLogLevel"
+	Daemon_TranslateEnvIPs_FullMethodName           = "/telepresence.daemon.Daemon/TranslateEnvIPs"
+	Daemon_WaitForNetwork_FullMethodName            = "/telepresence.daemon.Daemon/WaitForNetwork"
+	Daemon_WaitForAgentIP_FullMethodName            = "/telepresence.daemon.Daemon/WaitForAgentIP"
+	Daemon_LookupIP_FullMethodName                  = "/telepresence.daemon.Daemon/LookupIP"
+	Daemon_ResolvePort_FullMethodName               = "/telepresence.daemon.Daemon/ResolvePort"
+	Daemon_RerouteRemotePort_FullMethodName         = "/telepresence.daemon.Daemon/RerouteRemotePort"
+	Daemon_SetInterceptShortcuts_FullMethodName     = "/telepresence.daemon.Daemon/SetInterceptShortcuts"
+	Daemon_AddLocalClientRedirect_FullMethodName    = "/telepresence.daemon.Daemon/AddLocalClientRedirect"
+	Daemon_RemoveLocalClientRedirect_FullMethodName = "/telepresence.daemon.Daemon/RemoveLocalClientRedirect"
+	Daemon_ListLocalClientRedirects_FullMethodName  = "/telepresence.daemon.Daemon/ListLocalClientRedirects"
+	Daemon_ActivityWatcher_FullMethodName           = "/telepresence.daemon.Daemon/ActivityWatcher"
 )
 
 // DaemonClient is the client API for Daemon service.
@@ -85,6 +88,12 @@ type DaemonClient interface {
 	// connects directly to local intercept handlers instead of tunneling to the cluster.
 	// Each call replaces the previously declared set.
 	SetInterceptShortcuts(ctx context.Context, in *SetInterceptShortcutsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// AddLocalClientRedirect redirects traffic for a netip.AddrPort to localhost on a different port.
+	AddLocalClientRedirect(ctx context.Context, in *ReroutePortRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// RemoveLocalClientRedirect stops redirecting traffic for a netip.AddrPort to localhost.
+	RemoveLocalClientRedirect(ctx context.Context, in *ReroutePortRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ListLocalClientRedirects lists active local client redirects.
+	ListLocalClientRedirects(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LocalClientRedirects, error)
 	ActivityWatcher(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Activity], error)
 }
 
@@ -266,6 +275,36 @@ func (c *daemonClient) SetInterceptShortcuts(ctx context.Context, in *SetInterce
 	return out, nil
 }
 
+func (c *daemonClient) AddLocalClientRedirect(ctx context.Context, in *ReroutePortRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, Daemon_AddLocalClientRedirect_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *daemonClient) RemoveLocalClientRedirect(ctx context.Context, in *ReroutePortRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, Daemon_RemoveLocalClientRedirect_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *daemonClient) ListLocalClientRedirects(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LocalClientRedirects, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LocalClientRedirects)
+	err := c.cc.Invoke(ctx, Daemon_ListLocalClientRedirects_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *daemonClient) ActivityWatcher(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Activity], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &Daemon_ServiceDesc.Streams[0], Daemon_ActivityWatcher_FullMethodName, cOpts...)
@@ -328,6 +367,12 @@ type DaemonServer interface {
 	// connects directly to local intercept handlers instead of tunneling to the cluster.
 	// Each call replaces the previously declared set.
 	SetInterceptShortcuts(context.Context, *SetInterceptShortcutsRequest) (*emptypb.Empty, error)
+	// AddLocalClientRedirect redirects traffic for a netip.AddrPort to localhost on a different port.
+	AddLocalClientRedirect(context.Context, *ReroutePortRequest) (*emptypb.Empty, error)
+	// RemoveLocalClientRedirect stops redirecting traffic for a netip.AddrPort to localhost.
+	RemoveLocalClientRedirect(context.Context, *ReroutePortRequest) (*emptypb.Empty, error)
+	// ListLocalClientRedirects lists active local client redirects.
+	ListLocalClientRedirects(context.Context, *emptypb.Empty) (*LocalClientRedirects, error)
 	ActivityWatcher(*emptypb.Empty, grpc.ServerStreamingServer[Activity]) error
 	mustEmbedUnimplementedDaemonServer()
 }
@@ -389,6 +434,15 @@ func (UnimplementedDaemonServer) RerouteRemotePort(context.Context, *ReroutePort
 }
 func (UnimplementedDaemonServer) SetInterceptShortcuts(context.Context, *SetInterceptShortcutsRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetInterceptShortcuts not implemented")
+}
+func (UnimplementedDaemonServer) AddLocalClientRedirect(context.Context, *ReroutePortRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method AddLocalClientRedirect not implemented")
+}
+func (UnimplementedDaemonServer) RemoveLocalClientRedirect(context.Context, *ReroutePortRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveLocalClientRedirect not implemented")
+}
+func (UnimplementedDaemonServer) ListLocalClientRedirects(context.Context, *emptypb.Empty) (*LocalClientRedirects, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListLocalClientRedirects not implemented")
 }
 func (UnimplementedDaemonServer) ActivityWatcher(*emptypb.Empty, grpc.ServerStreamingServer[Activity]) error {
 	return status.Error(codes.Unimplemented, "method ActivityWatcher not implemented")
@@ -720,6 +774,60 @@ func _Daemon_SetInterceptShortcuts_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Daemon_AddLocalClientRedirect_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReroutePortRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DaemonServer).AddLocalClientRedirect(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Daemon_AddLocalClientRedirect_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DaemonServer).AddLocalClientRedirect(ctx, req.(*ReroutePortRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Daemon_RemoveLocalClientRedirect_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReroutePortRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DaemonServer).RemoveLocalClientRedirect(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Daemon_RemoveLocalClientRedirect_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DaemonServer).RemoveLocalClientRedirect(ctx, req.(*ReroutePortRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Daemon_ListLocalClientRedirects_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DaemonServer).ListLocalClientRedirects(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Daemon_ListLocalClientRedirects_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DaemonServer).ListLocalClientRedirects(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Daemon_ActivityWatcher_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(emptypb.Empty)
 	if err := stream.RecvMsg(m); err != nil {
@@ -805,6 +913,18 @@ var Daemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetInterceptShortcuts",
 			Handler:    _Daemon_SetInterceptShortcuts_Handler,
+		},
+		{
+			MethodName: "AddLocalClientRedirect",
+			Handler:    _Daemon_AddLocalClientRedirect_Handler,
+		},
+		{
+			MethodName: "RemoveLocalClientRedirect",
+			Handler:    _Daemon_RemoveLocalClientRedirect_Handler,
+		},
+		{
+			MethodName: "ListLocalClientRedirects",
+			Handler:    _Daemon_ListLocalClientRedirects_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
