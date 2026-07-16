@@ -48,10 +48,11 @@ func TestWorkloadUpdateInProgress(t *testing.T) {
 
 func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 	for _, tc := range []struct {
-		name           string
-		status         apps.DeploymentStatus
-		wantPatchCount int
-		wantDidRollout bool
+		name              string
+		status            apps.DeploymentStatus
+		wantEvictionCount int
+		wantPatchCount    int
+		wantDidRollout    bool
 	}{
 		{
 			name: "stable workload",
@@ -61,8 +62,9 @@ func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 				UpdatedReplicas:    6,
 				AvailableReplicas:  6,
 			},
-			wantPatchCount: 1,
-			wantDidRollout: true,
+			wantEvictionCount: 1,
+			wantPatchCount:    1,
+			wantDidRollout:    true,
 		},
 		{
 			name: "update in progress",
@@ -84,10 +86,12 @@ func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 			}
 			pod := &core.Pod{ObjectMeta: meta.ObjectMeta{Name: "echo-old", Namespace: "default", UID: types.UID("echo-old")}}
 			client := fake.NewSimpleClientset(deployment.DeepCopy(), pod.DeepCopy())
+			evictionCount := 0
 			client.PrependReactor("create", "pods", func(action k8sTesting.Action) (bool, runtime.Object, error) {
 				if action.GetSubresource() != "eviction" {
 					return false, nil, nil
 				}
+				evictionCount++
 				return true, nil, apierrors.NewTooManyRequests("eviction would violate the pod's disruption budget", 0)
 			})
 
@@ -96,6 +100,7 @@ func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 			didRollout, err := evictOrRollout(ctx, k8sapi.Deployment(deployment), pod, 0)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantDidRollout, didRollout)
+			assert.Equal(t, tc.wantEvictionCount, evictionCount)
 
 			patchCount := 0
 			for _, action := range client.Actions() {

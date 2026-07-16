@@ -134,6 +134,20 @@ func (e disruptionBudgetError) Error() string {
 }
 
 func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod, counter int) (didRollout bool, err error) {
+	if wl != nil {
+		var updating bool
+		wl, updating, err = refreshedWorkloadUpdateInProgress(ctx, wl)
+		if err != nil {
+			return false, err
+		}
+		if updating {
+			// Do not consume disruption budget while another rollout is already replacing pods.
+			clog.Debugf(ctx, "Deferring eviction of %s because %s is already updating", pod.Name, wl)
+			retryEvictPodAfterUpdateAsync(ctx, wl, pod)
+			return true, nil
+		}
+	}
+
 	err = evictPod(ctx, pod)
 	if err == nil {
 		return false, nil
@@ -149,12 +163,17 @@ func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod, coun
 		retryEvictPodAsync(ctx, wl, pod)
 		return false, nil
 	}
-	if workloadUpdateInProgress(wl) {
+	refreshedWorkload, updating, refreshErr := refreshedWorkloadUpdateInProgress(ctx, wl)
+	if refreshErr != nil {
+		return false, refreshErr
+	}
+	wl = refreshedWorkload
+	if updating {
 		// A previous restart patch or an unrelated workload update is already replacing these pods.
 		// Patching restartedAt again resets slow rollouts and can keep them permanently below their
 		// disruption budget. Let the current update finish, then retry the original eviction.
 		clog.Debugf(ctx, "Deferring eviction of %s because %s is already updating", pod.Name, wl)
-		retryEvictPodAsync(ctx, wl, pod)
+		retryEvictPodAfterUpdateAsync(ctx, wl, pod)
 		return true, nil
 	}
 	switch wl.GetKind() {
@@ -174,6 +193,31 @@ func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod, coun
 
 func workloadUpdateInProgress(wl k8sapi.Workload) bool {
 	return !wl.Updated(wl.GetGeneration())
+}
+
+func refreshedWorkloadUpdateInProgress(ctx context.Context, wl k8sapi.Workload) (k8sapi.Workload, bool, error) {
+	refreshed, err := k8sapi.GetWorkload(ctx, wl.GetName(), wl.GetNamespace(), wl.GetKind())
+	if err != nil {
+		return nil, false, fmt.Errorf("unable to refresh %s before pod eviction: %w", wl, err)
+	}
+	return refreshed, workloadUpdateInProgress(refreshed), nil
+}
+
+func retryEvictPodAfterUpdateAsync(ctx context.Context, wl k8sapi.Workload, pod *core.Pod) {
+	go func() {
+		clog.Debugf(ctx, "Waiting for %s to finish updating before retrying eviction of %s", wl, pod.Name)
+		evictCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), managerutil.GetEnv(ctx).AgentArrivalTimeout)
+		defer cancel()
+		if evictCtx.Err() != nil {
+			return
+		}
+		refreshed, err := waitForWorkloadUpdate(evictCtx, wl)
+		if err != nil {
+			clog.Error(ctx, err)
+			return
+		}
+		_ = retryEvictPod(evictCtx, refreshed, pod, refreshed.Replicas())
+	}()
 }
 
 func retryEvictPodAsync(ctx context.Context, wl k8sapi.Workload, pod *core.Pod) {
@@ -248,6 +292,24 @@ func waitForReplicaCount(ctx context.Context, wl k8sapi.Workload, count int) err
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("%s never scaled to %d", wl, count)
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func waitForWorkloadUpdate(ctx context.Context, wl k8sapi.Workload) (k8sapi.Workload, error) {
+	for {
+		refreshed, updating, err := refreshedWorkloadUpdateInProgress(ctx, wl)
+		if err != nil {
+			return nil, err
+		}
+		if !updating {
+			return refreshed, nil
+		}
+		wl = refreshed
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%s did not finish updating: %w", wl, ctx.Err())
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
@@ -284,13 +346,17 @@ func triggerScalingEviction(ctx context.Context, wl k8sapi.Workload, pod *core.P
 
 func evictPod(ctx context.Context, pod *core.Pod) error {
 	clog.Debugf(ctx, "Attempting to evict pod %s", pod.Name)
+	uid := pod.UID
 	err := k8sapi.GetK8sInterface(ctx).CoreV1().Pods(pod.Namespace).EvictV1(ctx, &v1.Eviction{
 		ObjectMeta: meta.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace},
+		DeleteOptions: &meta.DeleteOptions{
+			Preconditions: &meta.Preconditions{UID: &uid},
+		},
 	})
-	if err == nil {
+	if err == nil || k8sErrors.IsNotFound(err) || k8sErrors.IsConflict(err) {
 		store := informer.GetK8sFactory(ctx, pod.Namespace).Core().V1().Pods().Informer().GetStore()
 		_ = store.Delete(pod)
-		clog.Debugf(ctx, "Successfully evicted pod %s", pod.Name)
+		clog.Debugf(ctx, "Pod %s was evicted or already replaced", pod.Name)
 		return nil
 	}
 	if strings.Contains(err.Error(), "disruption budget") {
