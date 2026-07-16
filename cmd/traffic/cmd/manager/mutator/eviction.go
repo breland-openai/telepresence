@@ -146,13 +146,16 @@ func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod, coun
 		// Other pod siblings were evicted successfully, which means that an engagement will be able to
 		// proceed, Wait for the previous eviction(s) to trigger pod recreation, so the disruption budget
 		// can be satisfied even though this pod is evicted.
-		go func() {
-			clog.Debugf(ctx, "Waiting for other %s pods to be recreated so that the disruption budget can be satisfied when evicting %s", wl.GetNamespace(), pod.Name)
-			evictCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), managerutil.GetEnv(ctx).AgentArrivalTimeout)
-			defer cancel()
-			_ = retryEvictPod(evictCtx, wl, pod, wl.Replicas())
-		}()
+		retryEvictPodAsync(ctx, wl, pod)
 		return false, nil
+	}
+	if workloadUpdateInProgress(wl) {
+		// A previous restart patch or an unrelated workload update is already replacing these pods.
+		// Patching restartedAt again resets slow rollouts and can keep them permanently below their
+		// disruption budget. Let the current update finish, then retry the original eviction.
+		clog.Debugf(ctx, "Deferring eviction of %s because %s is already updating", pod.Name, wl)
+		retryEvictPodAsync(ctx, wl, pod)
+		return true, nil
 	}
 	switch wl.GetKind() {
 	case k8sapi.StatefulSetKind, k8sapi.ReplicaSetKind:
@@ -167,6 +170,22 @@ func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod, coun
 	}
 	// Rollout applies to all pods for the workload, so we're done here
 	return true, nil
+}
+
+func workloadUpdateInProgress(wl k8sapi.Workload) bool {
+	return !wl.Updated(wl.GetGeneration())
+}
+
+func retryEvictPodAsync(ctx context.Context, wl k8sapi.Workload, pod *core.Pod) {
+	go func() {
+		clog.Debugf(ctx, "Waiting for %s pods to be recreated so that the disruption budget can be satisfied when evicting %s", wl.GetNamespace(), pod.Name)
+		evictCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), managerutil.GetEnv(ctx).AgentArrivalTimeout)
+		defer cancel()
+		if evictCtx.Err() != nil {
+			return
+		}
+		_ = retryEvictPod(evictCtx, wl, pod, wl.Replicas())
+	}()
 }
 
 func retryEvictPod(ctx context.Context, wl k8sapi.Workload, pod *core.Pod, replicas int) error {
