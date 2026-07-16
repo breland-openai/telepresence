@@ -534,19 +534,21 @@ func (c *configWatcher) DeleteMapsAndRolloutAll(ctx context.Context) {
 
 func (c *configWatcher) deleteMapsAndRolloutNS(ctx context.Context, ns string, iwc *informersWithCancel) {
 	defer func() {
+		iwc.cancel()
 		c.informers.Delete(ns)
 		informer.DropFactory(ctx, ns)
 	}()
 
-	clog.Debugf(ctx, "Cancelling watchers for namespace %s", ns)
+	clog.Debugf(ctx, "Removing workload handlers for namespace %s", ns)
 	for i := 0; i < watcherMax; i++ {
 		if reg := iwc.eventRegs[i]; reg != nil {
 			_ = iwc.informers[i].RemoveEventHandler(reg)
 		}
 	}
-	iwc.cancel()
 
-	err := c.EvictAllPodsWithAgentConfig(ctx, ns)
+	// Keep the informer caches live until every replacement is ready. The normal event-driven
+	// reconciliation path is unavailable after the handlers above are removed.
+	err := c.evictAllPodsWithAgentConfigAndWait(ctx, ns)
 	if err != nil {
 		clog.Errorf(ctx, "unable to delete agents in namespace %s: %v", ns, err)
 	}

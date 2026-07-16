@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/puzpuzpuz/xsync/v4"
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
@@ -79,15 +80,55 @@ func (c *configWatcher) EvictAllPodsWithAgentConfig(ctx context.Context, namespa
 	return errs
 }
 
+func (c *configWatcher) evictAllPodsWithAgentConfigAndWait(ctx context.Context, namespace string) error {
+	c.agentConfigs.Delete(namespace)
+	for {
+		evictMap, err := podList(ctx, namespace)
+		if err != nil {
+			return err
+		}
+
+		foundAgent := false
+		for _, wp := range evictMap {
+			pods := podsWithAgentConfigMismatch(ctx, wp.pods, "")
+			if len(pods) == 0 {
+				continue
+			}
+			foundAgent = true
+			desiredReplicas := k8sapi.DesiredReplicas(wp.wl)
+			if err = c.evictPods(ctx, wp.wl, pods); err != nil {
+				return err
+			}
+
+			recoveryCtx := ctx
+			cancel := func() {}
+			if timeout := managerutil.GetEnv(ctx).AgentArrivalTimeout; timeout > 0 {
+				recoveryCtx, cancel = context.WithTimeout(ctx, timeout)
+			}
+			err = waitForWorkloadRecovery(recoveryCtx, wp.wl, desiredReplicas)
+			cancel()
+			if err != nil {
+				return err
+			}
+		}
+		if !foundAgent {
+			return nil
+		}
+	}
+}
+
 func (c *configWatcher) evictPodsWithAgentConfigMismatch(ctx context.Context, wl k8sapi.Workload, pods []*core.Pod, cfgJSON string) error {
-	pods = slices.DeleteFunc(pods, func(pod *core.Pod) bool {
+	return c.evictPods(ctx, wl, podsWithAgentConfigMismatch(ctx, pods, cfgJSON))
+}
+
+func podsWithAgentConfigMismatch(ctx context.Context, pods []*core.Pod, cfgJSON string) []*core.Pod {
+	return slices.DeleteFunc(slices.Clone(pods), func(pod *core.Pod) bool {
 		if pod.Annotations[annotation.Config] == cfgJSON {
 			clog.Tracef(ctx, "Keeping pod %s because its config is still valid", pod.Name)
 			return true
 		}
 		return false
 	})
-	return c.evictPods(ctx, wl, pods)
 }
 
 func (c *configWatcher) evictPods(ctx context.Context, wl k8sapi.Workload, pods []*core.Pod) (err error) {
@@ -287,11 +328,28 @@ func workloadRolloutInProgress(wl k8sapi.Workload) bool {
 }
 
 func refreshWorkload(ctx context.Context, wl k8sapi.Workload) (k8sapi.Workload, error) {
-	refreshed, err := k8sapi.GetWorkload(ctx, wl.GetName(), wl.GetNamespace(), wl.GetKind())
+	var refreshed k8sapi.Workload
+	err := backoff.Retry(func() error {
+		var refreshErr error
+		refreshed, refreshErr = k8sapi.GetWorkload(ctx, wl.GetName(), wl.GetNamespace(), wl.GetKind())
+		if refreshErr != nil && workloadRefreshErrorIsTerminal(refreshErr) {
+			return backoff.Permanent(refreshErr)
+		}
+		return refreshErr
+	}, backoff.WithContext(backoff.WithMaxRetries(backoff.NewConstantBackOff(200*time.Millisecond), 10), ctx))
 	if err != nil {
 		return nil, fmt.Errorf("unable to refresh %s before pod eviction: %w", wl, err)
 	}
 	return refreshed, nil
+}
+
+func workloadRefreshErrorIsTerminal(err error) bool {
+	return k8sErrors.IsNotFound(err) ||
+		k8sErrors.IsForbidden(err) ||
+		k8sErrors.IsUnauthorized(err) ||
+		k8sErrors.IsBadRequest(err) ||
+		k8sErrors.IsInvalid(err) ||
+		k8sErrors.IsMethodNotSupported(err)
 }
 
 func refreshedWorkloadUpdateInProgress(ctx context.Context, wl k8sapi.Workload) (k8sapi.Workload, bool, error) {
@@ -393,6 +451,26 @@ func waitForWorkloadUpdateStart(ctx context.Context, wl k8sapi.Workload) error {
 		case <-ctx.Done():
 			return fmt.Errorf("%s did not start updating: %w", wl, ctx.Err())
 		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func waitForWorkloadRecovery(ctx context.Context, wl k8sapi.Workload, desiredReplicas int32) error {
+	for {
+		refreshed, err := refreshWorkload(ctx, wl)
+		if err != nil {
+			return err
+		}
+		if k8sapi.DesiredReplicas(refreshed) == desiredReplicas &&
+			k8sapi.ReadyReplicas(refreshed) >= desiredReplicas &&
+			!workloadRolloutInProgress(refreshed) {
+			return nil
+		}
+		wl = refreshed
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s did not recover %d ready replicas: %w", wl, desiredReplicas, ctx.Err())
+		case <-time.After(300 * time.Millisecond):
 		}
 	}
 }
