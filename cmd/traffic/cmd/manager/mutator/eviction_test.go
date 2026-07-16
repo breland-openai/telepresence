@@ -46,6 +46,71 @@ func TestWorkloadUpdateInProgress(t *testing.T) {
 	assert.True(t, workloadUpdateInProgress(k8sapi.Deployment(deployment)))
 }
 
+func TestWorkloadRolloutInProgress(t *testing.T) {
+	replicas := int32(6)
+	deployment := &apps.Deployment{
+		ObjectMeta: meta.ObjectMeta{Generation: 12},
+		Spec:       apps.DeploymentSpec{Replicas: &replicas},
+		Status: apps.DeploymentStatus{
+			ObservedGeneration: 12,
+			Replicas:           6,
+			UpdatedReplicas:    6,
+			AvailableReplicas:  5,
+			Conditions: []apps.DeploymentCondition{{
+				Type:   apps.DeploymentProgressing,
+				Status: core.ConditionTrue,
+				Reason: "NewReplicaSetAvailable",
+			}},
+		},
+	}
+	assert.False(t, workloadRolloutInProgress(k8sapi.Deployment(deployment)), "steady unavailable replica")
+
+	deployment.Status.Conditions[0].Reason = "ReplicaSetUpdated"
+	assert.True(t, workloadRolloutInProgress(k8sapi.Deployment(deployment)), "rollout awaiting availability")
+
+	replicaSet := &apps.ReplicaSet{
+		ObjectMeta: meta.ObjectMeta{Generation: 4},
+		Spec:       apps.ReplicaSetSpec{Replicas: &replicas},
+		Status: apps.ReplicaSetStatus{
+			ObservedGeneration: 4,
+			Replicas:           6,
+			AvailableReplicas:  5,
+		},
+	}
+	assert.False(t, workloadRolloutInProgress(k8sapi.ReplicaSet(replicaSet)), "steady unavailable replica")
+	replicaSet.Status.Replicas = 5
+	assert.True(t, workloadRolloutInProgress(k8sapi.ReplicaSet(replicaSet)), "scale in progress")
+
+	statefulSet := &apps.StatefulSet{
+		ObjectMeta: meta.ObjectMeta{Generation: 8},
+		Spec: apps.StatefulSetSpec{
+			Replicas: &replicas,
+			UpdateStrategy: apps.StatefulSetUpdateStrategy{
+				Type: apps.OnDeleteStatefulSetStrategyType,
+			},
+		},
+		Status: apps.StatefulSetStatus{
+			ObservedGeneration: 8,
+			Replicas:           6,
+			UpdatedReplicas:    0,
+		},
+	}
+	assert.False(t, workloadRolloutInProgress(k8sapi.StatefulSet(statefulSet)), "OnDelete revision mismatch")
+	statefulSet.Status.Replicas = 5
+	assert.True(t, workloadRolloutInProgress(k8sapi.StatefulSet(statefulSet)), "OnDelete scale in progress")
+
+	partition := int32(3)
+	statefulSet.Status.Replicas = 6
+	statefulSet.Spec.UpdateStrategy = apps.StatefulSetUpdateStrategy{
+		Type:          apps.RollingUpdateStatefulSetStrategyType,
+		RollingUpdate: &apps.RollingUpdateStatefulSetStrategy{Partition: &partition},
+	}
+	statefulSet.Status.UpdatedReplicas = 3
+	assert.False(t, workloadRolloutInProgress(k8sapi.StatefulSet(statefulSet)), "completed partitioned rollout")
+	statefulSet.Status.UpdatedReplicas = 2
+	assert.True(t, workloadRolloutInProgress(k8sapi.StatefulSet(statefulSet)), "partitioned rollout in progress")
+}
+
 func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
@@ -61,6 +126,23 @@ func TestEvictOrRolloutDoesNotRestartUpdatingWorkload(t *testing.T) {
 				Replicas:           6,
 				UpdatedReplicas:    6,
 				AvailableReplicas:  6,
+			},
+			wantEvictionCount: 1,
+			wantPatchCount:    1,
+			wantDidRollout:    true,
+		},
+		{
+			name: "stable workload with unavailable replica",
+			status: apps.DeploymentStatus{
+				ObservedGeneration: 12,
+				Replicas:           6,
+				UpdatedReplicas:    6,
+				AvailableReplicas:  5,
+				Conditions: []apps.DeploymentCondition{{
+					Type:   apps.DeploymentProgressing,
+					Status: core.ConditionTrue,
+					Reason: "NewReplicaSetAvailable",
+				}},
 			},
 			wantEvictionCount: 1,
 			wantPatchCount:    1,

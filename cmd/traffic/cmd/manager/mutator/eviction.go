@@ -5,11 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
+	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
 	v1 "k8s.io/api/policy/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
@@ -90,20 +91,23 @@ func (c *configWatcher) evictPodsWithAgentConfigMismatch(ctx context.Context, wl
 }
 
 func (c *configWatcher) evictPods(ctx context.Context, wl k8sapi.Workload, pods []*core.Pod) (err error) {
+	var evictionState *workloadEvictionState
 	if wl != nil {
 		key := WorkloadKey{Kind: wl.GetKind(), Name: wl.GetName(), Namespace: wl.GetNamespace()}
-		lock, _ := c.evictionLocks.LoadOrCompute(key, func() (*sync.Mutex, bool) {
-			return &sync.Mutex{}, false
+		evictionState, _ = c.evictionStates.LoadOrCompute(key, func() (*workloadEvictionState, bool) {
+			return &workloadEvictionState{}, false
 		})
-		lock.Lock()
-		defer lock.Unlock()
+		evictionState.Lock()
+		defer evictionState.Unlock()
 
-		var updating bool
-		wl, updating, err = refreshedWorkloadUpdateInProgress(ctx, wl)
+		wl, err = refreshWorkload(ctx, wl)
 		if err != nil {
 			return err
 		}
-		if updating {
+		if !workloadUpdateInProgress(wl) {
+			evictionState.replacementPending = false
+		}
+		if evictionState.replacementPending || workloadRolloutInProgress(wl) {
 			clog.Debugf(ctx, "Deferring pod eviction because %s is already updating", wl)
 			return nil
 		}
@@ -135,6 +139,9 @@ func (c *configWatcher) evictPods(ctx context.Context, wl k8sapi.Workload, pods 
 			}
 			return inactivation{Time: time.Now(), deleted: true}, xsync.UpdateOp
 		})
+		if didRollout && evictionState != nil {
+			evictionState.replacementPending = true
+		}
 		if err != nil {
 			return err
 		}
@@ -158,12 +165,11 @@ func (e disruptionBudgetError) Error() string {
 
 func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod, counter int) (didRollout bool, err error) {
 	if wl != nil {
-		var updating bool
-		wl, updating, err = refreshedWorkloadUpdateInProgress(ctx, wl)
+		wl, err = refreshWorkload(ctx, wl)
 		if err != nil {
 			return false, err
 		}
-		if updating {
+		if workloadRolloutInProgress(wl) {
 			// Do not consume disruption budget while another rollout is already replacing pods.
 			clog.Debugf(ctx, "Deferring eviction of %s because %s is already updating", pod.Name, wl)
 			return true, nil
@@ -194,12 +200,12 @@ func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod, coun
 		retryEvictPodAsync(ctx, wl, pod)
 		return false, nil
 	}
-	refreshedWorkload, updating, refreshErr := refreshedWorkloadUpdateInProgress(ctx, wl)
+	refreshedWorkload, refreshErr := refreshWorkload(ctx, wl)
 	if refreshErr != nil {
 		return false, refreshErr
 	}
 	wl = refreshedWorkload
-	if updating {
+	if workloadRolloutInProgress(wl) {
 		// A previous restart patch or an unrelated workload update is already replacing these pods.
 		// Patching restartedAt again resets slow rollouts and can keep them permanently below their
 		// disruption budget. Informer reconciliation will retry once the update finishes.
@@ -225,10 +231,73 @@ func workloadUpdateInProgress(wl k8sapi.Workload) bool {
 	return !wl.Updated(wl.GetGeneration())
 }
 
-func refreshedWorkloadUpdateInProgress(ctx context.Context, wl k8sapi.Workload) (k8sapi.Workload, bool, error) {
+func workloadRolloutInProgress(wl k8sapi.Workload) bool {
+	desiredReplicas := k8sapi.DesiredReplicas(wl)
+	switch wl.GetKind() {
+	case k8sapi.DeploymentKind:
+		deployment, ok := k8sapi.DeploymentImpl(wl)
+		if !ok {
+			break
+		}
+		if deployment.Status.ObservedGeneration != deployment.Generation ||
+			deployment.Status.Replicas != desiredReplicas ||
+			deployment.Status.UpdatedReplicas != desiredReplicas {
+			return true
+		}
+		for _, condition := range deployment.Status.Conditions {
+			if condition.Type == apps.DeploymentProgressing && condition.Status == core.ConditionTrue {
+				return condition.Reason != "NewReplicaSetAvailable"
+			}
+		}
+		return false
+	case k8sapi.RolloutKind:
+		rollout, ok := k8sapi.RolloutImpl(wl)
+		if !ok {
+			break
+		}
+		return rollout.Status.ObservedGeneration != strconv.FormatInt(rollout.Generation, 10) ||
+			rollout.Status.Replicas != desiredReplicas ||
+			rollout.Status.UpdatedReplicas != desiredReplicas
+	case k8sapi.ReplicaSetKind:
+		replicaSet, ok := k8sapi.ReplicaSetImpl(wl)
+		if !ok {
+			break
+		}
+		return replicaSet.Status.ObservedGeneration != replicaSet.Generation ||
+			replicaSet.Status.Replicas != desiredReplicas
+	case k8sapi.StatefulSetKind:
+		statefulSet, ok := k8sapi.StatefulSetImpl(wl)
+		if !ok {
+			break
+		}
+		if statefulSet.Status.ObservedGeneration != statefulSet.Generation ||
+			statefulSet.Status.Replicas != desiredReplicas {
+			return true
+		}
+		if statefulSet.Spec.UpdateStrategy.Type == apps.OnDeleteStatefulSetStrategyType {
+			return false
+		}
+		expectedUpdatedReplicas := desiredReplicas
+		if rollingUpdate := statefulSet.Spec.UpdateStrategy.RollingUpdate; rollingUpdate != nil && rollingUpdate.Partition != nil {
+			expectedUpdatedReplicas = max(0, desiredReplicas-*rollingUpdate.Partition)
+		}
+		return statefulSet.Status.UpdatedReplicas < expectedUpdatedReplicas
+	}
+	return workloadUpdateInProgress(wl)
+}
+
+func refreshWorkload(ctx context.Context, wl k8sapi.Workload) (k8sapi.Workload, error) {
 	refreshed, err := k8sapi.GetWorkload(ctx, wl.GetName(), wl.GetNamespace(), wl.GetKind())
 	if err != nil {
-		return nil, false, fmt.Errorf("unable to refresh %s before pod eviction: %w", wl, err)
+		return nil, fmt.Errorf("unable to refresh %s before pod eviction: %w", wl, err)
+	}
+	return refreshed, nil
+}
+
+func refreshedWorkloadUpdateInProgress(ctx context.Context, wl k8sapi.Workload) (k8sapi.Workload, bool, error) {
+	refreshed, err := refreshWorkload(ctx, wl)
+	if err != nil {
+		return nil, false, err
 	}
 	return refreshed, workloadUpdateInProgress(refreshed), nil
 }

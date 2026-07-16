@@ -53,14 +53,19 @@ type Map interface {
 }
 
 type configWatcher struct {
-	cancel        context.CancelFunc
-	agentConfigs  *xsync.Map[string, map[string]*agentconfig.Sidecar]
-	informers     *xsync.Map[string, *informersWithCancel]
-	inactivePods  *xsync.Map[types.UID, inactivation]
-	evictionLocks *xsync.Map[WorkloadKey, *sync.Mutex]
-	startedAt     time.Time
-	configured    atomic.Bool
-	running       atomic.Bool
+	cancel         context.CancelFunc
+	agentConfigs   *xsync.Map[string, map[string]*agentconfig.Sidecar]
+	informers      *xsync.Map[string, *informersWithCancel]
+	inactivePods   *xsync.Map[types.UID, inactivation]
+	evictionStates *xsync.Map[WorkloadKey, *workloadEvictionState]
+	startedAt      time.Time
+	configured     atomic.Bool
+	running        atomic.Bool
+}
+
+type workloadEvictionState struct {
+	sync.Mutex
+	replacementPending bool
 }
 
 type mapKey struct{}
@@ -246,11 +251,11 @@ func (c *configWatcher) Store(sc *agentconfig.Sidecar) {
 
 func NewWatcher() Map {
 	w := &configWatcher{
-		cancel:        func() {},
-		informers:     xsync.NewMap[string, *informersWithCancel](),
-		inactivePods:  xsync.NewMap[types.UID, inactivation](),
-		evictionLocks: xsync.NewMap[WorkloadKey, *sync.Mutex](),
-		agentConfigs:  xsync.NewMap[string, map[string]*agentconfig.Sidecar](),
+		cancel:         func() {},
+		informers:      xsync.NewMap[string, *informersWithCancel](),
+		inactivePods:   xsync.NewMap[types.UID, inactivation](),
+		evictionStates: xsync.NewMap[WorkloadKey, *workloadEvictionState](),
+		agentConfigs:   xsync.NewMap[string, map[string]*agentconfig.Sidecar](),
 	}
 	return w
 }
