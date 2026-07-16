@@ -179,7 +179,7 @@ func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod, coun
 		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		if waitErr := waitForWorkloadUpdateStart(waitCtx, wl); waitErr != nil {
-			clog.Debugf(ctx, "Workload update was not observed after evicting %s: %v", pod.Name, waitErr)
+			return true, fmt.Errorf("workload update was not observed after evicting %s: %w", pod.Name, waitErr)
 		}
 		return true, nil
 	}

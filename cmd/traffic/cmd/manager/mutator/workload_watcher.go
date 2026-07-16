@@ -60,7 +60,10 @@ func (c *configWatcher) updateWorkload(ctx context.Context, wl, oldWl k8sapi.Wor
 		cmpopts.IgnoreMapEntries(func(k, _ string) bool {
 			return k == annotation.RestartedAt
 		})) {
-		return
+		if !workloadUpdateInProgress(oldWl) || workloadUpdateInProgress(wl) {
+			return
+		}
+		clog.Debugf(ctx, "Reconciling agent config after %s finished updating", wl)
 	}
 
 	switch ia {
