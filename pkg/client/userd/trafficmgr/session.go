@@ -780,8 +780,6 @@ func (s *session) WorkloadInfoSnapshot(
 	namespaces []string,
 	filter rpc.ListRequest_Filter,
 ) (*rpc.WorkloadInfoSnapshot, error) {
-	is := s.getCurrentIntercepts()
-
 	var nss []string
 	var sMap map[string]string
 	nss = make([]string, 0, len(namespaces))
@@ -796,6 +794,11 @@ func (s *session) WorkloadInfoSnapshot(
 		clog.Debug(s, "No namespaces are mapped")
 		return &rpc.WorkloadInfoSnapshot{}, nil
 	}
+	if filter == rpc.ListRequest_INTERCEPTS {
+		return s.interceptInfoSnapshot(nss), nil
+	}
+
+	is := s.getCurrentIntercepts()
 	if len(nss) == 1 && nss[0] == s.Namespace {
 		cas := s.getCurrentAgents()
 		sMap = make(map[string]string, len(cas))
@@ -822,6 +825,71 @@ nextIs:
 
 	workloadInfos := s.getInfosForWorkloads(nss, iMap, gMap, sMap, filter)
 	return &rpc.WorkloadInfoSnapshot{Workloads: workloadInfos}, nil
+}
+
+// interceptInfoSnapshot returns the current normal intercepts without waiting
+// for the workload watchers. The watcher snapshot is useful when listing all
+// workloads, but an intercept-only list can get the workload identity from the
+// intercept spec itself.
+func (s *session) interceptInfoSnapshot(namespaces []string) *rpc.WorkloadInfoSnapshot {
+	namespaceSet := make(map[string]struct{}, len(namespaces))
+	for _, namespace := range namespaces {
+		namespaceSet[namespace] = struct{}{}
+	}
+
+	type key struct {
+		kind      string
+		name      string
+		namespace string
+	}
+
+	workloadInfos := make(map[key]*rpc.WorkloadInfo)
+	for _, intercept := range s.getCurrentIntercepts() {
+		if intercept == nil || intercept.InterceptInfo == nil {
+			continue
+		}
+		spec := intercept.Spec
+		if spec == nil || spec.NoDefaultPort || spec.Wiretap {
+			continue
+		}
+		if _, ok := namespaceSet[spec.Namespace]; !ok {
+			continue
+		}
+
+		k := key{
+			kind:      spec.WorkloadKind,
+			name:      spec.Agent,
+			namespace: spec.Namespace,
+		}
+		workloadInfo, ok := workloadInfos[k]
+		if !ok {
+			workloadInfo = &rpc.WorkloadInfo{
+				Name:                 spec.Agent,
+				Namespace:            spec.Namespace,
+				WorkloadResourceType: spec.WorkloadKind,
+			}
+			workloadInfos[k] = workloadInfo
+		}
+		workloadInfo.InterceptInfo = append(workloadInfo.InterceptInfo, intercept.InterceptInfo)
+	}
+
+	snapshot := &rpc.WorkloadInfoSnapshot{
+		Workloads: make([]*rpc.WorkloadInfo, 0, len(workloadInfos)),
+	}
+	for _, workloadInfo := range workloadInfos {
+		snapshot.Workloads = append(snapshot.Workloads, workloadInfo)
+	}
+	sort.Slice(snapshot.Workloads, func(i, j int) bool {
+		left, right := snapshot.Workloads[i], snapshot.Workloads[j]
+		if left.Name != right.Name {
+			return left.Name < right.Name
+		}
+		if left.Namespace != right.Namespace {
+			return left.Namespace < right.Namespace
+		}
+		return left.WorkloadResourceType < right.WorkloadResourceType
+	})
+	return snapshot
 }
 
 func (s *session) remainLoop(_ context.Context) error {
