@@ -36,6 +36,13 @@ func (c *configWatcher) configsAffectedBySvc(ctx context.Context, svc *core.Serv
 			// A deleted service will only affect configs that matches its UID
 			return nil, nil, false
 		}
+		if len(svc.Spec.Selector) == 0 {
+			// A selectorless Service does not select pods by label. Existing
+			// UID claimants above still need regeneration when a selector is
+			// removed, but it must not make every workload in the namespace
+			// look newly selected.
+			return nil, nil, false
+		}
 
 		// The config will be affected if a service is added or modified so that it now selects the pod for the workload.
 		wl, err := agentmap.GetWorkload(ctx, ac.WorkloadName, ac.Namespace, ac.WorkloadKind)
@@ -99,7 +106,7 @@ func (c *configWatcher) watchServices(ctx context.Context, ix cache.SharedIndexI
 			},
 			UpdateFunc: func(oldObj, newObj any) {
 				if newSvc, ok := newObj.(*core.Service); ok {
-					c.updateSvc(ctx, newSvc, true)
+					c.updateSvc(ctx, newSvc, false)
 				}
 			},
 		})
