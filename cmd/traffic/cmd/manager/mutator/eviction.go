@@ -579,14 +579,7 @@ func podList(ctx context.Context, namespace string) (wlPodMap, error) {
 		if !podIsPendingOrRunning(pod) {
 			continue
 		}
-		var wl k8sapi.Workload
-		if podKind, ok := pod.Labels[agentconfig.WorkloadKindLabel]; ok && !enabledWorkloads.Contains(k8sapi.Kind(podKind)) {
-			// Pod's label indicates a workload kind that has been disabled. As such, it will not be present in the
-			// shared informer cache.
-			wl, err = k8sapi.GetWorkload(ctx, pod.Labels[agentconfig.WorkloadNameLabel], pod.Namespace, k8sapi.Kind(podKind))
-		} else {
-			wl, err = agentmap.FindOwnerWorkload(ctx, k8sapi.Pod(pod), enabledWorkloads)
-		}
+		wl, err := podOwnerWorkload(ctx, pod, enabledWorkloads)
 		if err != nil {
 			if k8sErrors.IsNotFound(err) {
 				continue
@@ -596,6 +589,15 @@ func podList(ctx context.Context, namespace string) (wlPodMap, error) {
 		podMap.add(wl, pod)
 	}
 	return podMap, nil
+}
+
+func podOwnerWorkload(ctx context.Context, pod *core.Pod, enabledWorkloads k8sapi.Kinds) (k8sapi.Workload, error) {
+	if podKind, ok := pod.Labels[agentconfig.WorkloadKindLabel]; ok && !enabledWorkloads.Contains(k8sapi.Kind(podKind)) {
+		// Pod's label indicates a workload kind that has been disabled. As such, it will not be present in the
+		// shared informer cache.
+		return k8sapi.GetWorkload(ctx, pod.Labels[agentconfig.WorkloadNameLabel], pod.Namespace, k8sapi.Kind(podKind))
+	}
+	return agentmap.FindOwnerWorkload(ctx, k8sapi.Pod(pod), enabledWorkloads)
 }
 
 func workloadPods(ctx context.Context, wl k8sapi.Workload) ([]*core.Pod, error) {
@@ -608,5 +610,26 @@ func workloadPods(ctx context.Context, wl k8sapi.Workload) ([]*core.Pod, error) 
 	if err != nil {
 		return nil, err
 	}
-	return slices.DeleteFunc(slices.Clone(pods), func(pod *core.Pod) bool { return !podIsPendingOrRunning(pod) }), nil
+	// A selector is not always unique to one workload. Stable and canary
+	// Deployments commonly share one and distinguish their pods only by
+	// template labels, so verify ownership before evicting a candidate pod.
+	enabledWorkloads := managerutil.GetEnv(ctx).EnabledWorkloadKinds
+	workloadKey := WorkloadKey{Kind: wl.GetKind(), Name: wl.GetName(), Namespace: wl.GetNamespace()}
+	ownedPods := make([]*core.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if !podIsPendingOrRunning(pod) {
+			continue
+		}
+		owner, err := podOwnerWorkload(ctx, pod, enabledWorkloads)
+		if err != nil {
+			if k8sErrors.IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		if (WorkloadKey{Kind: owner.GetKind(), Name: owner.GetName(), Namespace: owner.GetNamespace()}) == workloadKey {
+			ownedPods = append(ownedPods, pod)
+		}
+	}
+	return ownedPods, nil
 }

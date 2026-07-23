@@ -234,6 +234,96 @@ func TestPodsWithAgentConfigMismatchIgnoresManualInjection(t *testing.T) {
 	assert.Empty(t, podsWithAgentConfigMismatch(context.Background(), []*core.Pod{pod}, ""))
 }
 
+func TestWorkloadPodsOnlyReturnsPodsOwnedByWorkload(t *testing.T) {
+	const namespace = "default"
+	controller := true
+	selector := map[string]string{"app": "sediment-service"}
+	stable := &apps.Deployment{
+		ObjectMeta: meta.ObjectMeta{Name: "sediment-service", Namespace: namespace},
+		Spec: apps.DeploymentSpec{
+			Selector: &meta.LabelSelector{MatchLabels: selector},
+			Template: core.PodTemplateSpec{ObjectMeta: meta.ObjectMeta{Labels: map[string]string{
+				"app":   "sediment-service",
+				"track": "stable",
+			}}},
+		},
+	}
+	canary := stable.DeepCopy()
+	canary.Name = "sediment-service-canary"
+	canary.Spec.Template.Labels["track"] = "canary"
+
+	stableRS := &apps.ReplicaSet{ObjectMeta: meta.ObjectMeta{
+		Name:      "sediment-service-66dfc6c7cf",
+		Namespace: namespace,
+		OwnerReferences: []meta.OwnerReference{{
+			Kind:       string(k8sapi.DeploymentKind),
+			Name:       stable.Name,
+			Controller: &controller,
+		}},
+	}}
+	canaryRS := &apps.ReplicaSet{ObjectMeta: meta.ObjectMeta{
+		Name:      "sediment-service-canary-6569fd8dc4",
+		Namespace: namespace,
+		OwnerReferences: []meta.OwnerReference{{
+			Kind:       string(k8sapi.DeploymentKind),
+			Name:       canary.Name,
+			Controller: &controller,
+		}},
+	}}
+	stablePod := &core.Pod{
+		ObjectMeta: meta.ObjectMeta{
+			Name:      "sediment-service-66dfc6c7cf-stable",
+			Namespace: namespace,
+			Labels:    selector,
+			OwnerReferences: []meta.OwnerReference{{
+				Kind:       string(k8sapi.ReplicaSetKind),
+				Name:       stableRS.Name,
+				Controller: &controller,
+			}},
+		},
+		Status: core.PodStatus{Phase: core.PodRunning},
+	}
+	canaryPod := &core.Pod{
+		ObjectMeta: meta.ObjectMeta{
+			Name:      "sediment-service-canary-6569fd8dc4-canary",
+			Namespace: namespace,
+			Labels:    selector,
+			OwnerReferences: []meta.OwnerReference{{
+				Kind:       string(k8sapi.ReplicaSetKind),
+				Name:       canaryRS.Name,
+				Controller: &controller,
+			}},
+		},
+		Status: core.PodStatus{Phase: core.PodRunning},
+	}
+
+	client := fake.NewSimpleClientset(stable, canary, stableRS, canaryRS, stablePod, canaryPod)
+	ctx := k8sapi.WithJoinedClientSetInterface(context.Background(), client, argorolloutsfake.NewSimpleClientset())
+	ctx = informer.WithFactory(ctx, "")
+	ctx = managerutil.WithEnv(ctx, &managerutil.Env{
+		EnabledWorkloadKinds: k8sapi.Kinds{k8sapi.DeploymentKind},
+	})
+	factory := informer.GetK8sFactory(ctx, namespace)
+	deploymentStore := factory.Apps().V1().Deployments().Informer().GetStore()
+	podStore := factory.Core().V1().Pods().Informer().GetStore()
+	for _, deployment := range []*apps.Deployment{stable, canary} {
+		require.NoError(t, deploymentStore.Add(deployment.DeepCopy()))
+	}
+	for _, pod := range []*core.Pod{stablePod, canaryPod} {
+		require.NoError(t, podStore.Add(pod.DeepCopy()))
+	}
+
+	pods, err := workloadPods(ctx, k8sapi.Deployment(stable))
+	require.NoError(t, err)
+	require.Len(t, pods, 1)
+	assert.Equal(t, stablePod.Name, pods[0].Name)
+
+	pods, err = workloadPods(ctx, k8sapi.Deployment(canary))
+	require.NoError(t, err)
+	require.Len(t, pods, 1)
+	assert.Equal(t, canaryPod.Name, pods[0].Name)
+}
+
 func TestDeferredEvictionIsNotMarkedDeleted(t *testing.T) {
 	replicas := int32(2)
 	stable := &apps.Deployment{
