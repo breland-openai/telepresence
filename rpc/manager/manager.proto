@@ -21,6 +21,10 @@ message ClientInfo {
   string product = 3;  // "telepresence"
   string version = 4;
 
+  // Clients that set this can receive lightweight AgentInfo updates from the
+  // watch streams and fetch full container environments only when needed.
+  bool supports_compact_agent_info = 7;
+
   reserved 5; // was api_key
 }
 
@@ -105,6 +109,11 @@ message AgentInfo {
   // Service-backed targets advertised by this agent. Older agents leave this
   // empty and continue to use workload-scoped intercept matching.
   repeated InterceptTarget intercept_targets = 17;
+
+  // True when this AgentInfo came from a lightweight watch snapshot and its
+  // container environment maps were intentionally omitted. Callers that need
+  // those maps must fetch a full AgentInfo through EnsureAgent.
+  bool container_environment_omitted = 18;
 
   reserved 6;
 }
