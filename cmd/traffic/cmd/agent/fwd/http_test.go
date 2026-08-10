@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,91 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/matcher"
 	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
 )
+
+func TestEnsureGRPCTrailersHeaderForReverseProxy(t *testing.T) {
+	backendTe := make(chan string, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		backendTe <- request.Header.Get("Te")
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+
+	targetURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	frontend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		proxy.ServeHTTP(writer, ensureGRPCTrailersHeader(request))
+	}))
+	defer frontend.Close()
+
+	request, err := http.NewRequest(http.MethodPost, frontend.URL, nil)
+	require.NoError(t, err)
+	request.Header.Set("Content-Type", "application/grpc")
+
+	response, err := frontend.Client().Do(request)
+	require.NoError(t, err)
+	defer response.Body.Close()
+	require.Equal(t, http.StatusNoContent, response.StatusCode)
+	select {
+	case got := <-backendTe:
+		assert.Equal(t, "trailers", got)
+	case <-time.After(time.Second):
+		t.Fatal("backend did not receive the proxied gRPC request")
+	}
+}
+
+func TestEnsureGRPCTrailersHeaderOnlyAddsForGRPC(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		te          string
+		wantTe      string
+		wantClone   bool
+	}{
+		{
+			name:        "gRPC media type with suffix and parameters",
+			contentType: "application/grpc+proto; charset=utf-8",
+			wantTe:      "trailers",
+			wantClone:   true,
+		},
+		{
+			name:        "gRPC request that already advertises trailers",
+			contentType: "application/grpc",
+			te:          "trailers",
+			wantTe:      "trailers",
+		},
+		{
+			name:        "gRPC-web request",
+			contentType: "application/grpc-web+proto",
+		},
+		{
+			name:        "non-gRPC request",
+			contentType: "application/json",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodPost, "http://example.com", nil)
+			require.NoError(t, err)
+			request.Header.Set("Content-Type", test.contentType)
+			if test.te != "" {
+				request.Header.Set("Te", test.te)
+			}
+			originalHeader := request.Header.Clone()
+
+			got := ensureGRPCTrailersHeader(request)
+
+			assert.Equal(t, test.wantTe, got.Header.Get("Te"))
+			assert.Equal(t, originalHeader, request.Header)
+			if test.wantClone {
+				assert.NotSame(t, request, got)
+			} else {
+				assert.Same(t, request, got)
+			}
+		})
+	}
+}
 
 func TestHTTPInterceptor_shouldInterceptRequest(t *testing.T) {
 	headerFilters := map[string]string{

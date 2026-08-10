@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
+	"strings"
 	"sync"
 
 	"golang.org/x/net/http2"
@@ -234,6 +235,28 @@ func shouldInterceptRequest(req *http.Request, headerFilters map[string]string, 
 	return matcher.NewRequest(pathFilters, headerFilters).Matches(req)
 }
 
+func ensureGRPCTrailersHeader(request *http.Request) *http.Request {
+	contentType := strings.ToLower(strings.TrimSpace(strings.SplitN(request.Header.Get("Content-Type"), ";", 2)[0]))
+	if contentType != "application/grpc" && !strings.HasPrefix(contentType, "application/grpc+") {
+		return request
+	}
+	for _, value := range request.Header.Values("Te") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "trailers") {
+				return request
+			}
+		}
+	}
+
+	// TE is hop-by-hop, so an upstream proxy may remove it before the
+	// traffic-agent sees the request. ReverseProxy only forwards Te: trailers
+	// when it is present on the inbound request, and local gRPC servers require
+	// it to accept the forwarded request.
+	request = request.Clone(request.Context())
+	request.Header.Set("Te", "trailers")
+	return request
+}
+
 func (f *tcp) configureUpstreamTransport(ctx context.Context, plaintext bool) *http.Transport {
 	tm := f.tlsManager
 	tp := f.Target().Port()
@@ -419,6 +442,7 @@ func (f *tcp) serveHTTPIntercept(
 		proxyErrorHandler(rw, req, err)
 	}
 	targetProxy.Transport = hit.transport
+	request = ensureGRPCTrailersHeader(request)
 	request = request.WithContext(context.WithValue(request.Context(), httpInterceptDialContextKey{}, &httpInterceptDialContext{
 		src: src,
 		ii:  ii,
