@@ -27,6 +27,11 @@ type awaitingForward struct {
 	doneCh   <-chan struct{}
 }
 
+const (
+	clientTunnelSlowAfter       = time.Second
+	clientTunnelStillWaitingLog = 5 * time.Second
+)
+
 func (s *state) Version(context.Context, *emptypb.Empty) (*rpc.VersionInfo2, error) {
 	return &rpc.VersionInfo2{Name: DisplayName, Version: version.Version}, nil
 }
@@ -113,8 +118,11 @@ func (s *state) WatchDial(session *rpc.SessionInfo, server agent.Agent_WatchDial
 	if err != nil {
 		return err
 	}
-	clog.Debugf(ctx, "WatchDial called from client %s", session.SessionId)
-	defer clog.Debugf(ctx, "WatchDial ended from client %s", session.SessionId)
+	started := time.Now()
+	clog.Infof(ctx, "WatchDial called from client %s", session.SessionId)
+	defer func() {
+		clog.Infof(ctx, "WatchDial ended from client %s after %s: context=%v", session.SessionId, time.Since(started).Round(time.Millisecond), ctx.Err())
+	}()
 	drCh := make(chan *rpc.DialRequest)
 
 	// Displacement policy: a verified caller always takes over the slot, even from a
@@ -167,6 +175,7 @@ func (s *state) WatchDial(session *rpc.SessionInfo, server agent.Agent_WatchDial
 func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID tunnel.SessionID, id tunnel.ConnID, roundTripLatency, dialTimeout time.Duration,
 ) (tunnel.Stream, error) {
 	clog.Debugf(ctx, "Creating tunnel to client %s for id %s", sessionID, id)
+	createStart := time.Now()
 	var drCh chan<- *rpc.DialRequest
 	var awc *xsync.Map[tunnel.ConnID, *awaitingForward]
 	var aw *awaitingForward
@@ -194,6 +203,7 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 		return fmt.Errorf("unable to create tunnel to client %s for id %s: no dial watcher", sessionID, id)
 	}, backoff.WithContext(backoff.NewConstantBackOff(20*time.Millisecond), ctx))
 	if err != nil {
+		clog.Warnf(ctx, "unable to create tunnel to client %s for id %s after %s: %v", sessionID, id, time.Since(createStart).Round(time.Millisecond), err)
 		return nil, err
 	}
 	defer func() {
@@ -207,6 +217,7 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 		}
 	}()
 
+	requestStart := time.Now()
 	select {
 	case <-ctx.Done():
 		clog.Errorf(ctx, "unable to send DialRequest to client %s for id %s: %v", sessionID, id, ctx.Err())
@@ -214,13 +225,32 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 	case drCh <- &rpc.DialRequest{ConnId: []byte(id), DialTimeout: int64(dialTimeout), RoundtripLatency: int64(roundTripLatency)}:
 	}
 
-	select {
-	case <-ctx.Done():
-		clog.Errorf(ctx, "unable to create tunnel to client %s for id %s: %v", sessionID, id, ctx.Err())
-		return nil, ctx.Err()
-	case stream := <-stCh:
-		clog.Debugf(ctx, "Created tunnel to client %s for id %s", sessionID, id)
-		return stream, nil
+	waitLog := time.NewTimer(clientTunnelSlowAfter)
+	defer waitLog.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			clog.Errorf(ctx, "unable to create tunnel to client %s for id %s after %s: %v", sessionID, id, time.Since(requestStart).Round(time.Millisecond), ctx.Err())
+			return nil, ctx.Err()
+		case stream := <-stCh:
+			if elapsed := time.Since(requestStart); elapsed > clientTunnelSlowAfter {
+				clog.Warnf(ctx, "created tunnel to client %s for id %s slowly in %s", sessionID, id, elapsed.Round(time.Millisecond))
+			} else {
+				clog.Debugf(ctx, "Created tunnel to client %s for id %s in %s", sessionID, id, elapsed)
+			}
+			return stream, nil
+		case <-waitLog.C:
+			clog.Warnf(
+				ctx,
+				"still waiting for client tunnel after %s: clientSession=%s conn=%s dialTimeout=%s roundtripLatency=%s",
+				time.Since(requestStart).Round(time.Millisecond),
+				sessionID,
+				id,
+				dialTimeout,
+				roundTripLatency,
+			)
+			waitLog.Reset(clientTunnelStillWaitingLog)
+		}
 	}
 }
 
