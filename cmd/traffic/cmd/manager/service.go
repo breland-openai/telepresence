@@ -304,7 +304,16 @@ func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClient
 	}
 	now := time.Now()
 	st.RestoreClient(sessionID, client, auth.PrincipalFrom(ctx), now)
-	agents := slices.DeleteFunc(slices.Clone(info.Agents), func(agent *rpc.AgentInfo) bool {
+	restoredAgents := info.Agents
+	if legacyForkClient(client) && len(restoredAgents) != 0 {
+		// Legacy compact snapshots encode their omitted-environment marker at
+		// the field number now used by the QUIC port. They therefore look
+		// complete after decoding, so let the real traffic-agents reconnect
+		// instead of restoring incomplete client-owned snapshots.
+		clog.Debugf(ctx, "Not restoring %d agents supplied by a legacy client; waiting for the traffic-agents to reconnect", len(restoredAgents))
+		restoredAgents = nil
+	}
+	agents := slices.DeleteFunc(slices.Clone(restoredAgents), func(agent *rpc.AgentInfo) bool {
 		if agent.GetContainerEnvironmentOmitted() {
 			// Compact watch snapshots are intentionally incomplete. Restoring
 			// one after a manager restart would make the omitted container
@@ -338,6 +347,9 @@ func (s *service) ArriveAsAgent(ctx context.Context, agent *rpc.AgentInfo) (*rpc
 	if val := validateAgent(agent); val != "" {
 		return nil, status.Error(codes.InvalidArgument, val)
 	}
+	if err := normalizeLegacyAgentInfo(agent); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid legacy agent information: %v", err)
+	}
 
 	for _, cn := range agent.Containers {
 		s.removeExcludedEnvVars(cn.Environment)
@@ -364,6 +376,9 @@ func (s *service) ReconnectAgent(ctx context.Context, rq *rpc.ReconnectAgentRequ
 	sessionID := tunnel.SessionID(rq.GetSession().SessionId)
 	if _, _, err := s.ensureAgentSession(ctx, rq.Session); err != nil && status.Code(err) != codes.NotFound {
 		return nil, err
+	}
+	if err := normalizeLegacyAgentInfo(rq.Agent); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid legacy agent information: %v", err)
 	}
 	principal, mismatch := verifiedAgentPrincipal(ctx, rq.Agent)
 	if mismatch && s.authMode == auth.ModeEnforcing {
@@ -877,7 +892,7 @@ func (s *service) WatchAgents(session *rpc.SessionInfo, stream grpc.ServerStream
 		return err
 	}
 	ns := clientInfo.Namespace
-	return s.watchAgents(ctx, clientInfo.SupportsCompactAgentInfo,
+	return s.watchAgents(ctx, clientInfo.SupportsCompactAgentInfo, legacyForkClient(clientInfo.ClientInfo),
 		func(_ tunnel.SessionID, a *state.AgentSession) bool { return a.Namespace == ns }, stream)
 }
 
@@ -927,6 +942,7 @@ func agentInfoForWatch(ai *rpc.AgentInfo, compact bool) *rpc.AgentInfo {
 func (s *service) watchAgents(
 	ctx context.Context,
 	compact bool,
+	legacy bool,
 	includeAgent func(tunnel.SessionID, *state.AgentSession) bool,
 	stream grpc.ServerStreamingServer[rpc.AgentInfoSnapshot],
 ) error {
@@ -955,7 +971,7 @@ func (s *service) watchAgents(
 		for _, agentSessionID := range agentSessionIDs {
 			ag, ok := snapshot.Load(agentSessionID)
 			if ok && !m.IsInactive(types.UID(ag.PodUid)) {
-				agents = append(agents, agentInfoForWatch(ag.AgentInfo, compact))
+				agents = append(agents, agentInfoForClientWatch(ag.AgentInfo, compact, legacy))
 			}
 		}
 		if firstSnap {
@@ -991,6 +1007,7 @@ func (s *service) WatchAgentsDelta(session *rpc.SessionInfo, stream grpc.ServerS
 	}
 	ns := clientInfo.Namespace
 	compact := clientInfo.SupportsCompactAgentInfo
+	legacy := legacyForkClient(clientInfo.ClientInfo)
 	deltaCh := s.state.WatchAgents(ctx, func(_ tunnel.SessionID, a *state.AgentSession) bool { return a.Namespace == ns })
 	sessionDone, err := s.state.SessionDone(managerutil.GetSessionID(ctx))
 	if err != nil {
@@ -1007,7 +1024,7 @@ func (s *service) WatchAgentsDelta(session *rpc.SessionInfo, stream grpc.ServerS
 			if rl := len(delta.Upserts); rl > 0 {
 				aid.Upserts = make(map[string]*rpc.AgentInfo, rl)
 				for k, v := range delta.Upserts {
-					aid.Upserts[string(k)] = agentInfoForWatch(v.AgentInfo, compact)
+					aid.Upserts[string(k)] = agentInfoForClientWatch(v.AgentInfo, compact, legacy)
 				}
 			}
 			if rl := len(delta.Removals); rl > 0 {
