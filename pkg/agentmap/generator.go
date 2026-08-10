@@ -104,7 +104,9 @@ func (cfg *GeneratorConfig) Generate(
 		return nil, errcat.User.Newf("%s is the Telepresence Traffic Manager. It can not have a traffic-agent", wl)
 	}
 
-	pod := wl.GetPodTemplate()
+	// Workload templates belong to shared informer snapshots and may be read by
+	// the service and workload reconcilers concurrently.
+	pod := wl.GetPodTemplate().DeepCopy()
 	pod.Namespace = wl.GetNamespace()
 	cns := pod.Spec.Containers
 	for i := range cns {

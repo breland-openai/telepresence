@@ -2195,12 +2195,12 @@ func setupAgentInjector(t *testing.T, ctx context.Context, ci kubernetes.Interfa
 	require.NoError(t, err)
 
 	configWatcher := config.NewWatcher(mgrNs)
-	go func() {
-		err := configWatcher.Run(ctx)
+	go func(watcherCtx context.Context) {
+		err := configWatcher.Run(watcherCtx)
 		if err != nil {
 			t.Error(err)
 		}
-	}()
+	}(ctx)
 	require.NoError(t, configWatcher.ForceEvent(ctx))
 	ctx, err = namespaces.InitContext(ctx, configWatcher.SelectorChannel())
 	require.NoError(t, err)

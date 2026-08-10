@@ -1215,11 +1215,13 @@ matchExpressions:
 	ctx = informer.WithFactory(ctx, "")
 
 	configWatcher := config.NewWatcher(mgrNs)
-	go func() {
-		if err := configWatcher.Run(ctx); err != nil {
+	configWatcherDone := make(chan struct{})
+	go func(watcherCtx context.Context) {
+		defer close(configWatcherDone)
+		if err := configWatcher.Run(watcherCtx); err != nil {
 			t.Error(err)
 		}
-	}()
+	}(ctx)
 	if err = configWatcher.ForceEvent(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1282,6 +1284,7 @@ matchExpressions:
 		if err := g.Wait(); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			t.Error(err)
 		}
+		<-configWatcherDone
 	})
 	return conn, mgr, ctx
 }
