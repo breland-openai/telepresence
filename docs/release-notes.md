@@ -26,6 +26,12 @@ The agent injector reused a cached sidecar config across concurrent pod admissio
 A Kubernetes Service can route requests to more than one workload, such as stable and canary Deployments, while an intercept previously followed only the workload named by the user. HTTP intercepts without <code>--replace</code> now let each selected workload participate in one logical intercept, so filtered traffic reaches the same local handler regardless of which selected workload receives it. If the selected workloads or their traffic-agents cannot support shared interception, Telepresence warns and keeps the historical single-workload behavior instead of failing the intercept.
 </div>
 
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Improve selected-intercept tunnel stability</div></div>
+<div style="margin-left: 15px">
+
+Selected-intercept tunnels now reconnect agent dial watchers with backoff, clean up abandoned forwards more carefully, use separate timeouts for agent connections and intercepted endpoints, and reject dial requests when responder capacity is full instead of letting work accumulate.
+</div>
+
 ## <div style="display:flex;"><img src="images/feature.png" alt="feature" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[Guided traffic-manager setup with telepresence setup](reference/setup)</div></div>
 <div style="margin-left: 15px">
 
@@ -2462,4 +2468,3 @@ The helm chart now correctly handles custom agentInjector.webhook.port that was 
 
 Params .intercept.disableGlobal and .timeouts.agentArrival are now correctly honored.
 </div>
-
