@@ -170,6 +170,78 @@ dns:
 	})
 }
 
+func TestDNSUseComplexLookupRoundTrip(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg := GetDefaultConfig()
+		assert.False(t, cfg.DNS().UseComplexLookup)
+		assert.True(t, cfg.DNS().IsZero())
+	})
+
+	t.Run("true alone survives YAML round trip", func(t *testing.T) {
+		cfg, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  useComplexLookup: true
+`))
+		require.NoError(t, err)
+		assert.True(t, cfg.DNS().UseComplexLookup)
+		assert.False(t, cfg.DNS().Equal(GetDefaultConfig().DNS()))
+		assert.False(t, cfg.DNS().IsZero())
+
+		data, err := cfg.MarshalYAML()
+		require.NoError(t, err)
+		assert.Equal(t, "dns:\n  useComplexLookup: true\n", string(data))
+
+		roundTrip, err := ParseConfigYAML(testutil.NewContext(t, true), "", data)
+		require.NoError(t, err)
+		assert.True(t, roundTrip.DNS().UseComplexLookup)
+	})
+
+	t.Run("true alone survives JSON round trip", func(t *testing.T) {
+		cfg, err := UnmarshalJSONConfig([]byte(`{"dns":{"useComplexLookup":true}}`), true)
+		require.NoError(t, err)
+		assert.True(t, cfg.DNS().UseComplexLookup)
+
+		data, err := json2.Marshal(cfg)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"dns":{"useComplexLookup":true}}`, string(data))
+
+		roundTrip, err := UnmarshalJSONConfig(data, true)
+		require.NoError(t, err)
+		assert.True(t, roundTrip.DNS().UseComplexLookup)
+	})
+
+	t.Run("manager value survives unrelated configuration merge", func(t *testing.T) {
+		manager, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  useComplexLookup: true
+`))
+		require.NoError(t, err)
+
+		cfg := GetDefaultConfig()
+		cfg.DestructiveMerge(manager)
+		assert.True(t, cfg.DNS().UseComplexLookup)
+
+		unrelated, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  recursionCheck: true
+`))
+		require.NoError(t, err)
+		cfg.DestructiveMerge(unrelated)
+		assert.True(t, cfg.DNS().UseComplexLookup)
+		assert.True(t, cfg.DNS().RecursionCheck)
+	})
+
+	t.Run("status uses snake case", func(t *testing.T) {
+		dns := GetDefaultConfig().DNS()
+		dns.UseComplexLookup = true
+		assert.True(t, dns.ToSnake().UseComplexLookup)
+
+		data, err := json2.Marshal(dns.ToSnake())
+		require.NoError(t, err)
+		assert.Contains(t, string(data), `"use_complex_lookup":true`)
+	})
+}
+
 // TestNodeAgentDefault verifies that nodeAgent.enabled defaults to false and
 // that a user config setting it to true parses correctly.
 func TestNodeAgentDefault(t *testing.T) {

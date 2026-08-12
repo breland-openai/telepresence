@@ -620,6 +620,13 @@ func (s *session) clusterLookup(ctx context.Context, q *dns2.Question) (dnsproxy
 	clog.Debugf(ctx, "Lookup %s %q", dns2.TypeToString[q.Qtype], q.Name)
 	s.dnsLookups++
 
+	if s.shouldLookupViaWorkload(q) {
+		if answer, rCode, err, ok := s.lookupViaWorkload(ctx, q); ok {
+			return answer, rCode, err
+		}
+		return s.complexClusterLookup(ctx, q)
+	}
+
 	if s.lookupSequencer == nil || !(q.Qtype == dns2.TypeA || q.Qtype == dns2.TypeAAAA) {
 		return s.complexClusterLookup(ctx, q)
 	}
@@ -639,6 +646,96 @@ func (s *session) clusterLookup(ctx context.Context, q *dns2.Question) (dnsproxy
 		}, xsync.UpdateOp
 	})
 	return result.rrs, result.rCode, result.err
+}
+
+func (s *session) shouldLookupViaWorkload(question *dns2.Question) bool {
+	if (question.Qtype != dns2.TypeA && question.Qtype != dns2.TypeAAAA) ||
+		s.agentClients == nil || s.dnsServer == nil {
+		return false
+	}
+
+	name := strings.ToLower(strings.TrimSuffix(question.Name, "."))
+	clusterDomain := strings.ToLower(strings.TrimSuffix(s.dnsServer.ClusterDomain(), "."))
+	if name == clusterDomain || strings.HasSuffix(name, "."+clusterDomain) ||
+		name == "svc" || strings.HasSuffix(name, ".svc") {
+		return false
+	}
+
+	if !slices.ContainsFunc(s.dnsServer.GetConfig().IncludeSuffixes, func(suffix string) bool {
+		suffix = strings.ToLower(strings.Trim(strings.TrimSpace(suffix), "."))
+		return suffix != "" && (name == suffix || strings.HasSuffix(name, "."+suffix))
+	}) {
+		return false
+	}
+
+	return slices.ContainsFunc(s.subnetViaWorkloads, func(via *rpc.SubnetViaWorkload) bool {
+		return via.Workload != "" && via.Workload != "local"
+	})
+}
+
+func (s *session) lookupViaWorkload(
+	ctx context.Context,
+	question *dns2.Question,
+) (dnsproxy.RRs, int, error, bool) {
+	visited := make(map[string]struct{}, len(s.subnetViaWorkloads))
+	for _, via := range s.subnetViaWorkloads {
+		workload := via.Workload
+		if workload == "" || workload == "local" {
+			continue
+		}
+		if _, ok := visited[workload]; ok {
+			continue
+		}
+		visited[workload] = struct{}{}
+
+		prefixes := make([]netip.Prefix, 0)
+		for _, subnet := range s.localTranslationSubnets {
+			if subnet.workload == workload && subnet.IsValid() {
+				prefixes = append(prefixes, subnet.Prefix)
+			}
+		}
+		if len(prefixes) == 0 {
+			continue
+		}
+
+		agent := s.agentClients.GetAgentForWorkload(ctx, workload)
+		if agent == nil {
+			if err := ctx.Err(); err != nil {
+				return nil, rcodeFromError(err), err, true
+			}
+			continue
+		}
+		response, err := agent.Lookup(ctx, &manager.LookupRequest{Session: s.session, Name: question.Name})
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, rcodeFromError(err), err, true
+			}
+			clog.Debugf(ctx, "Workload %s could not resolve %q: %v", workload, question.Name, err)
+			continue
+		}
+		if response == nil {
+			continue
+		}
+
+		ips := make([]netip.Addr, 0, len(response.Ips))
+		for _, encodedIP := range response.Ips {
+			var addr netip.Addr
+			if err := addr.UnmarshalBinary(encodedIP); err != nil {
+				continue
+			}
+			addr = addr.Unmap()
+			if selected, ok := s.translationSubnetForIP(addr); ok && selected.workload == workload {
+				ips = append(ips, addr)
+			}
+		}
+		if len(ips) == 0 {
+			continue
+		}
+		clog.Debugf(ctx, "Using proxy-via workload %s for lookup %q", workload, question.Name)
+		answer, rCode, err := s.lookupIPRecords(question, ips)
+		return answer, rCode, err, true
+	}
+	return nil, dns2.RcodeNameError, nil, false
 }
 
 func (s *session) simpleLookup(ctx context.Context, question *dns2.Question) (dnsproxy.RRs, int, error) {
@@ -672,18 +769,22 @@ func (s *session) simpleLookup(ctx context.Context, question *dns2.Question) (dn
 	for i := range resp.Ips {
 		_ = ips[i].UnmarshalBinary(resp.Ips[i])
 	}
+	return s.lookupIPRecords(question, ips)
+}
+
+func (s *session) lookupIPRecords(question *dns2.Question, ips []netip.Addr) (dnsproxy.RRs, int, error) {
 	if len(s.localTranslationSubnets) > 0 {
 		for i, ip := range ips {
-			ips[i], err = s.GetLocalIP(ip)
+			translated, err := s.GetLocalIP(ip)
 			if err != nil {
 				return nil, dns2.RcodeServerFailure, err
 			}
+			ips[i] = translated
 		}
 	}
 	ips4, ips6 := splitNameTypes(question.Name, ips)
 	rrs := ensureBothFamilies(question.Name, ips4, ips6)
-	rCode := dns2.RcodeSuccess
-	return rrs, rCode, err
+	return rrs, dns2.RcodeSuccess, nil
 }
 
 // rrHeader creates a common DNS RR header for INET class.
@@ -790,12 +891,10 @@ func rcodeFromError(err error) int {
 func (s *session) GetLocalIP(destinationIP netip.Addr) (netip.Addr, error) {
 	var err error
 	va, _ := s.localTranslationTable.LoadOrCompute(destinationIP, func() (netip.Addr, bool) {
-		for _, sn := range s.localTranslationSubnets {
-			if sn.Contains(destinationIP) {
-				var nip netip.Addr
-				nip, err = s.nextVirtualIP(sn.workload, destinationIP)
-				return nip, err != nil
-			}
+		if selected, ok := s.translationSubnetForIP(destinationIP); ok {
+			nip, allocErr := s.nextVirtualIP(selected.workload, destinationIP)
+			err = allocErr
+			return nip, err != nil
 		}
 		return netip.Addr{}, true
 	})
@@ -803,6 +902,18 @@ func (s *session) GetLocalIP(destinationIP netip.Addr) (netip.Addr, error) {
 		destinationIP = va
 	}
 	return destinationIP, err
+}
+
+func (s *session) translationSubnetForIP(destinationIP netip.Addr) (agentSubnet, bool) {
+	var selected agentSubnet
+	matched := false
+	for _, subnet := range s.localTranslationSubnets {
+		if subnet.Contains(destinationIP) && (!matched || subnet.Bits() > selected.Bits()) {
+			selected = subnet
+			matched = true
+		}
+	}
+	return selected, matched
 }
 
 func (s *session) nextVirtualIP(workload string, destinationIP netip.Addr) (netip.Addr, error) {

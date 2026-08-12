@@ -391,6 +391,14 @@ func (s *Server) GetConfig() *client.DNS {
 	return &d
 }
 
+// ClusterDomain returns the Kubernetes cluster domain reported by the manager.
+func (s *Server) ClusterDomain() string {
+	s.RLock()
+	domain := s.clusterDomain
+	s.RUnlock()
+	return domain
+}
+
 func (s *Server) Ready() <-chan struct{} {
 	return s.ready
 }

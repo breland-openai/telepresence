@@ -1210,6 +1210,7 @@ func (d *DNS) Equal(o *DNS) bool {
 		o.VIFAddress == d.VIFAddress &&
 		o.LookupTimeout == d.LookupTimeout &&
 		o.RecursionCheck == d.RecursionCheck &&
+		o.UseComplexLookup == d.UseComplexLookup &&
 		o.PreserveLocalClusterDNS == d.PreserveLocalClusterDNS &&
 		slices.Equal(o.IncludeSuffixes, d.IncludeSuffixes) &&
 		slices.Equal(o.ExcludeSuffixes, d.ExcludeSuffixes) &&
