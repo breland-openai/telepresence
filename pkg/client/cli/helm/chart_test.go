@@ -61,3 +61,69 @@ func TestQuicTunnelRequiresSingleManagerReplica(t *testing.T) {
 	require.Error(t, err, "quicTunnel.enabled with two replicas must refuse to render even without the schema")
 	require.ErrorContains(t, err, "quicTunnel.enabled requires replicaCount 1")
 }
+
+func TestAgentPreStopDrainTimeout(t *testing.T) {
+	for _, timeout := range []string{"0s", "25s", "2m", "1m30s"} {
+		t.Run(timeout, func(t *testing.T) {
+			require.NoError(t, renderCoreChart(t, map[string]any{
+				"agent": map[string]any{"preStopDrainTimeout": timeout},
+			}, true))
+		})
+	}
+
+	for _, timeout := range []string{"-1s", "+1s", "2", "2minutes"} {
+		t.Run("invalid "+timeout, func(t *testing.T) {
+			err := renderCoreChart(t, map[string]any{
+				"agent": map[string]any{"preStopDrainTimeout": timeout},
+			}, true)
+			require.Error(t, err)
+			require.ErrorContains(t, err, "preStopDrainTimeout")
+		})
+	}
+}
+
+func TestAgentPreStopDrainTimeoutManagerEnvironment(t *testing.T) {
+	tests := []struct {
+		name  string
+		vals  map[string]any
+		value string
+	}{
+		{
+			name:  "default",
+			value: "2m",
+		},
+		{
+			name:  "configured",
+			vals:  map[string]any{"agent": map[string]any{"preStopDrainTimeout": "45s"}},
+			value: "45s",
+		},
+		{
+			name:  "disabled",
+			vals:  map[string]any{"agent": map[string]any{"preStopDrainTimeout": "0s"}},
+			value: "0s",
+		},
+		{
+			name: "injector disabled",
+			vals: map[string]any{"agentInjector": map[string]any{"enabled": false}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chrt, err := loadCoreChart(semver.MustParse("2.31.0"))
+			require.NoError(t, err)
+			values, err := chartutil.ToRenderValues(chrt, tt.vals,
+				chartutil.ReleaseOptions{Name: "traffic-manager", Namespace: "ambassador", IsInstall: true},
+				chartutil.DefaultCapabilities)
+			require.NoError(t, err)
+			rendered, err := engine.Engine{}.Render(chrt, values)
+			require.NoError(t, err)
+			deployment := rendered["telepresence-oss/templates/deployment.yaml"]
+			if tt.value == "" {
+				require.NotContains(t, deployment, "AGENT_PRE_STOP_DRAIN_TIMEOUT")
+				return
+			}
+			require.Contains(t, deployment, "- name: AGENT_PRE_STOP_DRAIN_TIMEOUT\n            value: \""+tt.value+"\"")
+		})
+	}
+}

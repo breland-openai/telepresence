@@ -63,6 +63,22 @@ The `agent.LogLevel` controls the log level of the traffic-agent. See [Log Level
 
 The `agent.resources` and `agent.initResources` will be used as the `resources` element when injecting traffic-agents and init-containers.
 
+### Shutdown drain
+
+`agent.preStopDrainTimeout` controls how long an injected traffic-agent keeps serving
+existing intercepted connections while its pod terminates. The default is `2m`; set
+it to `0s` to disable the shutdown hook.
+
+The traffic-manager and injected traffic-agent images must both support the shutdown
+hook; set this value to `0s` when using an older or custom agent image without support.
+
+The actual drain is capped at the pod's termination grace period minus five seconds.
+A pod using Kubernetes's default 30-second grace period therefore drains for at
+most 25 seconds. Workloads requiring a longer drain must configure a sufficiently
+long pod termination grace period. This setting only affects injected sidecars,
+not node agents. Every injected pod retains its resources during this drain, even
+when it has no active intercept; use `0s` to avoid that termination overhead.
+
 ## Mutating Webhook
 
 Telepresence uses a Mutating Webhook to inject the [Traffic Agent](../concepts/architecture.md#traffic-agent) sidecar container and update the

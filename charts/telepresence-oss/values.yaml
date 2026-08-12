@@ -215,6 +215,8 @@ agentInjector:
 agent:
   port: 9900
   enableH2cProbing: true
+  # Keep injected traffic-agents serving during pod termination. Set to 0s to disable.
+  preStopDrainTimeout: 2m
   mountPolicies:
     "/tmp": Local
   image:

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -104,7 +105,12 @@ func (a *agentInjector) Inject(ctx context.Context, req *admission.AdmissionRequ
 	}
 
 	if isDelete {
-		a.agentConfigs.Inactivate(pod.UID)
+		if req.DryRun != nil && *req.DryRun {
+			return nil, nil
+		}
+		if !preserveAgentDuringDrain(ctx, req, pod) {
+			a.agentConfigs.Inactivate(pod.UID)
+		}
 		return nil, nil
 	}
 
@@ -177,6 +183,67 @@ func (a *agentInjector) Inject(ctx context.Context, req *admission.AdmissionRequ
 		podTpl.Spec = wl.GetPodTemplate().Spec
 	}
 	return createPatch(ctx, sc, pod, podTpl)
+}
+
+// preserveAgentDuringDrain keeps an existing agent session usable until its
+// managed preStop hook finishes. Inactivating the pod at DELETE admission
+// would otherwise remove its intercepts and close client tunnels before the
+// kubelet has given the agent a chance to drain.
+func preserveAgentDuringDrain(ctx context.Context, req *admission.AdmissionRequest, pod *core.Pod) bool {
+	if managerutil.GetEnv(ctx).AgentPreStopDrainTimeout <= 0 {
+		return false
+	}
+
+	originalGracePeriod := int64(30)
+	if seconds := pod.Spec.TerminationGracePeriodSeconds; seconds != nil {
+		originalGracePeriod = *seconds
+	}
+	gracePeriod := originalGracePeriod
+	if seconds := pod.DeletionGracePeriodSeconds; seconds != nil {
+		gracePeriod = min(gracePeriod, *seconds)
+	}
+	if req.Options.Object != nil {
+		options, ok := req.Options.Object.(*meta.DeleteOptions)
+		if !ok {
+			return false
+		}
+		if options.GracePeriodSeconds != nil {
+			gracePeriod = min(gracePeriod, *options.GracePeriodSeconds)
+		}
+	} else if len(req.Options.Raw) > 0 {
+		var options meta.DeleteOptions
+		if err := json.Unmarshal(req.Options.Raw, &options); err != nil {
+			return false
+		}
+		if options.GracePeriodSeconds != nil {
+			gracePeriod = min(gracePeriod, *options.GracePeriodSeconds)
+		}
+	}
+	if gracePeriod <= 5 {
+		return false
+	}
+
+	for i := range pod.Spec.Containers {
+		container := &pod.Spec.Containers[i]
+		if container.Name != agentconfig.ContainerName || container.Lifecycle == nil ||
+			container.Lifecycle.PreStop == nil || container.Lifecycle.PreStop.Exec == nil {
+			continue
+		}
+		command := container.Lifecycle.PreStop.Exec.Command
+		if len(command) != 3 || command[0] != "/usr/local/bin/traffic" || command[1] != "agent-drain" {
+			return false
+		}
+		timeout, err := time.ParseDuration(command[2])
+		if err != nil || timeout <= 0 {
+			return false
+		}
+		// Authenticate the hook against the pod grace period used when it
+		// was injected. A later manager setting or DELETE override can be
+		// shorter without making the existing hook untrusted; Kubernetes
+		// still bounds it to the actual remaining termination grace.
+		return timeout <= time.Duration(originalGracePeriod-5)*time.Second
+	}
+	return false
 }
 
 func createPatch(ctx context.Context, config *agentconfig.Sidecar, pod *core.Pod, wlTpl *core.PodTemplateSpec) (patches PatchOps, err error) {
@@ -447,10 +514,11 @@ func addAgentContainer(
 	patches PatchOps,
 ) (PatchOps, map[string]string, error) {
 	ab := agentconfig.ContainerBuilder{
-		MountPolicies: managerutil.GetEnv(ctx).AgentMountPolicies,
-		Pod:           wlTpl,
-		Config:        config,
-		CoverDir:      managerutil.GetEnv(ctx).GoCoverDir,
+		MountPolicies:       managerutil.GetEnv(ctx).AgentMountPolicies,
+		Pod:                 wlTpl,
+		Config:              config,
+		PreStopDrainTimeout: managerutil.GetEnv(ctx).AgentPreStopDrainTimeout,
+		CoverDir:            managerutil.GetEnv(ctx).GoCoverDir,
 	}
 	acn, replaceAnnotations, err := ab.AgentContainer(ctx)
 	if err != nil {
