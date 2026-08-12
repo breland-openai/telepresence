@@ -391,6 +391,14 @@ func (s *Server) GetConfig() *client.DNS {
 	return &d
 }
 
+// ClusterDomain returns the Kubernetes cluster domain reported by the manager.
+func (s *Server) ClusterDomain() string {
+	s.RLock()
+	domain := s.clusterDomain
+	s.RUnlock()
+	return domain
+}
+
 func (s *Server) Ready() <-chan struct{} {
 	return s.ready
 }
@@ -457,9 +465,9 @@ func mappingsMap(mappings []*client.DNSMapping) map[string]string {
 		for _, m := range mappings {
 			al := m.AliasFor
 			if _, err := netip.ParseAddr(al); err != nil {
-				al += "."
+				al = dns.Fqdn(al)
 			}
-			mm[strings.ToLower(m.Name+".")] = strings.ToLower(al)
+			mm[strings.ToLower(dns.Fqdn(m.Name))] = strings.ToLower(al)
 		}
 		return mm
 	}

@@ -53,7 +53,9 @@ Envoy sidecar, and the auto-allocated virtual IPs are unreachable. The value
 will typically mirror what you pass to `--proxy-via` when connecting.
 
 The `client.dns.includeSuffixes` value can also be set per-client in
-`config.yml` instead of globally in the chart.
+`config.yml` instead of globally in the chart. The suffix applies to every
+matching ServiceEntry hostname; individual hostnames do not need separate
+configuration.
 
 ## Connecting
 
@@ -71,10 +73,19 @@ reachable from the workstation:
 $ curl http://my-service-entry-host.internal.example/
 ```
 
-The lookup is performed by the traffic-agent inside the meshed pod, the
-ServiceEntry's virtual IP is translated to a locally routed address, and the
-connection is dialed from the pod through the Envoy sidecar, which routes it
-according to the ServiceEntry.
+For an address lookup matching a configured `includeSuffixes` entry,
+Telepresence selects the traffic-agent belonging to the `--proxy-via` workload,
+even when other workloads are attached or the traffic-manager requires complex
+DNS lookups. The selected agent's answer is used only when its address belongs
+to that workload's configured `--proxy-via` range. The virtual IP is translated
+to a locally routed address, and the connection is dialed from the same pod
+through the Envoy sidecar.
+
+If multiple workloads have `--proxy-via` ranges, Telepresence tries them in the
+order configured. If no selected workload can resolve the name within its own
+range, the lookup falls back to the normal traffic-manager resolution path.
+Ordinary Kubernetes service names and DNS names outside the explicitly included
+suffixes retain their existing resolution behavior.
 
 ## Limitations
 

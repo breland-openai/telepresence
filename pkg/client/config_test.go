@@ -16,6 +16,7 @@ import (
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/clog/testutil"
 	"github.com/telepresenceio/telepresence/v2/pkg/filelocation"
+	json2 "github.com/telepresenceio/telepresence/v2/pkg/json"
 )
 
 func TestGetConfig(t *testing.T) {
@@ -84,6 +85,161 @@ routing:
 func TestInterceptLocalShortcutDefault(t *testing.T) {
 	assert.True(t, GetDefaultConfig().Intercept().LocalShortcut)
 	assert.True(t, GetDefaultConfig().Intercept().LocalShortcutIsGlobal)
+}
+
+func TestDNSPreserveLocalClusterDNS(t *testing.T) {
+	t.Run("enabled by default", func(t *testing.T) {
+		cfg := GetDefaultConfig()
+		assert.True(t, cfg.DNS().PreserveLocalClusterDNS)
+		assert.True(t, cfg.DNS().ToSnake().PreserveLocalClusterDNS)
+	})
+
+	t.Run("omitted setting remains enabled", func(t *testing.T) {
+		cfg, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  recursionCheck: true
+`))
+		require.NoError(t, err)
+		assert.True(t, cfg.DNS().PreserveLocalClusterDNS)
+	})
+
+	t.Run("explicit false survives YAML round trip", func(t *testing.T) {
+		cfg, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  preserveLocalClusterDNS: false
+`))
+		require.NoError(t, err)
+		assert.False(t, cfg.DNS().PreserveLocalClusterDNS)
+		assert.False(t, cfg.DNS().Equal(GetDefaultConfig().DNS()))
+		assert.False(t, cfg.DNS().IsZero())
+
+		data, err := cfg.MarshalYAML()
+		require.NoError(t, err)
+		assert.Equal(t, "dns:\n  preserveLocalClusterDNS: false\n", string(data))
+
+		roundTrip, err := ParseConfigYAML(testutil.NewContext(t, true), "", data)
+		require.NoError(t, err)
+		assert.False(t, roundTrip.DNS().PreserveLocalClusterDNS)
+	})
+
+	t.Run("explicit false survives JSON round trip", func(t *testing.T) {
+		cfg, err := UnmarshalJSONConfig([]byte(`{"dns":{"preserveLocalClusterDNS":false}}`), true)
+		require.NoError(t, err)
+		assert.False(t, cfg.DNS().PreserveLocalClusterDNS)
+
+		data, err := json2.Marshal(cfg)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"dns":{"preserveLocalClusterDNS":false}}`, string(data))
+
+		roundTrip, err := UnmarshalJSONConfig(data, true)
+		require.NoError(t, err)
+		assert.False(t, roundTrip.DNS().PreserveLocalClusterDNS)
+	})
+
+	t.Run("explicit false survives configuration merges", func(t *testing.T) {
+		disabled, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  preserveLocalClusterDNS: false
+`))
+		require.NoError(t, err)
+
+		cfg := GetDefaultConfig()
+		cfg.DestructiveMerge(disabled)
+		assert.False(t, cfg.DNS().PreserveLocalClusterDNS)
+
+		unrelated, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  recursionCheck: true
+`))
+		require.NoError(t, err)
+		cfg.DestructiveMerge(unrelated)
+		assert.False(t, cfg.DNS().PreserveLocalClusterDNS)
+		assert.True(t, cfg.DNS().RecursionCheck)
+	})
+
+	t.Run("status uses snake case", func(t *testing.T) {
+		dns := &DNS{
+			VIFAddress:              netip.MustParseAddrPort("127.0.0.1:53"),
+			PreserveLocalClusterDNS: false,
+		}
+		assert.False(t, dns.ToSnake().PreserveLocalClusterDNS)
+
+		data, err := json2.Marshal(dns.ToSnake())
+		require.NoError(t, err)
+		assert.Contains(t, string(data), `"preserve_local_cluster_dns":false`)
+	})
+}
+
+func TestDNSUseComplexLookupRoundTrip(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg := GetDefaultConfig()
+		assert.False(t, cfg.DNS().UseComplexLookup)
+		assert.True(t, cfg.DNS().IsZero())
+	})
+
+	t.Run("true alone survives YAML round trip", func(t *testing.T) {
+		cfg, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  useComplexLookup: true
+`))
+		require.NoError(t, err)
+		assert.True(t, cfg.DNS().UseComplexLookup)
+		assert.False(t, cfg.DNS().Equal(GetDefaultConfig().DNS()))
+		assert.False(t, cfg.DNS().IsZero())
+
+		data, err := cfg.MarshalYAML()
+		require.NoError(t, err)
+		assert.Equal(t, "dns:\n  useComplexLookup: true\n", string(data))
+
+		roundTrip, err := ParseConfigYAML(testutil.NewContext(t, true), "", data)
+		require.NoError(t, err)
+		assert.True(t, roundTrip.DNS().UseComplexLookup)
+	})
+
+	t.Run("true alone survives JSON round trip", func(t *testing.T) {
+		cfg, err := UnmarshalJSONConfig([]byte(`{"dns":{"useComplexLookup":true}}`), true)
+		require.NoError(t, err)
+		assert.True(t, cfg.DNS().UseComplexLookup)
+
+		data, err := json2.Marshal(cfg)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"dns":{"useComplexLookup":true}}`, string(data))
+
+		roundTrip, err := UnmarshalJSONConfig(data, true)
+		require.NoError(t, err)
+		assert.True(t, roundTrip.DNS().UseComplexLookup)
+	})
+
+	t.Run("manager value survives unrelated configuration merge", func(t *testing.T) {
+		manager, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  useComplexLookup: true
+`))
+		require.NoError(t, err)
+
+		cfg := GetDefaultConfig()
+		cfg.DestructiveMerge(manager)
+		assert.True(t, cfg.DNS().UseComplexLookup)
+
+		unrelated, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  recursionCheck: true
+`))
+		require.NoError(t, err)
+		cfg.DestructiveMerge(unrelated)
+		assert.True(t, cfg.DNS().UseComplexLookup)
+		assert.True(t, cfg.DNS().RecursionCheck)
+	})
+
+	t.Run("status uses snake case", func(t *testing.T) {
+		dns := GetDefaultConfig().DNS()
+		dns.UseComplexLookup = true
+		assert.True(t, dns.ToSnake().UseComplexLookup)
+
+		data, err := json2.Marshal(dns.ToSnake())
+		require.NoError(t, err)
+		assert.Contains(t, string(data), `"use_complex_lookup":true`)
+	})
 }
 
 // TestNodeAgentDefault verifies that nodeAgent.enabled defaults to false and

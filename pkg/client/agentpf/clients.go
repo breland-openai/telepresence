@@ -395,6 +395,7 @@ func (ac *client) runDialWatcher(ctx context.Context, watchID uint64) {
 
 type Clients interface {
 	GetRandomAgent(context.Context) agent.AgentClient
+	GetAgentForWorkload(context.Context, string) agent.AgentClient
 	GetClient(netip.Addr) tunnel.Provider
 	WatchAgentPods(rmc manager.ManagerClient) error
 
@@ -664,6 +665,52 @@ func (s *clients) GetRandomAgent(ctx context.Context) (aa agent.AgentClient) {
 		clog.Warn(s, err)
 	}
 	return aa
+}
+
+// GetAgentForWorkload returns a connected traffic-agent for the workload in the connected namespace.
+func (s *clients) GetAgentForWorkload(ctx context.Context, workload string) agent.AgentClient {
+	if workload == "" || s.disabled.Load() {
+		return nil
+	}
+
+	var connected, other *client
+	var connectedKey, otherKey string
+	s.clients.Range(func(key string, ac *client) bool {
+		ac.RLock()
+		info := ac.info
+		matches := info != nil && !info.NodeAgent && info.WorkloadName == workload && info.Namespace == s.Namespace
+		isConnected := ac.cli != nil
+		ac.RUnlock()
+
+		if !matches {
+			return true
+		}
+		if isConnected {
+			if connected == nil || key < connectedKey {
+				connected = ac
+				connectedKey = key
+			}
+		} else if other == nil || key < otherKey {
+			other = ac
+			otherKey = key
+		}
+		return true
+	})
+
+	selected := connected
+	if selected == nil {
+		selected = other
+	}
+	if selected == nil {
+		return nil
+	}
+
+	agentClient, err := selected.ensureConnect(ctx)
+	if err != nil {
+		clog.Warn(s, err)
+		return nil
+	}
+	return agentClient
 }
 
 // GetWorkloadClient returns tunnel.Provider that opens a tunnel to a traffic-agent that
