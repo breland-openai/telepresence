@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/blang/semver/v4"
@@ -50,7 +52,106 @@ var NewExtendedManagerClient func(conn *grpc.ClientConn, ossManager rpc.ManagerC
 // stuck forever before /tmp/agent/ready is created.
 var managerHandshakeTimeout = 10 * time.Second //nolint:gochecknoglobals // overridden by tests
 
-const agentSessionIDPrefix = "agent:"
+const (
+	agentSessionIDPrefix        = "agent:"
+	initialInterceptSyncTimeout = 30 * time.Second
+)
+
+type interceptReadiness struct {
+	mu           sync.Mutex
+	synchronized bool
+	generation   uint64
+	initialSync  chan struct{}
+	initialOnce  sync.Once
+}
+
+type interceptSnapshot struct {
+	intercepts []*rpc.InterceptInfo
+	generation uint64
+}
+
+type interceptReadinessStream[T any] struct {
+	grpc.ServerStreamingClient[T]
+	ctx       context.Context
+	readiness *interceptReadiness
+}
+
+func (s *interceptReadinessStream[T]) Recv() (*T, error) {
+	value, err := s.ServerStreamingClient.Recv()
+	if err != nil && s.ctx.Err() == nil {
+		if readinessErr := s.readiness.setUnsynchronized(s.ctx); readinessErr != nil {
+			return nil, readinessErr
+		}
+	}
+	return value, err
+}
+
+func newInterceptReadiness() *interceptReadiness {
+	return &interceptReadiness{initialSync: make(chan struct{})}
+}
+
+func (r *interceptReadiness) currentGeneration() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.generation
+}
+
+func (r *interceptReadiness) setSynchronized(ctx context.Context, generation uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if generation != r.generation {
+		return nil
+	}
+	if r.synchronized {
+		return nil
+	}
+	file, err := dos.OpenFile(ctx, readyFile, os.O_CREATE|os.O_WRONLY, 0o666)
+	if err != nil {
+		return err
+	}
+	if err = file.Close(); err != nil {
+		_ = dos.Remove(ctx, readyFile)
+		return err
+	}
+	if err = ctx.Err(); err != nil {
+		_ = dos.Remove(ctx, readyFile)
+		return err
+	}
+	r.synchronized = true
+	r.initialOnce.Do(func() { close(r.initialSync) })
+	return nil
+}
+
+func (r *interceptReadiness) setUnsynchronized(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.synchronized = false
+	r.generation++
+	if err := dos.Remove(ctx, readyFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (r *interceptReadiness) awaitInitialSync(ctx context.Context, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-r.initialSync:
+		return nil
+	case <-ctx.Done():
+		return nil
+	case <-timer.C:
+		return status.Errorf(codes.DeadlineExceeded,
+			"traffic-agent did not synchronize its initial intercept snapshot within %s", timeout)
+	}
+}
 
 // Agent session IDs are deterministic from the pod UID. Older managers can
 // return an empty ID when a retried arrival finds the first call already
@@ -69,6 +170,10 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 	processCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	readiness := newInterceptReadiness()
+	if err := readiness.setUnsynchronized(ctx); err != nil {
+		return fmt.Errorf("clear traffic-agent readiness: %w", err)
+	}
 
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 	tokenPath := filepath.Join(agentconfig.ManagerTokenMountPath, agentconfig.ManagerTokenFile)
@@ -136,6 +241,10 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 		defer cancel()
 
+		if err := readiness.setUnsynchronized(ctx); err != nil {
+			clog.Errorf(ctx, "clear traffic-agent readiness: %v", err)
+		}
+
 		// Reset state by processing an empty snapshot
 		// - clear out any intercepts
 		// - set forwarding to the app
@@ -153,22 +262,20 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 	wg.Go("logLevelWatch", func(ctx context.Context) error {
 		return logLevelWatchLoop(ctx, state.AgentConfig().LogLevel, manager, retryInterval)
 	})
-	snapshots := make(chan []*rpc.InterceptInfo)
+	snapshots := make(chan interceptSnapshot)
 	wg.Go("interceptWatch", func(ctx context.Context) error {
-		return interceptWatchLoop(ctx, manager, session, info, snapshots, retryInterval)
+		return interceptWatchLoop(ctx, manager, session, info, snapshots, retryInterval, readiness)
 	})
 	wg.Go("handleIntercept", func(ctx context.Context) error {
-		return handleInterceptLoop(ctx, manager, session, snapshots, state)
+		return handleInterceptLoop(ctx, manager, session, snapshots, state, readiness)
 	})
 	wg.Go("remain", func(ctx context.Context) error {
 		return remainLoop(ctx, manager, session)
 	})
+	wg.Go("initialInterceptSync", func(ctx context.Context) error {
+		return readiness.awaitInitialSync(ctx, initialInterceptSyncTimeout)
+	})
 
-	file, err := dos.OpenFile(ctx, readyFile, os.O_CREATE|os.O_WRONLY, 0o666)
-	if err != nil {
-		return err
-	}
-	_ = file.Close()
 	return wg.Wait()
 }
 
@@ -199,12 +306,16 @@ func interceptWatchLoop(
 	manager rpc.ManagerClient,
 	session *rpc.SessionInfo,
 	info *rpc.AgentInfo,
-	snapshots chan<- []*rpc.InterceptInfo,
+	snapshots chan<- interceptSnapshot,
 	retryInterval time.Duration,
+	readiness *interceptReadiness,
 ) error {
 	// Call WatchIntercepts and publish the snapshots on the channel
 	snapMap := make(map[string]*rpc.InterceptInfo)
 	reconnectAgent := func() error {
+		if err := readiness.setUnsynchronized(ctx); err != nil {
+			return err
+		}
 		clear(snapMap)
 		_, err := manager.ReconnectAgent(ctx, &rpc.ReconnectAgentRequest{
 			Session: session,
@@ -214,26 +325,55 @@ func interceptWatchLoop(
 	}
 	err := watcher.WatchWithRetry(ctx, "WatchInterceptsDelta", retryInterval,
 		func(ctx context.Context) (grpc.ServerStreamingClient[rpc.InterceptInfoDelta], error) {
-			return manager.WatchInterceptsDelta(ctx, session)
+			stream, err := manager.WatchInterceptsDelta(ctx, session)
+			if err != nil {
+				return nil, err
+			}
+			return &interceptReadinessStream[rpc.InterceptInfoDelta]{
+				ServerStreamingClient: stream,
+				ctx:                   ctx,
+				readiness:             readiness,
+			}, nil
 		},
 		func(delta *rpc.InterceptInfoDelta) error {
 			maps.DeltaUpdate(snapMap, delta.Upserts, delta.Removals)
-			snapshots <- maps.Values(snapMap)
-			return nil
+			return sendInterceptSnapshot(ctx, snapshots, interceptSnapshot{
+				intercepts: maps.Values(snapMap),
+				generation: readiness.currentGeneration(),
+			})
 		}, reconnectAgent)
 	if err != nil && status.Code(err) == codes.Unimplemented {
 		// Fall back to streaming all intercepts if the traffic manager doesn't support delta updates.'
 		clog.Warnf(ctx, "WatchInterceptsDelta is not implemented by the traffic-manager, falling back to WatchIntercepts and full snapshots")
 		err = watcher.WatchWithRetry(ctx, "WatchIntercepts", retryInterval,
 			func(ctx context.Context) (grpc.ServerStreamingClient[rpc.InterceptInfoSnapshot], error) {
-				return manager.WatchIntercepts(ctx, session)
+				stream, err := manager.WatchIntercepts(ctx, session)
+				if err != nil {
+					return nil, err
+				}
+				return &interceptReadinessStream[rpc.InterceptInfoSnapshot]{
+					ServerStreamingClient: stream,
+					ctx:                   ctx,
+					readiness:             readiness,
+				}, nil
 			},
 			func(snapshot *rpc.InterceptInfoSnapshot) error {
-				snapshots <- snapshot.Intercepts
-				return nil
+				return sendInterceptSnapshot(ctx, snapshots, interceptSnapshot{
+					intercepts: snapshot.Intercepts,
+					generation: readiness.currentGeneration(),
+				})
 			}, reconnectAgent)
 	}
 	return err
+}
+
+func sendInterceptSnapshot(ctx context.Context, snapshots chan<- interceptSnapshot, snapshot interceptSnapshot) error {
+	select {
+	case snapshots <- snapshot:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func remainLoop(ctx context.Context, manager rpc.ManagerClient, session *rpc.SessionInfo) error {
@@ -253,14 +393,24 @@ func remainLoop(ctx context.Context, manager rpc.ManagerClient, session *rpc.Ses
 	}
 }
 
-func handleInterceptLoop(ctx context.Context, manager rpc.ManagerClient, session *rpc.SessionInfo, snapshots <-chan []*rpc.InterceptInfo, state State) error {
+func handleInterceptLoop(
+	ctx context.Context,
+	manager rpc.ManagerClient,
+	session *rpc.SessionInfo,
+	snapshots <-chan interceptSnapshot,
+	state State,
+	readiness *interceptReadiness,
+) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case snapshot := <-snapshots:
-			clog.Debugf(ctx, "HandleIntercepts %s", interceptsStringer(snapshot))
-			reviews := state.HandleIntercepts(ctx, snapshot)
+			clog.Debugf(ctx, "HandleIntercepts %s", interceptsStringer(snapshot.intercepts))
+			reviews := state.HandleIntercepts(ctx, snapshot.intercepts)
+			if err := readiness.setSynchronized(ctx, snapshot.generation); err != nil {
+				return err
+			}
 			for _, review := range reviews {
 				review.Session = session
 				if _, err := manager.ReviewIntercept(ctx, review); err != nil {
