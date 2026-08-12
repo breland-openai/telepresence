@@ -31,7 +31,12 @@ type quicAgentState struct {
 // starts or refreshes the QUIC listener itself. See "Agent connections over QUIC" in
 // docs/reference/quic-transport-architecture.md.
 func (s *state) RefreshQuicAgentListener(processCtx, fetchCtx context.Context) {
-	resp, err := s.manager.GetQuicAgentCert(fetchCtx, s.sessionInfo)
+	manager, session := s.managerSession()
+	if manager == nil || session == nil {
+		return
+	}
+
+	resp, err := manager.GetQuicAgentCert(fetchCtx, session)
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {
 			// The traffic-manager predates agent QUIC certificates. Expected skew;

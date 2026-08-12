@@ -208,7 +208,7 @@ func (fs *fwdState) HandlePort(ctx context.Context, cepts []*manager.InterceptIn
 	}
 
 	fwd := fs.forwarder
-	if fs.sessionInfo != nil {
+	if fs.SessionInfo() != nil {
 		// Update forwarding.
 		fwd.SetStreamProvider(fs)
 	}

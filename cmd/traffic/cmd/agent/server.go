@@ -257,10 +257,15 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 // ReportMetrics makes an attempt to send metrics to the traffic-manager. The provided context is just
 // for logging (it can be cancelled). Errors are logged but not fatal.
 func (s *state) ReportMetrics(ctx context.Context, metrics *rpc.TunnelMetrics) {
+	manager := s.ManagerClient()
+	if manager == nil {
+		return
+	}
+
 	go func() {
 		mCtx, mCancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 		defer mCancel()
-		_, err := s.manager.ReportMetrics(mCtx, metrics)
+		_, err := manager.ReportMetrics(mCtx, metrics)
 		if err != nil && status.Code(err) != codes.Canceled {
 			clog.Errorf(ctx, "ReportMetrics failed: %v", err)
 		}
