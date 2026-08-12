@@ -1,9 +1,11 @@
 package dns
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
+	"time"
 
 	"github.com/telepresenceio/telepresence/v2/regression_test/framework/managers"
 	"github.com/telepresenceio/telepresence/v2/regression_test/framework/rt"
@@ -76,4 +78,59 @@ func (s *ExcludesMappings) Test_Mappings() {
 	t.Cleanup(func() { conn.Disconnect(t) })
 
 	rt.RoutedToCluster(t, "http://"+net.JoinHostPort(dnsMappingAlias, strconv.Itoa(wl.Port)))
+}
+
+// Test_LocalClusterAPIMappings models a client hosted inside one Kubernetes
+// cluster while connected to another: the host API's colliding short and fully
+// qualified service names must keep their local address, while ordinary remote
+// Services remain routed through the connected cluster.
+func (s *ExcludesMappings) Test_LocalClusterAPIMappings() {
+	t := s.T()
+	ctx := s.Ctx()
+	ns := s.AppNamespace()
+	wl := s.Workload(workloads.Echo("dns-local-cluster-api-echo"))
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	s.Require().NoError(err)
+	t.Cleanup(func() { _ = listener.Close() })
+	localAPIAddress := listener.Addr().(*net.TCPAddr)
+
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	env := rt.Env{Ctx: ctx, T: t, R: s.R()}
+	path, err := rt.WithKubeConfigExtension(env, map[string]any{
+		"dns": map[string]any{"mappings": []map[string]string{
+			{"name": "kubernetes.default.svc", "aliasFor": localAPIAddress.IP.String()},
+			{"name": "kubernetes.default.svc.cluster.local", "aliasFor": localAPIAddress.IP.String()},
+		}},
+	})
+	s.Require().NoError(err)
+
+	freeDefaultConnection(t, ns)
+	conn := rt.Mutate(t, rt.ConnectionFixture(ns, rt.ConnWithKubeconfig(path)))
+	t.Cleanup(func() { conn.Disconnect(t) })
+
+	for _, apiName := range []string{"kubernetes.default.svc", "kubernetes.default.svc.cluster.local"} {
+		s.Eventually(func() bool {
+			lookupContext, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
+			defer cancel()
+			addresses, lookupErr := net.DefaultResolver.LookupHost(lookupContext, apiName)
+			return lookupErr == nil && len(addresses) == 1 && addresses[0] == localAPIAddress.IP.String()
+		}, lookupPollTimeout, lookupPollInterval, "%s did not resolve to the local Kubernetes API", apiName)
+
+		dialer := net.Dialer{Timeout: time.Second}
+		apiConnection, dialErr := dialer.DialContext(ctx, "tcp", net.JoinHostPort(apiName, strconv.Itoa(localAPIAddress.Port)))
+		s.Require().NoError(dialErr, "%s did not route to the local Kubernetes API", apiName)
+		s.Require().NoError(apiConnection.Close())
+	}
+
+	rt.RoutedToCluster(t, "http://"+net.JoinHostPort(wl.SvcName, strconv.Itoa(wl.Port)))
 }

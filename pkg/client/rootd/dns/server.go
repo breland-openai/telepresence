@@ -457,9 +457,9 @@ func mappingsMap(mappings []*client.DNSMapping) map[string]string {
 		for _, m := range mappings {
 			al := m.AliasFor
 			if _, err := netip.ParseAddr(al); err != nil {
-				al += "."
+				al = dns.Fqdn(al)
 			}
-			mm[strings.ToLower(m.Name+".")] = strings.ToLower(al)
+			mm[strings.ToLower(dns.Fqdn(m.Name))] = strings.ToLower(al)
 		}
 		return mm
 	}

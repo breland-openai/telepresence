@@ -129,6 +129,9 @@ type session struct {
 	// The local dns server
 	dnsServer *dns.Server
 
+	// localClusterDNSMappings is immutable after session construction.
+	localClusterDNSMappings client.DNSMappings
+
 	// vifDNS is the address and port of the DNS server attached to the TUN device. This is currently only
 	// used in conjunction with systemd-resolved. The current macOS and the overriding solution
 	// will dispatch directly to the local DNS Service without going through the TUN device, but
@@ -443,7 +446,14 @@ func newSession(
 	}
 	clog.Infof(s, "allow-conflicting subnets %v", s.allowConflictingSubnets)
 
-	s.dnsServer = dns.NewServer(cfg.DNS(), s.Namespace, s.clusterLookup)
+	dnsConfig := cfg.DNS()
+	s.localClusterDNSMappings = discoverLocalClusterDNSMappings(s, dnsConfig, rt.VirtualSubnet)
+	if len(s.localClusterDNSMappings) > 0 {
+		effectiveDNS := *dnsConfig
+		effectiveDNS.Mappings = mergeLocalClusterDNSMappings(dnsConfig.Mappings, s.localClusterDNSMappings)
+		dnsConfig = &effectiveDNS
+	}
+	s.dnsServer = dns.NewServer(dnsConfig, s.Namespace, s.clusterLookup)
 	s.SetTopLevelDomains(nil)
 
 	// Set ourselves as the default dialer for the session.
@@ -805,7 +815,8 @@ func (s *session) nextVirtualIP(workload string, destinationIP netip.Addr) (neti
 }
 
 func (s *session) getNetworkConfig() *rpc.NetworkConfig {
-	mc := client.GetConfig(s)
+	// Runtime addresses and preserved mappings belong to this status snapshot.
+	mc := client.GetConfig(client.WithConfig(s, client.GetConfig(s)))
 	r := mc.Routing()
 	if s.tunVif != nil {
 		r.Subnets = s.tunVif.Router.GetRoutedSubnets()
@@ -831,6 +842,7 @@ func (s *session) getNetworkConfig() *rpc.NetworkConfig {
 		r.AllowConflicting = nil
 	}
 	d := mc.DNS()
+	d.Mappings = s.dnsServer.GetConfig().Mappings
 	if proc.RunningInContainer() && s.teleroute != nil {
 		las := s.teleroute.DaemonAddresses()
 		d.LocalAddresses = make([]netip.AddrPort, len(las))
@@ -1238,51 +1250,42 @@ func computeNeverProxyOverrides(ctx context.Context, subnets, nvp []netip.Prefix
 	return subnet.Unique(proxy), neverProxy, neverProxyOverrides
 }
 
-// neverProxyWithLocalDNS returns the configured never-proxy subnets extended with
-// host routes for any local DNS server whose address is covered by one of the
-// subnets that we are about to route. Without this, DNS queries sent to such a
-// server would be captured by the TUN-device and tunnelled into the cluster
-// instead of reaching the real resolver, breaking name resolution for everything
-// that isn't a cluster name. See issue #2429.
+// neverProxyWithLocalDNS preserves physical routes to local DNS resolvers and
+// the owning Kubernetes API when their addresses overlap proxied subnets.
 func (s *session) neverProxyWithLocalDNS(subnets []netip.Prefix) (neverProxy, dnsRoutes []netip.Prefix) {
 	cfg := client.GetConfig(s).DNS()
 
-	// Collect the DNS server addresses from every source we know of: the user
-	// configuration, the addresses the DNS server actually settled on at runtime
-	// (e.g. resolved from /etc/resolv.conf), and the host's system resolvers.
-	dnsServers := make([]netip.Addr, 0, len(cfg.LocalAddresses)+len(s.dnsServer.LocalAddresses))
+	localEndpoints := make([]netip.Addr, 0, len(cfg.LocalAddresses)+len(s.dnsServer.LocalAddresses)+len(s.localClusterDNSMappings))
 	for _, ap := range cfg.LocalAddresses {
-		dnsServers = append(dnsServers, ap.Addr())
+		localEndpoints = append(localEndpoints, ap.Addr())
 	}
 	for _, ap := range s.dnsServer.LocalAddresses {
-		dnsServers = append(dnsServers, ap.Addr())
+		localEndpoints = append(localEndpoints, ap.Addr())
 	}
 	for _, ap := range dns.SystemResolvers(s) {
-		dnsServers = append(dnsServers, ap.Addr())
+		localEndpoints = append(localEndpoints, ap.Addr())
 	}
+	localEndpoints = appendPreservedLocalClusterDNSAddresses(localEndpoints, s.localClusterDNSMappings)
 
-	return appendLocalDNSNeverProxy(s, s.neverProxySubnets, subnets, dnsServers)
+	return appendLocalDNSNeverProxy(s, s.neverProxySubnets, subnets, localEndpoints)
 }
 
-// appendLocalDNSNeverProxy adds a host route (/32 or /128) to neverProxy for each
-// DNS server address that is covered by one of the routed subnets and not already
-// covered by a never-proxy entry. It also returns the host routes for those DNS
-// servers (dnsRoutes), so the router can route just these via their real path
-// while leaving every other never-proxy entry on the default route.
-func appendLocalDNSNeverProxy(ctx context.Context, neverProxy, subnets []netip.Prefix, dnsServers []netip.Addr) (allNeverProxy, dnsRoutes []netip.Prefix) {
+// appendLocalDNSNeverProxy returns host routes preserving physical access to
+// local endpoints covered by a proxied subnet.
+func appendLocalDNSNeverProxy(ctx context.Context, neverProxy, subnets []netip.Prefix, localEndpoints []netip.Addr) (allNeverProxy, dnsRoutes []netip.Prefix) {
 	nvp := slices.Clone(neverProxy)
-	for _, dnsIP := range slice.AppendUnique([]netip.Addr{}, dnsServers...) {
-		if !dnsIP.IsValid() || dnsIP.IsLoopback() || dnsIP.IsUnspecified() {
+	for _, localIP := range slice.AppendUnique([]netip.Addr{}, localEndpoints...) {
+		if !localIP.IsValid() || localIP.IsLoopback() || localIP.IsUnspecified() {
 			continue
 		}
 		for _, sn := range subnets {
-			if !sn.Contains(dnsIP) {
+			if !sn.Contains(localIP) {
 				continue
 			}
-			hostRoute := netip.PrefixFrom(dnsIP, dnsIP.BitLen())
+			hostRoute := netip.PrefixFrom(localIP, localIP.BitLen())
 			dnsRoutes = append(dnsRoutes, hostRoute)
 			if !slices.Contains(nvp, hostRoute) {
-				clog.Infof(ctx, "Adding local DNS server %s to never-proxy because it is covered by routed subnet %s", dnsIP, sn)
+				clog.Infof(ctx, "Adding local DNS or Kubernetes API address %s to never-proxy because it is covered by routed subnet %s", localIP, sn)
 				nvp = append(nvp, hostRoute)
 			}
 			break
@@ -1816,6 +1819,9 @@ func (s *session) SetExcludes(excludes []string) {
 }
 
 func (s *session) SetMappings(mappings []*rpc.DNSMapping) {
+	if len(s.localClusterDNSMappings) > 0 {
+		mappings = mergeLocalClusterDNSMappings(client.MappingsFromRPC(mappings), s.localClusterDNSMappings).ToRPC()
+	}
 	s.dnsServer.SetMappings(mappings)
 }
 

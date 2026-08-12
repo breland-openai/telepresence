@@ -92,18 +92,19 @@ does not support this for anonymous users, hence the default tags.
 
 The `client.dns` configuration offers options for configuring the DNS resolution behavior in a client application or system. Here is a summary of the available fields:
 
-The fields for `client.dns` are: `localAddresses`, `excludeSuffixes`, `includeSuffixes`, and `lookupTimeout`.
+The fields for `client.dns` are: `localAddresses`, `excludeSuffixes`, `includeSuffixes`, `lookupTimeout`, and `preserveLocalClusterDNS`.
 
-| Field              | Description                                                                                                                                                         | Type                                        | Default                                            |
-|--------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------|----------------------------------------------------|
-| `localAddresses`   | Addresses of local DNS servers. This entry is only used on Linux systems that are not configured to use systemd-resolved.                                          | [sequence][yaml-seq] of address:port values | first `nameserver` mentioned in `/etc/resolv.conf` |
-| `excludeSuffixes`  | Suffixes for which the DNS resolver will always fail (or fallback in case of the overriding resolver). Can be globally configured in the Helm chart.                | [sequence][yaml-seq] of [strings][yaml-str] | `[".arpa", ".com", ".io", ".net", ".org", ".ru"]`  |
-| `includeSuffixes`  | Suffixes for which the DNS resolver will always attempt to do a lookup.  Includes have higher priority than excludes. Can be globally configured in the Helm chart. | [sequence][yaml-seq] of [strings][yaml-str] | `[]`                                               |
-| `excludes`         | Names to be excluded by the DNS resolver                                                                                                                            | `[]`                                        |                                                    |
-| `mappings`         | Names to be resolved to other names (CNAME records) or to explicit IP addresses                                                                                     | `[]`                                        |                                                    |
-| `lookupTimeout`    | Maximum time to wait for a cluster side host lookup.                                                                                                                | [duration][go-duration] [string][yaml-str]  | 4 seconds                                          |
-| `recursionCheck`   | Enable DNS lookup recursion detection and avoidance.                                                                                                                | boolean                                     | false                                              |
-| `useComplexLookup` | Disable use of simplified but efficient A and AAAA lookups.                                                                                                         | [boolean][yaml-bool]                        | `false`                                            |
+| Field                     | Description                                                                                                                                                         | Type                                        | Default                                            |
+|---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------|----------------------------------------------------|
+| `localAddresses`          | Addresses of local DNS servers. This entry is only used on Linux systems that are not configured to use systemd-resolved.                                          | [sequence][yaml-seq] of address:port values | first `nameserver` mentioned in `/etc/resolv.conf` |
+| `excludeSuffixes`         | Suffixes for which the DNS resolver will always fail (or fallback in case of the overriding resolver). Can be globally configured in the Helm chart.                | [sequence][yaml-seq] of [strings][yaml-str] | `[".arpa", ".com", ".io", ".net", ".org", ".ru"]`  |
+| `includeSuffixes`         | Suffixes for which the DNS resolver will always attempt to do a lookup.  Includes have higher priority than excludes. Can be globally configured in the Helm chart. | [sequence][yaml-seq] of [strings][yaml-str] | `[]`                                               |
+| `excludes`                | Names to be excluded by the DNS resolver                                                                                                                            | `[]`                                        |                                                    |
+| `mappings`                | Names to be resolved to other names (CNAME records) or to explicit IP addresses                                                                                     | `[]`                                        |                                                    |
+| `lookupTimeout`           | Maximum time to wait for a cluster side host lookup.                                                                                                                | [duration][go-duration] [string][yaml-str]  | 4 seconds                                          |
+| `recursionCheck`          | Enable DNS lookup recursion detection and avoidance.                                                                                                                | boolean                                     | false                                              |
+| `useComplexLookup`        | Disable use of simplified but efficient A and AAAA lookups.                                                                                                         | [boolean][yaml-bool]                        | `false`                                            |
+| `preserveLocalClusterDNS` | On Linux, preserve the host cluster's Kubernetes API DNS names when connecting to a different cluster.                                                              | [boolean][yaml-bool]                        | `true`                                             |
 
 Here is an example values.yaml:
 ```yaml
@@ -139,6 +140,33 @@ dns:
   excludes:
     - redis
 ```
+
+#### Preserve local Kubernetes API DNS
+
+When Telepresence runs on a Linux host inside a Kubernetes cluster and connects to
+another cluster, both clusters can expose their APIs under the same service names.
+By default, Telepresence queries the host's physical DNS resolvers directly before
+installing its own DNS routing. If those resolvers provide an address for
+`kubernetes.default.svc.cluster.local`, Telepresence preserves that address for
+the exact names `kubernetes.default.svc.cluster.local` and
+`kubernetes.default.svc`. Other services continue to resolve in the connected
+cluster. Automatic discovery currently recognizes the conventional
+`cluster.local` Kubernetes DNS domain.
+
+Explicit entries in `dns.mappings` take precedence over preserved names. When
+physical DNS cannot resolve the host cluster's Kubernetes API, Telepresence does
+not add a mapping and ordinary connected-cluster resolution remains unchanged.
+Disable preservation explicitly when the connected cluster's API should take
+precedence:
+
+```yaml
+dns:
+  preserveLocalClusterDNS: false
+```
+
+Adding these names to `dns.excludes` is not equivalent. When systemd-resolved
+routes `~svc` or `~cluster.local` to Telepresence, an excluded name can return
+NXDOMAIN instead of falling back to the host's physical DNS resolver.
 
 #### recursionCheck
 
