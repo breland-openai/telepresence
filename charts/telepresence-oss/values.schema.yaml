@@ -75,6 +75,10 @@ properties:
       port:
         description: Port number of the first port that the agent will use
         type: integer
+      preStopDrainTimeout:
+        description: Maximum time an injected traffic-agent continues serving during pod termination. Set to 0s to disable.
+        type: string
+        pattern: "^(\\d+(\\.\\d+)?(h|m|s|ms|us|µs))+$"
       resources:
         description: Resource requirements for the agent
         $ref: "#/$defs/resourceRequirements"

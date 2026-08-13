@@ -3,6 +3,7 @@ package managerutil
 import (
 	"context"
 	"encoding/json/v2"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"reflect"
@@ -81,6 +82,7 @@ type Env struct {
 	AgentInitContainerEnabled  bool `default:"true"`
 	AgentMaxIdleTime           time.Duration
 	AgentWatchRetryInterval    time.Duration `default:"10s"`
+	AgentPreStopDrainTimeout   time.Duration `default:"2m"`
 
 	// GoCoverDir is the manager's own GOCOVERDIR, propagated into generated agent containers.
 	GoCoverDir string `env:"GOCOVERDIR"`
@@ -301,6 +303,9 @@ func LoadEnv(ctx context.Context, envMap map[string]string) (context.Context, er
 	})
 	if err != nil {
 		return ctx, err
+	}
+	if envStruct.AgentPreStopDrainTimeout < 0 {
+		return ctx, fmt.Errorf("AGENT_PRE_STOP_DRAIN_TIMEOUT must not be negative: %s", envStruct.AgentPreStopDrainTimeout)
 	}
 	return WithEnv(ctx, envStruct), nil
 }

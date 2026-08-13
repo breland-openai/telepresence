@@ -260,6 +260,8 @@ spec:
         node-agent session-lease lifecycle.
         */}}
           {{- with .agent }}
+          - name: AGENT_PRE_STOP_DRAIN_TIMEOUT
+            value: {{ .preStopDrainTimeout | quote }}
           {{- if .resources }}
           - name: AGENT_RESOURCES
             value: '{{ toJson .resources }}'

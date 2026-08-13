@@ -65,6 +65,7 @@ func TestEnvconfig(t *testing.T) {
 		AgentInitContainerEnabled:    true,
 		InterceptAllowGlobal:         true,
 		AgentWatchRetryInterval:      10 * time.Second,
+		AgentPreStopDrainTimeout:     2 * time.Minute,
 		AgentConsumptionMetrics:      true,
 		UsageReportingEnabled:        true,
 		MutatorWebhookPort:           8443,
@@ -161,6 +162,22 @@ func TestEnvconfig(t *testing.T) {
 				}
 			},
 		},
+		"agent-pre-stop-drain-timeout": {
+			Input: map[string]string{
+				"AGENT_PRE_STOP_DRAIN_TIMEOUT": "45s",
+			},
+			Output: func(e *managerutil.Env) {
+				e.AgentPreStopDrainTimeout = 45 * time.Second
+			},
+		},
+		"agent-pre-stop-drain-disabled": {
+			Input: map[string]string{
+				"AGENT_PRE_STOP_DRAIN_TIMEOUT": "0s",
+			},
+			Output: func(e *managerutil.Env) {
+				e.AgentPreStopDrainTimeout = 0
+			},
+		},
 		"allow-global-intercepts-true": {
 			Input: map[string]string{
 				"INTERCEPT_ALLOW_GLOBAL": "true",
@@ -218,6 +235,22 @@ func TestEnvconfig(t *testing.T) {
 			assert.Equal(t, "", actual.QualifiedAgentImage())
 		})
 	}
+}
+
+func TestEnvconfigPreStopDrainTimeout(t *testing.T) {
+	env := map[string]string{
+		"REGISTRY":    "ghcr.io/telepresenceio",
+		"LOG_LEVEL":   "info",
+		"SERVER_PORT": "8081",
+	}
+
+	ctx, err := managerutil.LoadEnv(context.Background(), env)
+	require.NoError(t, err)
+	assert.Equal(t, 2*time.Minute, managerutil.GetEnv(ctx).AgentPreStopDrainTimeout)
+
+	env["AGENT_PRE_STOP_DRAIN_TIMEOUT"] = "-1s"
+	_, err = managerutil.LoadEnv(context.Background(), env)
+	require.ErrorContains(t, err, "AGENT_PRE_STOP_DRAIN_TIMEOUT must not be negative")
 }
 
 func TestEnvconfigAgentArrivalTimeoutDefault(t *testing.T) {

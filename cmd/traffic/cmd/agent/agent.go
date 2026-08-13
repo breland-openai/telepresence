@@ -236,20 +236,29 @@ func MakeInterceptStates(cn *agentconfig.Container) map[types.PortAndProto]agent
 func TalkToManagerLoop(ctx context.Context, s State, info *rpc.AgentInfo) {
 	ac := s.AgentConfig()
 	gRPCAddress := fmt.Sprintf("%s:%v", ac.ManagerHost, ac.ManagerPort)
+	talkToManagerLoop(ctx, 5*time.Second, func(ctx context.Context) error {
+		return TalkToManager(ctx, gRPCAddress, info, s)
+	})
+}
 
-	// Don't reconnect more than every 5s
-	ticker := time.NewTicker(5 * time.Second)
+func talkToManagerLoop(ctx context.Context, retryInterval time.Duration, talk func(context.Context) error) {
+	ticker := time.NewTicker(retryInterval)
 	defer ticker.Stop()
 
 	for {
-		err := TalkToManager(ctx, gRPCAddress, info, s)
+		err := talk(ctx)
 		if err != nil {
 			switch status.Code(err) {
-			case codes.AlreadyExists, codes.Aborted, codes.Canceled:
-				// This won't change, so abort here.
+			case codes.AlreadyExists, codes.Canceled:
 				return
+			case codes.Aborted:
+				if !isInactivePodRejection(err) {
+					return
+				}
+				clog.Warnf(ctx, "traffic-manager temporarily rejected the inactive pod; retrying: %v", err)
+			default:
+				clog.Errorf(ctx, "error talking to traffic-manager: %v", err)
 			}
-			clog.Errorf(ctx, "error talking to traffic-manager: %v", err)
 		}
 
 		select {
@@ -258,6 +267,22 @@ func TalkToManagerLoop(ctx context.Context, s State, info *rpc.AgentInfo) {
 		case <-ticker.C:
 		}
 	}
+}
+
+func isInactivePodRejection(err error) bool {
+	if status.Code(err) != codes.Aborted {
+		return false
+	}
+
+	var grpcStatus interface {
+		GRPCStatus() *status.Status
+	}
+	if !errors.As(err, &grpcStatus) {
+		return false
+	}
+
+	s := grpcStatus.GRPCStatus()
+	return s != nil && s.Message() == "inactivated pod"
 }
 
 func advertisedInterceptTargets(ac *agentconfig.Sidecar) []*rpc.AgentInfo_InterceptTarget {
