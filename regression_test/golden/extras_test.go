@@ -1,8 +1,11 @@
 package golden
 
 import (
+	"slices"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 )
 
 // TestExtraValuesReachManagerAndForwarder pins the contract that the
@@ -29,5 +32,48 @@ func TestExtraValuesReachManagerAndForwarder(t *testing.T) {
 				t.Errorf("%s: %q not rendered", tpl, want)
 			}
 		}
+	}
+}
+
+func TestLocalClusterDNSPreservationReachesManager(t *testing.T) {
+	wantNames := []string{
+		"artifact-gateway.platform.svc.cluster.local",
+		"image-cache.platform.svc.cluster.local",
+	}
+	out := renderChart(t, map[string]any{
+		"client": map[string]any{
+			"dns": map[string]any{
+				"preserveLocalClusterDNS":      true,
+				"preserveLocalClusterDNSNames": wantNames,
+			},
+		},
+	})
+
+	const configMapTemplate = "telepresence-oss/templates/trafficManager-configmap.yaml"
+	var configMap struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := yaml.Unmarshal([]byte(out[configMapTemplate]), &configMap); err != nil {
+		t.Fatalf("unmarshal manager ConfigMap: %v", err)
+	}
+	clientYAML, ok := configMap.Data["client.yaml"]
+	if !ok {
+		t.Fatal("manager ConfigMap does not contain client.yaml")
+	}
+
+	var clientConfig struct {
+		DNS struct {
+			PreserveLocalClusterDNS      bool     `json:"preserveLocalClusterDNS"`
+			PreserveLocalClusterDNSNames []string `json:"preserveLocalClusterDNSNames"`
+		} `json:"dns"`
+	}
+	if err := yaml.Unmarshal([]byte(clientYAML), &clientConfig); err != nil {
+		t.Fatalf("unmarshal manager client configuration: %v", err)
+	}
+	if !clientConfig.DNS.PreserveLocalClusterDNS {
+		t.Error("manager client configuration does not enable local cluster DNS preservation")
+	}
+	if !slices.Equal(clientConfig.DNS.PreserveLocalClusterDNSNames, wantNames) {
+		t.Errorf("manager client preserved names = %v, want %v", clientConfig.DNS.PreserveLocalClusterDNSNames, wantNames)
 	}
 }

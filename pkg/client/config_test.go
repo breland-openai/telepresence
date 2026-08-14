@@ -170,6 +170,176 @@ dns:
 	})
 }
 
+func TestDNSPreserveLocalClusterDNSNames(t *testing.T) {
+	const artifactGateway = "artifact-gateway.platform.svc.cluster.local"
+	const packageMirror = "package-mirror.platform.svc.cluster.local"
+
+	t.Run("no additional names by default", func(t *testing.T) {
+		cfg := GetDefaultConfig()
+		assert.Nil(t, cfg.DNS().PreserveLocalClusterDNSNames)
+		assert.True(t, cfg.DNS().PreserveLocalClusterDNS)
+		assert.True(t, cfg.DNS().IsZero())
+	})
+
+	t.Run("names alone survive YAML round trip", func(t *testing.T) {
+		cfg, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  preserveLocalClusterDNSNames:
+    - artifact-gateway.platform.svc.cluster.local
+    - package-mirror.platform.svc.cluster.local
+`))
+		require.NoError(t, err)
+		assert.Equal(t, []string{artifactGateway, packageMirror}, cfg.DNS().PreserveLocalClusterDNSNames)
+		assert.True(t, cfg.DNS().PreserveLocalClusterDNS)
+		assert.False(t, cfg.DNS().Equal(GetDefaultConfig().DNS()))
+		assert.False(t, cfg.DNS().IsZero())
+
+		data, err := cfg.MarshalYAML()
+		require.NoError(t, err)
+		assert.Contains(t, string(data), "preserveLocalClusterDNSNames:")
+		assert.NotContains(t, string(data), "preserveLocalClusterDNS:")
+
+		roundTrip, err := ParseConfigYAML(testutil.NewContext(t, true), "", data)
+		require.NoError(t, err)
+		assert.Equal(t, []string{artifactGateway, packageMirror}, roundTrip.DNS().PreserveLocalClusterDNSNames)
+		assert.True(t, roundTrip.DNS().PreserveLocalClusterDNS)
+	})
+
+	t.Run("names alone survive JSON round trip", func(t *testing.T) {
+		input := `{"dns":{"preserveLocalClusterDNSNames":["artifact-gateway.platform.svc.cluster.local"]}}`
+		cfg, err := UnmarshalJSONConfig([]byte(input), true)
+		require.NoError(t, err)
+		assert.Equal(t, []string{artifactGateway}, cfg.DNS().PreserveLocalClusterDNSNames)
+		assert.False(t, cfg.DNS().IsZero())
+
+		data, err := json2.Marshal(cfg)
+		require.NoError(t, err)
+		assert.JSONEq(t, input, string(data))
+
+		roundTrip, err := UnmarshalJSONConfig(data, true)
+		require.NoError(t, err)
+		assert.Equal(t, []string{artifactGateway}, roundTrip.DNS().PreserveLocalClusterDNSNames)
+	})
+
+	t.Run("manager names survive unrelated configuration merge", func(t *testing.T) {
+		manager, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  preserveLocalClusterDNSNames:
+    - artifact-gateway.platform.svc.cluster.local
+  useComplexLookup: true
+`))
+		require.NoError(t, err)
+
+		managerData, err := manager.MarshalYAML()
+		require.NoError(t, err)
+		manager, err = ParseConfigYAML(testutil.NewContext(t, true), "", managerData)
+		require.NoError(t, err)
+
+		local, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  recursionCheck: true
+`))
+		require.NoError(t, err)
+
+		merged := manager.Merge(local)
+		assert.Equal(t, []string{artifactGateway}, merged.DNS().PreserveLocalClusterDNSNames)
+		assert.True(t, merged.DNS().UseComplexLookup)
+		assert.True(t, merged.DNS().RecursionCheck)
+	})
+
+	t.Run("local names replace manager names", func(t *testing.T) {
+		manager, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  preserveLocalClusterDNSNames:
+    - artifact-gateway.platform.svc.cluster.local
+`))
+		require.NoError(t, err)
+
+		local, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  preserveLocalClusterDNSNames:
+    - package-mirror.platform.svc.cluster.local
+`))
+		require.NoError(t, err)
+
+		merged := manager.Merge(local)
+		assert.Equal(t, []string{packageMirror}, merged.DNS().PreserveLocalClusterDNSNames)
+		assert.Equal(t, []string{artifactGateway}, manager.DNS().PreserveLocalClusterDNSNames)
+	})
+
+	t.Run("empty local list clears manager names without disabling API preservation", func(t *testing.T) {
+		tmp := t.TempDir()
+		user := filepath.Join(tmp, "user")
+		require.NoError(t, os.MkdirAll(user, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(user, ConfigFile), []byte(`
+dns:
+  preserveLocalClusterDNSNames: []
+`), 0o600))
+
+		ctx := testutil.NewContext(t, false)
+		ctx = filelocation.WithAppUserConfigDir(ctx, user)
+		ctx = filelocation.WithAppSystemConfigDir(ctx, filepath.Join(tmp, "system"))
+		env, err := LoadEnv()
+		require.NoError(t, err)
+		ctx = WithEnv(ctx, &env)
+
+		manager, err := ParseConfigYAML(ctx, "", []byte(`
+dns:
+  preserveLocalClusterDNSNames:
+    - artifact-gateway.platform.svc.cluster.local
+`))
+		require.NoError(t, err)
+
+		local, err := LoadConfig(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, local.DNS().PreserveLocalClusterDNSNames)
+		require.Empty(t, local.DNS().PreserveLocalClusterDNSNames)
+
+		merged := manager.Merge(local)
+		assert.NotNil(t, merged.DNS().PreserveLocalClusterDNSNames)
+		assert.Empty(t, merged.DNS().PreserveLocalClusterDNSNames)
+		assert.True(t, merged.DNS().PreserveLocalClusterDNS)
+
+		data, err := json2.Marshal(merged)
+		require.NoError(t, err)
+		roundTrip, err := UnmarshalJSONConfig(data, true)
+		require.NoError(t, err)
+		assert.Empty(t, roundTrip.DNS().PreserveLocalClusterDNSNames)
+		assert.True(t, roundTrip.DNS().PreserveLocalClusterDNS)
+	})
+
+	t.Run("explicit false and names both survive round trip", func(t *testing.T) {
+		cfg, err := ParseConfigYAML(testutil.NewContext(t, true), "", []byte(`
+dns:
+  preserveLocalClusterDNS: false
+  preserveLocalClusterDNSNames:
+    - artifact-gateway.platform.svc.cluster.local
+`))
+		require.NoError(t, err)
+		assert.False(t, cfg.DNS().PreserveLocalClusterDNS)
+		assert.Equal(t, []string{artifactGateway}, cfg.DNS().PreserveLocalClusterDNSNames)
+
+		data, err := cfg.MarshalYAML()
+		require.NoError(t, err)
+		roundTrip, err := ParseConfigYAML(testutil.NewContext(t, true), "", data)
+		require.NoError(t, err)
+		assert.False(t, roundTrip.DNS().PreserveLocalClusterDNS)
+		assert.Equal(t, []string{artifactGateway}, roundTrip.DNS().PreserveLocalClusterDNSNames)
+	})
+
+	t.Run("status uses snake case", func(t *testing.T) {
+		dns := GetDefaultConfig().DNS()
+		dns.PreserveLocalClusterDNSNames = []string{artifactGateway}
+
+		snake := dns.ToSnake()
+		assert.Equal(t, []string{artifactGateway}, snake.PreserveLocalClusterDNSNames)
+
+		data, err := json2.Marshal(snake)
+		require.NoError(t, err)
+		assert.Contains(t, string(data), `"preserve_local_cluster_dns_names":["artifact-gateway.platform.svc.cluster.local"]`)
+	})
+}
+
 func TestDNSUseComplexLookupRoundTrip(t *testing.T) {
 	t.Run("disabled by default", func(t *testing.T) {
 		cfg := GetDefaultConfig()

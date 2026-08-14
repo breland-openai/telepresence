@@ -1362,7 +1362,7 @@ func computeNeverProxyOverrides(ctx context.Context, subnets, nvp []netip.Prefix
 }
 
 // neverProxyWithLocalDNS preserves physical routes to local DNS resolvers and
-// the owning Kubernetes API when their addresses overlap proxied subnets.
+// preserved cluster endpoints when their addresses overlap proxied subnets.
 func (s *session) neverProxyWithLocalDNS(subnets []netip.Prefix) (neverProxy, dnsRoutes []netip.Prefix) {
 	cfg := client.GetConfig(s).DNS()
 
@@ -1396,7 +1396,7 @@ func appendLocalDNSNeverProxy(ctx context.Context, neverProxy, subnets []netip.P
 			hostRoute := netip.PrefixFrom(localIP, localIP.BitLen())
 			dnsRoutes = append(dnsRoutes, hostRoute)
 			if !slices.Contains(nvp, hostRoute) {
-				clog.Infof(ctx, "Adding local DNS or Kubernetes API address %s to never-proxy because it is covered by routed subnet %s", localIP, sn)
+				clog.Infof(ctx, "Adding local DNS or preserved cluster address %s to never-proxy because it is covered by routed subnet %s", localIP, sn)
 				nvp = append(nvp, hostRoute)
 			}
 			break

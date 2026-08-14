@@ -5,9 +5,12 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	dns2 "github.com/miekg/dns"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
@@ -16,23 +19,38 @@ import (
 )
 
 const (
-	localClusterAPIName           = "kubernetes.default.svc"
-	localClusterAPIFQDN           = localClusterAPIName + ".cluster.local."
-	localClusterDNSDiscoveryLimit = 750 * time.Millisecond
-	localClusterDNSQueryLimit     = 250 * time.Millisecond
+	localClusterAPIName                 = "kubernetes.default.svc"
+	localClusterAPIFQDN                 = localClusterAPIName + ".cluster.local."
+	localClusterDNSDiscoveryLimit       = 750 * time.Millisecond
+	localClusterDNSMaximumDiscoveryTime = 3 * time.Second
+	localClusterDNSQueryLimit           = 250 * time.Millisecond
+	localClusterDNSMaximumNames         = 32
+	localClusterDNSParallelNames        = 4
 )
 
-type localClusterDNSLookup func(context.Context, netip.AddrPort, uint16) (netip.Addr, bool)
+type localClusterDNSLookup func(context.Context, netip.AddrPort, string, uint16) (netip.Addr, bool)
+
+type localClusterDNSName struct {
+	query    string
+	mappings []string
+}
 
 func discoverLocalClusterDNSMappings(ctx context.Context, config *client.DNS, virtualSubnet netip.Prefix) client.DNSMappings {
 	if !config.PreserveLocalClusterDNS {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, localClusterDNSDiscoveryLimit)
+	ctx, cancel := context.WithTimeout(ctx, localClusterDNSDiscoveryTimeout(config))
 	defer cancel()
 
 	return localClusterDNSMappings(ctx, config, virtualSubnet, dns.SystemResolvers(ctx), queryLocalClusterDNS)
+}
+
+func localClusterDNSDiscoveryTimeout(config *client.DNS) time.Duration {
+	nameCount := min(len(config.PreserveLocalClusterDNSNames), localClusterDNSMaximumNames) + 1
+	batches := (nameCount + localClusterDNSParallelNames - 1) / localClusterDNSParallelNames
+	timeout := localClusterDNSDiscoveryLimit + time.Duration(batches-1)*localClusterDNSQueryLimit
+	return min(timeout, localClusterDNSMaximumDiscoveryTime)
 }
 
 func localClusterDNSMappings(
@@ -46,16 +64,73 @@ func localClusterDNSMappings(
 		return nil
 	}
 
-	for _, resolver := range physicalLocalClusterDNSResolvers(config, virtualSubnet, resolvers) {
-		if addr, ok := lookupLocalClusterDNS(ctx, resolver, lookup); ok {
-			clog.Infof(ctx, "Preserving local Kubernetes API DNS at %s using resolver %s", addr, resolver)
-			return client.DNSMappings{
-				{Name: localClusterAPIName, AliasFor: addr.String()},
-				{Name: strings.TrimSuffix(localClusterAPIFQDN, "."), AliasFor: addr.String()},
-			}
-		}
+	physicalResolvers := physicalLocalClusterDNSResolvers(config, virtualSubnet, resolvers)
+	if len(physicalResolvers) == 0 {
+		return nil
 	}
-	return nil
+
+	names := preservedLocalClusterDNSNames(ctx, config.PreserveLocalClusterDNSNames)
+	results := make([]client.DNSMappings, len(names))
+	var next atomic.Int32
+	var workers sync.WaitGroup
+	for range min(len(names), localClusterDNSParallelNames) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				index := int(next.Add(1) - 1)
+				if index >= len(names) || ctx.Err() != nil {
+					return
+				}
+				name := names[index]
+				for _, resolver := range physicalResolvers {
+					if addr, ok := lookupLocalClusterDNS(ctx, resolver, name.query, lookup); ok {
+						clog.Infof(ctx, "Preserving local cluster DNS for %s at %s using resolver %s", name.query, addr, resolver)
+						for _, mapping := range name.mappings {
+							results[index] = append(results[index], &client.DNSMapping{Name: mapping, AliasFor: addr.String()})
+						}
+						break
+					}
+				}
+			}
+		}()
+	}
+	workers.Wait()
+
+	var mappings client.DNSMappings
+	for _, result := range results {
+		mappings = append(mappings, result...)
+	}
+	return mappings
+}
+
+func preservedLocalClusterDNSNames(ctx context.Context, configured []string) []localClusterDNSName {
+	names := []localClusterDNSName{{
+		query:    localClusterAPIFQDN,
+		mappings: []string{localClusterAPIName, strings.TrimSuffix(localClusterAPIFQDN, ".")},
+	}}
+	seen := map[string]struct{}{
+		localClusterAPIName:                          {},
+		strings.TrimSuffix(localClusterAPIFQDN, "."): {},
+	}
+	for _, configuredName := range configured {
+		name := canonicalLocalClusterDNSName(configuredName)
+		_, addressError := netip.ParseAddr(name)
+		if addressError == nil || !strings.Contains(name, ".") || len(validation.IsDNS1123Subdomain(name)) != 0 {
+			clog.Warnf(ctx, "Ignoring invalid local cluster DNS preservation name %q", configuredName)
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		if len(names) > localClusterDNSMaximumNames {
+			clog.Warnf(ctx, "Ignoring local cluster DNS preservation names beyond the limit of %d", localClusterDNSMaximumNames)
+			break
+		}
+		seen[name] = struct{}{}
+		names = append(names, localClusterDNSName{query: dns2.Fqdn(name), mappings: []string{name}})
+	}
+	return names
 }
 
 func physicalLocalClusterDNSResolvers(
@@ -89,7 +164,7 @@ func physicalLocalClusterDNSResolvers(
 	return physical
 }
 
-func lookupLocalClusterDNS(ctx context.Context, resolver netip.AddrPort, lookup localClusterDNSLookup) (netip.Addr, bool) {
+func lookupLocalClusterDNS(ctx context.Context, resolver netip.AddrPort, name string, lookup localClusterDNSLookup) (netip.Addr, bool) {
 	ctx, cancel := context.WithTimeout(ctx, localClusterDNSQueryLimit)
 	defer cancel()
 
@@ -101,7 +176,7 @@ func lookupLocalClusterDNS(ctx context.Context, resolver netip.AddrPort, lookup 
 	results := make(chan result, 2)
 	for _, qType := range []uint16{dns2.TypeA, dns2.TypeAAAA} {
 		go func() {
-			addr, ok := lookup(ctx, resolver, qType)
+			addr, ok := lookup(ctx, resolver, name, qType)
 			results <- result{addr: addr, qType: qType, ok: ok}
 		}()
 	}
@@ -127,14 +202,14 @@ func lookupLocalClusterDNS(ctx context.Context, resolver netip.AddrPort, lookup 
 	return ipv6, ipv6.IsValid()
 }
 
-func queryLocalClusterDNS(ctx context.Context, resolver netip.AddrPort, qType uint16) (netip.Addr, bool) {
+func queryLocalClusterDNS(ctx context.Context, resolver netip.AddrPort, name string, qType uint16) (netip.Addr, bool) {
 	request := new(dns2.Msg)
-	request.SetQuestion(localClusterAPIFQDN, qType)
+	request.SetQuestion(name, qType)
 	request.RecursionDesired = true
 
 	response, _, err := (&dns2.Client{Net: "udp", Timeout: localClusterDNSQueryLimit}).ExchangeContext(ctx, request, resolver.String())
 	if err != nil {
-		clog.Debugf(ctx, "Unable to resolve local Kubernetes API through %s: %v", resolver, err)
+		clog.Debugf(ctx, "Unable to resolve local cluster DNS name %s through %s: %v", name, resolver, err)
 		return netip.Addr{}, false
 	}
 	if response == nil || response.Rcode != dns2.RcodeSuccess {
@@ -142,7 +217,7 @@ func queryLocalClusterDNS(ctx context.Context, resolver netip.AddrPort, qType ui
 	}
 
 	for _, answer := range response.Answer {
-		if !strings.EqualFold(answer.Header().Name, localClusterAPIFQDN) {
+		if !strings.EqualFold(answer.Header().Name, name) {
 			continue
 		}
 		var addr netip.Addr

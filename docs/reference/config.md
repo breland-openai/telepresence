@@ -92,7 +92,9 @@ does not support this for anonymous users, hence the default tags.
 
 The `client.dns` configuration offers options for configuring the DNS resolution behavior in a client application or system. Here is a summary of the available fields:
 
-The fields for `client.dns` are: `localAddresses`, `excludeSuffixes`, `includeSuffixes`, `lookupTimeout`, and `preserveLocalClusterDNS`.
+The fields for `client.dns` include `localAddresses`, `excludeSuffixes`,
+`includeSuffixes`, `lookupTimeout`, `preserveLocalClusterDNS`, and
+`preserveLocalClusterDNSNames`.
 
 | Field                     | Description                                                                                                                                                         | Type                                        | Default                                            |
 |---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------|----------------------------------------------------|
@@ -104,7 +106,8 @@ The fields for `client.dns` are: `localAddresses`, `excludeSuffixes`, `includeSu
 | `lookupTimeout`           | Maximum time to wait for a cluster side host lookup.                                                                                                                | [duration][go-duration] [string][yaml-str]  | 4 seconds                                          |
 | `recursionCheck`          | Enable DNS lookup recursion detection and avoidance.                                                                                                                | boolean                                     | false                                              |
 | `useComplexLookup`        | Disable use of simplified but efficient A and AAAA lookups.                                                                                                         | [boolean][yaml-bool]                        | `false`                                            |
-| `preserveLocalClusterDNS` | On Linux, preserve the host cluster's Kubernetes API DNS names when connecting to a different cluster.                                                              | [boolean][yaml-bool]                        | `true`                                             |
+| `preserveLocalClusterDNS` | On Linux, preserve the host cluster's Kubernetes API DNS names and additional configured names when connecting to a different cluster.                            | [boolean][yaml-bool]                        | `true`                                             |
+| `preserveLocalClusterDNSNames` | Additional exact host-cluster DNS names to preserve through the host's physical network.                                                                     | [sequence][yaml-seq] of [strings][yaml-str] | `[]`                                               |
 
 Here is an example values.yaml:
 ```yaml
@@ -141,7 +144,7 @@ dns:
     - redis
 ```
 
-#### Preserve local Kubernetes API DNS
+#### Preserve local cluster DNS
 
 When Telepresence runs on a Linux host inside a Kubernetes cluster and connects to
 another cluster, both clusters can expose their APIs under the same service names.
@@ -149,15 +152,39 @@ By default, Telepresence queries the host's physical DNS resolvers directly befo
 installing its own DNS routing. If those resolvers provide an address for
 `kubernetes.default.svc.cluster.local`, Telepresence preserves that address for
 the exact names `kubernetes.default.svc.cluster.local` and
-`kubernetes.default.svc`. Other services continue to resolve in the connected
-cluster. Automatic discovery currently recognizes the conventional
+`kubernetes.default.svc`. Automatic API discovery recognizes the conventional
 `cluster.local` Kubernetes DNS domain.
 
-Explicit entries in `dns.mappings` take precedence over preserved names. When
-physical DNS cannot resolve the host cluster's Kubernetes API, Telepresence does
-not add a mapping and ordinary connected-cluster resolution remains unchanged.
-Disable preservation explicitly when the connected cluster's API should take
-precedence:
+Set `preserveLocalClusterDNSNames` to preserve other exact names that belong to
+the host cluster. For example, the traffic-manager Helm configuration can provide
+the same policy to every connected client:
+
+```yaml
+client:
+  dns:
+    preserveLocalClusterDNSNames:
+      - artifact-gateway.platform.svc.cluster.local
+```
+
+Each client discovers its own physical address independently, before Telepresence
+installs DNS routing. Each configured hostname is queried separately, including
+when the Kubernetes API name is unavailable. Only successfully resolved exact
+names are preserved; other services continue resolving in the connected cluster.
+When a discovered address overlaps a proxied subnet, Telepresence adds an exact
+IPv4 `/32` or IPv6 `/128` host route through the address's physical interface.
+
+The list accepts up to 32 fully qualified DNS names with at least two labels. A
+trailing root dot is optional. Names are case-insensitive and duplicate entries
+are ignored. Wildcards, suffix rules, and single-label names are not supported.
+An individual client's local list replaces a manager-provided list. An explicitly
+empty local list disables manager-provided additional names while preserving the
+automatic Kubernetes API mappings. Discovery runs when a new connection session
+starts, so reconnect to apply updated names.
+
+Explicit entries in `dns.mappings` take precedence over preserved names. Names
+that physical DNS cannot resolve retain ordinary connected-cluster resolution.
+Disable preservation explicitly when connected-cluster names should take
+precedence; this disables both automatic API preservation and configured names:
 
 ```yaml
 dns:
