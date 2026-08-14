@@ -280,6 +280,19 @@ properties:
             type: array
             items:
               type: string
+          preserveLocalClusterDNS:
+            description: >-
+              Preserve the host cluster's Kubernetes API names and configured additional hostnames on Linux.
+              Defaults to true
+            type: boolean
+          preserveLocalClusterDNSNames:
+            description: >-
+              Additional exact hostnames to resolve through the host cluster's physical DNS before connecting.
+              Requires preserveLocalClusterDNS to be enabled
+            type: array
+            maxItems: 32
+            items:
+              type: string
       intercept:
         type: object
         properties:

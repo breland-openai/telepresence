@@ -161,16 +161,26 @@ func TestMappingsMapCanonicalizesFullyQualifiedNames(t *testing.T) {
 
 func TestPreservedLocalClusterDNS(t *testing.T) {
 	const (
-		localAPIIP  = "10.0.0.1"
-		remoteAPIIP = "246.246.0.3"
-		remoteWebIP = "246.246.0.13"
+		localAPIIP         = "10.0.0.1"
+		localServiceName   = "artifact-gateway.platform.svc.cluster.local."
+		localServiceIP     = "192.0.2.21"
+		remoteAPIIP        = "246.246.0.3"
+		remoteServiceIP    = "198.51.100.21"
+		remotePlatformName = "frontend.platform.svc.cluster.local."
+		remotePlatformIP   = "198.51.100.42"
+		remoteWebIP        = "246.246.0.13"
 	)
 
 	var remoteQueries []string
 	remoteLookup := func(_ context.Context, question *dns.Question) (dnsproxy.RRs, int, error) {
 		remoteQueries = append(remoteQueries, question.Name)
 		answerIP := remoteAPIIP
-		if question.Name == "web.application.svc.cluster.local." {
+		switch question.Name {
+		case localServiceName:
+			answerIP = remoteServiceIP
+		case remotePlatformName:
+			answerIP = remotePlatformIP
+		case "web.application.svc.cluster.local.":
 			answerIP = remoteWebIP
 		}
 		if question.Qtype != dns.TypeA {
@@ -186,24 +196,33 @@ func TestPreservedLocalClusterDNS(t *testing.T) {
 		Mappings: client.DNSMappings{
 			{Name: "kubernetes.default.svc", AliasFor: localAPIIP},
 			{Name: "kubernetes.default.svc.cluster.local", AliasFor: localAPIIP},
+			{Name: localServiceName, AliasFor: localServiceIP},
 		},
 	}, "application", remoteLookup)
 	server.ctx = testutil.NewContext(t, true)
 	server.clientLookup = server.resolveThruCache
 
-	// A stale remote answer must never take precedence over the authoritative
-	// local mapping, even when the previous remote lookup has not expired.
+	// Stale remote answers must never take precedence over authoritative local
+	// mappings, even when previous remote lookups have not expired.
 	wait := make(chan struct{})
 	close(wait)
-	server.cache.Store(cacheKey{name: "kubernetes.default.svc.", qType: dns.TypeA}, &cacheEntry{
-		created: time.Now(),
-		answer: dnsproxy.RRs{&dns.A{
-			Hdr: dns.RR_Header{Name: "kubernetes.default.svc.", Rrtype: dns.TypeA, Class: dns.ClassINET},
-			A:   net.ParseIP(remoteAPIIP),
-		}},
-		rCode: dns.RcodeSuccess,
-		wait:  wait,
-	})
+	for _, stale := range []struct {
+		name string
+		ip   string
+	}{
+		{name: "kubernetes.default.svc.", ip: remoteAPIIP},
+		{name: localServiceName, ip: remoteServiceIP},
+	} {
+		server.cache.Store(cacheKey{name: stale.name, qType: dns.TypeA}, &cacheEntry{
+			created: time.Now(),
+			answer: dnsproxy.RRs{&dns.A{
+				Hdr: dns.RR_Header{Name: stale.name, Rrtype: dns.TypeA, Class: dns.ClassINET},
+				A:   net.ParseIP(stale.ip),
+			}},
+			rCode: dns.RcodeSuccess,
+			wait:  wait,
+		})
+	}
 
 	tests := []struct {
 		name     string
@@ -216,6 +235,9 @@ func TestPreservedLocalClusterDNS(t *testing.T) {
 		{name: "case-insensitive API name", query: "KUBERNETES.default.svc.", qtype: dns.TypeA, answerIP: localAPIIP},
 		{name: "Telepresence search suffix", query: "kubernetes.default.svc.tel2-search.", qtype: dns.TypeA, answerIP: localAPIIP},
 		{name: "opposite address family does not leak remotely", query: "kubernetes.default.svc.", qtype: dns.TypeAAAA},
+		{name: "additional local service", query: localServiceName, qtype: dns.TypeA, answerIP: localServiceIP},
+		{name: "additional local service opposite address family", query: localServiceName, qtype: dns.TypeAAAA},
+		{name: "ordinary remote service in preserved namespace", query: remotePlatformName, qtype: dns.TypeA, answerIP: remotePlatformIP},
 		{name: "ordinary remote service", query: "web.application.svc.cluster.local.", qtype: dns.TypeA, answerIP: remoteWebIP},
 	}
 	for _, tt := range tests {
@@ -238,7 +260,7 @@ func TestPreservedLocalClusterDNS(t *testing.T) {
 			require.Equal(t, tt.answerIP, answer.A.String())
 		})
 	}
-	require.Equal(t, []string{"web.application.svc.cluster.local."}, remoteQueries)
+	require.Equal(t, []string{remotePlatformName, "web.application.svc.cluster.local."}, remoteQueries)
 }
 
 func TestExcludedLocalClusterAPIDoesNotFallBack(t *testing.T) {
