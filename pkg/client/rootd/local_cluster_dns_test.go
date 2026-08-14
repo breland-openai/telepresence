@@ -660,3 +660,83 @@ func TestSessionNetworkConfigIncludesPreservedMappings(t *testing.T) {
 	require.Equal(t, client.DNSMappings{explicit}, client.GetConfig(s).DNS().Mappings)
 	require.Equal(t, []netip.Prefix{netip.MustParsePrefix("10.99.0.0/16")}, client.GetConfig(s).Routing().Subnets)
 }
+
+func TestSessionPreservedDNSLookupTimeout(t *testing.T) {
+	const hostname = "artifact-gateway.platform.svc.cluster.local"
+	address := netip.MustParseAddr("198.51.100.21")
+	tests := []struct {
+		name              string
+		configuredTimeout time.Duration
+		preserved         bool
+		wantTimeout       time.Duration
+	}{
+		{
+			name:        "normalizes canonical timeout when local mappings are preserved",
+			preserved:   true,
+			wantTimeout: 4 * time.Second,
+		},
+		{
+			name:              "retains explicitly configured timeout when local mappings are preserved",
+			configuredTimeout: 9 * time.Second,
+			preserved:         true,
+			wantTimeout:       9 * time.Second,
+		},
+		{
+			name:        "normalizes canonical timeout without preserved mappings",
+			wantTimeout: 4 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver, queries := fakeLocalClusterDNSRecords(t, map[string]netip.Addr{
+				hostname + ".": address,
+			})
+			config := client.GetDefaultConfig()
+			config.DNS().LookupTimeout = tt.configuredTimeout
+			config.DNS().Mappings = client.DNSMappings{
+				{Name: "inventory.platform.svc.cluster.local", AliasFor: "203.0.113.11"},
+			}
+			ctx, cancel := context.WithCancel(client.WithConfig(context.Background(), config))
+			defer cancel()
+			s := &session{
+				Cluster: &k8s.Cluster{
+					Kubeconfig: &k8s.Kubeconfig{Context: ctx, Namespace: "platform"},
+				},
+				session:   &manager.SessionInfo{SessionId: "test-session"},
+				localDNS:  resolver,
+				l4PortMap: xsync.NewMap[types.AddrPortProto, uint16](),
+			}
+			if tt.preserved {
+				s.localClusterDNSMappings = client.DNSMappings{
+					{Name: localClusterAPIName, AliasFor: "192.0.2.1"},
+					{Name: hostname, AliasFor: address.String()},
+				}
+			}
+			canonicalDNS := client.GetConfig(s).DNS()
+			s.initializeDNSServer(canonicalDNS)
+
+			require.Equal(t, tt.wantTimeout, client.GetConfig(s).DNS().LookupTimeout)
+			require.Equal(t, tt.wantTimeout, s.dnsServer.GetConfig().LookupTimeout)
+			require.Len(t, client.GetConfig(s).DNS().Mappings, 1)
+			if tt.preserved {
+				require.Len(t, s.dnsServer.GetConfig().Mappings, 3)
+			}
+
+			statusConfig, err := client.UnmarshalJSONConfig(s.getNetworkConfig().ClientConfig, false)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantTimeout, statusConfig.DNS().LookupTimeout)
+			require.Equal(t, s.dnsServer.GetConfig().Mappings, statusConfig.DNS().Mappings)
+
+			resolved, err := s.resolvePort(ctx, hostname, "8080")
+			require.NoError(t, err)
+			require.Equal(t, netip.AddrPortFrom(address, 8080), resolved.AddrPort)
+			require.Equal(t, types.ProtoTCP, resolved.Proto)
+			require.Positive(t, queries.Load())
+
+			resolved, err = s.resolvePort(ctx, "203.0.113.9", "8443")
+			require.NoError(t, err)
+			require.Equal(t, netip.MustParseAddrPort("203.0.113.9:8443"), resolved.AddrPort)
+		})
+	}
+}

@@ -448,12 +448,7 @@ func newSession(
 
 	dnsConfig := cfg.DNS()
 	s.localClusterDNSMappings = discoverLocalClusterDNSMappings(s, dnsConfig, rt.VirtualSubnet)
-	if len(s.localClusterDNSMappings) > 0 {
-		effectiveDNS := *dnsConfig
-		effectiveDNS.Mappings = mergeLocalClusterDNSMappings(dnsConfig.Mappings, s.localClusterDNSMappings)
-		dnsConfig = &effectiveDNS
-	}
-	s.dnsServer = dns.NewServer(dnsConfig, s.Namespace, s.clusterLookup)
+	s.initializeDNSServer(dnsConfig)
 	s.SetTopLevelDomains(nil)
 
 	// Set ourselves as the default dialer for the session.
@@ -465,6 +460,17 @@ func newSession(
 		close(s.routesCh)
 	}()
 	return s, nil
+}
+
+func (s *session) initializeDNSServer(config *client.DNS) {
+	dnsConfig := config
+	if len(s.localClusterDNSMappings) > 0 {
+		effectiveDNS := *dnsConfig
+		effectiveDNS.Mappings = mergeLocalClusterDNSMappings(dnsConfig.Mappings, s.localClusterDNSMappings)
+		dnsConfig = &effectiveDNS
+	}
+	s.dnsServer = dns.NewServer(dnsConfig, s.Namespace, s.clusterLookup)
+	config.LookupTimeout = dnsConfig.LookupTimeout
 }
 
 // lookupSequencerTTL is the maximum time to keep a lookup result cached with the purpose of avoiding
