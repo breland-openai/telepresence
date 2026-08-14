@@ -148,8 +148,14 @@ func (r *interceptReadiness) awaitInitialSync(ctx context.Context, timeout time.
 	case <-ctx.Done():
 		return nil
 	case <-timer.C:
-		return status.Errorf(codes.DeadlineExceeded,
-			"traffic-agent did not synchronize its initial intercept snapshot within %s", timeout)
+		clog.Warnf(ctx, "traffic-agent has not synchronized its initial intercept snapshot within %s; continuing to wait", timeout)
+	}
+
+	select {
+	case <-r.initialSync:
+		return nil
+	case <-ctx.Done():
+		return nil
 	}
 }
 

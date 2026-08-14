@@ -434,12 +434,75 @@ func TestInterceptReadinessSupportsLegacySnapshots(t *testing.T) {
 	}
 }
 
-func TestInterceptReadinessInitialSyncTimeout(t *testing.T) {
-	ctx := interceptReadinessContext(t)
+func TestInterceptReadinessInitialSyncWaitsForDelayedSnapshot(t *testing.T) {
+	ctx, cancel := context.WithCancel(interceptReadinessContext(t))
+	defer cancel()
+
 	readiness := newInterceptReadiness()
-	err := readiness.awaitInitialSync(ctx, time.Millisecond)
-	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
-	require.ErrorContains(t, err, "initial intercept snapshot")
+	snapshots := make(chan interceptSnapshot)
+	stream := newFakeInterceptReadinessStream[rpc.InterceptInfoDelta](ctx)
+	manager := &interceptReadinessManager{
+		delta: func(context.Context) (grpc.ServerStreamingClient[rpc.InterceptInfoDelta], error) {
+			return stream, nil
+		},
+		reconnect: func(context.Context) error {
+			t.Error("a delayed initial snapshot must not reconnect the agent session")
+			return nil
+		},
+	}
+	state := &interceptReadinessState{
+		handle: func(context.Context, []*rpc.InterceptInfo) []*rpc.ReviewInterceptRequest {
+			return nil
+		},
+	}
+
+	watchDone := make(chan error, 1)
+	go func() {
+		watchDone <- interceptWatchLoop(ctx, manager, &rpc.SessionInfo{}, &rpc.AgentInfo{}, snapshots, time.Millisecond, readiness)
+	}()
+	handleDone := make(chan error, 1)
+	go func() {
+		handleDone <- handleInterceptLoop(ctx, manager, &rpc.SessionInfo{}, snapshots, state, readiness)
+	}()
+	syncDone := make(chan error, 1)
+	go func() {
+		syncDone <- readiness.awaitInitialSync(ctx, time.Millisecond)
+	}()
+
+	select {
+	case err := <-syncDone:
+		t.Fatalf("initial synchronization stopped before a snapshot arrived: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	require.False(t, readinessMarkerExists(ctx))
+
+	stream.values <- &rpc.InterceptInfoDelta{}
+	awaitReadinessSignal(t, readiness.initialSync, "delayed initial snapshot")
+	require.NoError(t, <-syncDone)
+	require.True(t, readinessMarkerExists(ctx))
+
+	cancel()
+	require.NoError(t, <-watchDone)
+	require.NoError(t, <-handleDone)
+}
+
+func TestInterceptReadinessInitialSyncCancellationAfterTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(interceptReadinessContext(t))
+	readiness := newInterceptReadiness()
+	done := make(chan error, 1)
+	go func() {
+		done <- readiness.awaitInitialSync(ctx, time.Millisecond)
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("initial synchronization stopped before cancellation: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	require.False(t, readinessMarkerExists(ctx))
+
+	cancel()
+	require.NoError(t, <-done)
 	require.False(t, readinessMarkerExists(ctx))
 }
 

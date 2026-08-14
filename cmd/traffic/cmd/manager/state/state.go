@@ -471,13 +471,7 @@ func (s *State) transferServiceParticipantReview(interceptID, key string, remove
 				!AgentMatchesInterceptInfo(agent.AgentInfo, intercept) {
 				return true
 			}
-			containerName := intercept.Spec.ContainerName
-			for _, target := range agent.InterceptTargets {
-				if servicePortMatches(target, intercept.Spec) && target.ContainerName != "" {
-					containerName = target.ContainerName
-					break
-				}
-			}
+			containerName := serviceInterceptContainerName(agent.AgentInfo, intercept.Spec)
 			if len(agent.Containers) > 0 && agent.Containers[containerName] == nil &&
 				(containerName != "" || len(agent.Containers) != 1) {
 				return true
@@ -499,19 +493,7 @@ func (s *State) transferServiceParticipantReview(interceptID, key string, remove
 			review.Session = &rpc.SessionInfo{SessionId: string(replacement.sessionID())}
 		}
 
-		containerName := intercept.Spec.ContainerName
-		for _, target := range replacement.InterceptTargets {
-			if servicePortMatches(target, intercept.Spec) && target.ContainerName != "" {
-				containerName = target.ContainerName
-				break
-			}
-		}
-		container := replacement.Containers[containerName]
-		if container == nil && containerName == "" && len(replacement.Containers) == 1 {
-			for _, candidate := range replacement.Containers {
-				container = candidate
-			}
-		}
+		container := serviceInterceptContainer(replacement.AgentInfo, intercept.Spec)
 		if container != nil {
 			container = proto.Clone(container).(*rpc.AgentInfo_ContainerInfo)
 			// Preserve the keys authorized by the original agent review. This
@@ -546,6 +528,28 @@ func (s *State) transferServiceParticipantReview(interceptID, key string, remove
 		return true
 	}
 	return false
+}
+
+func serviceInterceptContainerName(agent *rpc.AgentInfo, spec *rpc.InterceptSpec) string {
+	for _, target := range agent.InterceptTargets {
+		if servicePortMatches(target, spec) && target.ContainerName != "" {
+			return target.ContainerName
+		}
+	}
+	return spec.ContainerName
+}
+
+func serviceInterceptContainer(agent *rpc.AgentInfo, spec *rpc.InterceptSpec) *rpc.AgentInfo_ContainerInfo {
+	name := serviceInterceptContainerName(agent, spec)
+	if container := agent.Containers[name]; container != nil {
+		return container
+	}
+	if name == "" && len(agent.Containers) == 1 {
+		for _, container := range agent.Containers {
+			return container
+		}
+	}
+	return nil
 }
 
 func (s *State) gcClientSessionIntercepts(client *ClientSession) {

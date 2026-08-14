@@ -97,15 +97,21 @@ func (m *Map[K, V]) Subscribe(done <-chan struct{}, includeFilter func(K, V) boo
 	case <-done:
 		close(ch)
 	default:
-		m.notifier.Reset(math.MaxInt64)
-
 		id := uuid.New()
 		sb := &subscription[K, V]{include: includeFilter, channel: ch, doneCh: done}
-		sb.mark.Store(true)
+		// Publish before snapshotting; hold the subscriber lock until its initial
+		// state is queued so concurrent updates are delivered afterward.
+		sb.Lock()
 		m.subscribers.Store(id, sb)
-
-		// Fire notifier immediately to send the snapshot.
-		m.notify()
+		snapshot := m.LoadAll()
+		m.snapLock.Lock()
+		if m.snapshot == nil {
+			m.snapshot = snapshot
+		}
+		m.snapLock.Unlock()
+		initial := allDelta[K, V]{snapshot: snapshot}
+		initial.sendLocked(sb)
+		sb.Unlock()
 		go func() {
 			<-done
 			m.subscribers.Delete(id)
@@ -321,6 +327,11 @@ func (ad *allDelta[K, V]) filteredDelta(initialized bool, include func(K, V) boo
 func (ad *allDelta[K, V]) send(sb *subscription[K, V]) {
 	sb.Lock()
 	defer sb.Unlock()
+	ad.sendLocked(sb)
+}
+
+// sendLocked sends a delta while the caller holds the subscription mutex.
+func (ad *allDelta[K, V]) sendLocked(sb *subscription[K, V]) {
 	if sb.closed {
 		return
 	}
