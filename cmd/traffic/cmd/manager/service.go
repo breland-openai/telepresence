@@ -1181,12 +1181,13 @@ func (s *service) WatchIntercepts(session *rpc.SessionInfo, stream grpc.ServerSt
 	if err != nil {
 		return err
 	}
+	agentWatch := s.state.GetAgent(tunnel.SessionID(session.GetSessionId())) != nil
 	snapshot := cache.NewClientMap[string, *state.Intercept]()
 	return snapshot.Watch(sessionDone, deltaCh, func() error {
 		clog.Debug(ctx, "Sending update")
 		intercepts := make([]*rpc.InterceptInfo, 0, snapshot.Size())
 		snapshot.Range(func(_ string, intercept *state.Intercept) bool {
-			intercepts = append(intercepts, intercept.InterceptInfo)
+			intercepts = append(intercepts, watcherInterceptInfo(intercept.InterceptInfo, agentWatch))
 			return true
 		})
 		sort.Slice(intercepts, func(i, j int) bool {
@@ -1208,6 +1209,7 @@ func (s *service) WatchInterceptsDelta(session *rpc.SessionInfo, stream grpc.Ser
 	if err != nil {
 		return err
 	}
+	agentWatch := s.state.GetAgent(tunnel.SessionID(session.GetSessionId())) != nil
 	for {
 		select {
 		case <-ctx.Done():
@@ -1219,7 +1221,7 @@ func (s *service) WatchInterceptsDelta(session *rpc.SessionInfo, stream grpc.Ser
 			if rl := len(delta.Upserts); rl > 0 {
 				iid.Upserts = make(map[string]*rpc.InterceptInfo, rl)
 				for k, v := range delta.Upserts {
-					iid.Upserts[k] = v.InterceptInfo
+					iid.Upserts[k] = watcherInterceptInfo(v.InterceptInfo, agentWatch)
 				}
 			}
 			clog.Debugf(ctx, "Sending %d upserts and %d removals", len(iid.Upserts), len(iid.Removals))
@@ -1228,6 +1230,28 @@ func (s *service) WatchInterceptsDelta(session *rpc.SessionInfo, stream grpc.Ser
 				return err
 			}
 		}
+	}
+}
+
+func watcherInterceptInfo(info *rpc.InterceptInfo, agentWatch bool) *rpc.InterceptInfo {
+	if !agentWatch {
+		return info
+	}
+	return &rpc.InterceptInfo{
+		Spec:              info.Spec,
+		Id:                info.Id,
+		ClientSession:     info.ClientSession,
+		Disposition:       info.Disposition,
+		Message:           info.Message,
+		PodName:           info.PodName,
+		ApiPort:           info.ApiPort,
+		PodIp:             info.PodIp,
+		SftpPort:          info.SftpPort,
+		FtpPort:           info.FtpPort,
+		ClientMountPoint:  info.ClientMountPoint,
+		MechanismArgsDesc: info.MechanismArgsDesc,
+		ModifiedAt:        info.ModifiedAt,
+		ServiceWorkloads:  info.ServiceWorkloads,
 	}
 }
 
