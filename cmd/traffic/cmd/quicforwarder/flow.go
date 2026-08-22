@@ -13,6 +13,8 @@ import (
 	"github.com/telepresenceio/clog"
 )
 
+const initialFlowBatchSize = 2
+
 // flowEntry is one established client<->backend flow: a connected UDP socket to the
 // backend (plus its batch-I/O wrapper), and the last time either direction saw traffic
 // (used by sweepIdle).
@@ -142,7 +144,7 @@ func (t *flowTable) CreateAndForward(ctx context.Context, src netip.AddrPort, ba
 // QUIC packet boundaries rather than re-sending whatever the kernel happened to bundle
 // together on receipt.
 func (t *flowTable) pump(ctx context.Context, src netip.AddrPort, e *flowEntry) {
-	rmsgs := newReadBatchMessages(batchSize, e.gro)
+	rmsgs := newReadBatchMessages(initialFlowBatchSize, e.gro)
 	wmsgs := make([]ipv4.Message, 0, batchSize)
 	scratch := make([]byte, maxDatagramSize)
 	addr := net.UDPAddrFromAddrPort(src)
@@ -163,7 +165,15 @@ func (t *flowTable) pump(ctx context.Context, src netip.AddrPort, e *flowEntry) 
 		if err := writeMsgsBatch(t.frontPC, wmsgs, scratch); err != nil {
 			clog.Debugf(ctx, "quic-forwarder: write to client %s failed: %v", src, err)
 		}
+		rmsgs = growFlowReadBatchMessages(rmsgs, n, e.gro)
 	}
+}
+
+func growFlowReadBatchMessages(msgs []ipv4.Message, n int, gro bool) []ipv4.Message {
+	if n != len(msgs) || len(msgs) >= batchSize {
+		return msgs
+	}
+	return append(msgs, newReadBatchMessages(min(len(msgs), batchSize-len(msgs)), gro)...)
 }
 
 // sweepIdle closes and removes every flow that has seen no traffic in either

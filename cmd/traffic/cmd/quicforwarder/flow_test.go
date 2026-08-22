@@ -109,3 +109,29 @@ func TestFlowTable_SweepIdle_ClosesStaleFlows(t *testing.T) {
 	ft.sweepIdle(context.Background(), -time.Second)
 	assert.Equal(t, 0, ft.count())
 }
+
+func TestFlowReadBatchMessagesGrowOnlyWhenFull(t *testing.T) {
+	msgs := newReadBatchMessages(initialFlowBatchSize, false)
+	require.Len(t, msgs, initialFlowBatchSize)
+	for _, msg := range msgs {
+		require.Len(t, msg.Buffers, 1)
+		assert.Len(t, msg.Buffers[0], maxDatagramSize)
+	}
+
+	msgs[0].Buffers[0][0] = 42
+	msgs = growFlowReadBatchMessages(msgs, initialFlowBatchSize-1, false)
+	require.Len(t, msgs, initialFlowBatchSize)
+	assert.Equal(t, byte(42), msgs[0].Buffers[0][0])
+
+	for size := initialFlowBatchSize * 2; size <= batchSize; size *= 2 {
+		msgs = growFlowReadBatchMessages(msgs, len(msgs), false)
+		require.Len(t, msgs, size)
+		assert.Equal(t, byte(42), msgs[0].Buffers[0][0])
+		for _, msg := range msgs {
+			assert.Len(t, msg.Buffers[0], maxDatagramSize)
+		}
+	}
+
+	msgs = growFlowReadBatchMessages(msgs, len(msgs), false)
+	assert.Len(t, msgs, batchSize)
+}

@@ -155,6 +155,94 @@ func TestSubscribeInitialSnapshotFiltersValuesAndCloses(t *testing.T) {
 	}
 }
 
+func TestSubscribePendingDeltaMergeDoesNotMutateDeliveredDeltas(t *testing.T) {
+	tests := []struct {
+		name       string
+		initial    map[string]string
+		first      func(*Map[string, string])
+		second     func(*Map[string, string])
+		wantFirst  Delta[string, string]
+		wantMerged Delta[string, string]
+	}{
+		{
+			name:   "upserts add",
+			first:  func(m *Map[string, string]) { m.Store("first", "one") },
+			second: func(m *Map[string, string]) { m.Store("second", "two") },
+			wantFirst: Delta[string, string]{
+				Upserts: map[string]string{"first": "one"},
+			},
+			wantMerged: Delta[string, string]{
+				Upserts: map[string]string{"first": "one", "second": "two"},
+			},
+		},
+		{
+			name:    "upserts remove",
+			initial: map[string]string{"first": "one"},
+			first:   func(m *Map[string, string]) { m.Store("first", "updated") },
+			second:  func(m *Map[string, string]) { m.Delete("first") },
+			wantFirst: Delta[string, string]{
+				Upserts: map[string]string{"first": "updated"},
+			},
+			wantMerged: Delta[string, string]{
+				Upserts:  map[string]string{},
+				Removals: map[string]string{"first": "updated"},
+			},
+		},
+		{
+			name:    "removals add",
+			initial: map[string]string{"first": "one", "second": "two"},
+			first:   func(m *Map[string, string]) { m.Delete("first") },
+			second:  func(m *Map[string, string]) { m.Delete("second") },
+			wantFirst: Delta[string, string]{
+				Removals: map[string]string{"first": "one"},
+			},
+			wantMerged: Delta[string, string]{
+				Removals: map[string]string{"first": "one", "second": "two"},
+			},
+		},
+		{
+			name:    "removals remove",
+			initial: map[string]string{"first": "one"},
+			first:   func(m *Map[string, string]) { m.Delete("first") },
+			second:  func(m *Map[string, string]) { m.Store("first", "updated") },
+			wantFirst: Delta[string, string]{
+				Removals: map[string]string{"first": "one"},
+			},
+			wantMerged: Delta[string, string]{
+				Upserts:  map[string]string{"first": "updated"},
+				Removals: map[string]string{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			done := make(chan struct{})
+			defer close(done)
+
+			m := NewMap[string, string](func(a, b string) bool { return a == b }, time.Hour)
+			for key, value := range tt.initial {
+				m.Store(key, value)
+			}
+			fast := m.Subscribe(done, nil)
+			slow := m.Subscribe(done, nil)
+			<-fast
+			<-slow
+
+			tt.first(m)
+			m.notify()
+			delivered := <-fast
+			require.Equal(t, tt.wantFirst, delivered)
+
+			tt.second(m)
+			m.notify()
+
+			require.Equal(t, tt.wantFirst, delivered, "coalescing a pending delta changed another subscriber's delivered delta")
+			require.Equal(t, tt.wantMerged, <-slow)
+		})
+	}
+}
+
 func TestAllDeltaSendAfterSubscriptionClose(t *testing.T) {
 	sb := &subscription[string, string]{
 		channel: make(chan Delta[string, string], 1),

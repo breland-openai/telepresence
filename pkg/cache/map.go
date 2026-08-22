@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"maps"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ func (delta *Delta[K, V]) Merge(other Delta[K, V]) {
 	if len(delta.Upserts) == 0 {
 		delta.Upserts = other.Upserts
 	} else {
+		delta.Upserts = maps.Clone(delta.Upserts)
 		for k, v := range other.Upserts {
 			delta.Upserts[k] = v
 		}
@@ -29,6 +31,7 @@ func (delta *Delta[K, V]) Merge(other Delta[K, V]) {
 	if len(delta.Removals) == 0 {
 		delta.Removals = other.Removals
 	} else {
+		delta.Removals = maps.Clone(delta.Removals)
 		for k, v := range other.Removals {
 			delta.Removals[k] = v
 		}
