@@ -4,15 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"time"
 
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
 	"github.com/telepresenceio/telepresence/v2/pkg/types"
 )
-
-const dnsConnTTL = 5 * time.Second
 
 func (s *session) isForDNS(ip netip.Addr, port uint16) bool {
 	return s.vifDNS.Addr() == ip && s.vifDNS.Port() == port
@@ -94,7 +91,8 @@ func (s *session) streamCreator() tunnel.StreamCreator {
 				pipeId := tunnel.NewConnID(p, id.Source(), s.localDNS)
 				clog.Tracef(c, "Intercept DNS %s to %s", id, pipeId.Destination())
 				from, to := tunnel.NewPipe(pipeId, tunnel.SessionID(s.session.SessionId), tunnel.DnsToTun, tunnel.TunToDNS)
-				tunnel.NewDialerTTL(to, func() {}, dnsConnTTL, nil, nil).Start(c)
+				ttl := tunnel.DNSConnTTL(client.GetConfig(c).DNS().LookupTimeout)
+				tunnel.NewDialerTTL(to, func() {}, ttl, nil, nil).Start(c)
 				return from, nil
 			}
 		}

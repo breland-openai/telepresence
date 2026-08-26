@@ -59,6 +59,69 @@ func newTestStreamSession(ctx context.Context) *session {
 	}
 }
 
+func TestStreamCreatorDNSUsesConfiguredLookupTimeout(t *testing.T) {
+	config := client.GetDefaultConfig()
+	config.DNS().LookupTimeout = 7 * time.Second
+	ctx, cancel := context.WithCancel(client.WithConfig(context.Background(), config))
+	defer cancel()
+
+	listener, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	responseSent := make(chan error, 1)
+	go func() {
+		query := make([]byte, len("query"))
+		n, address, err := listener.ReadFrom(query)
+		if err != nil {
+			responseSent <- err
+			return
+		}
+		if string(query[:n]) != "query" {
+			responseSent <- io.ErrUnexpectedEOF
+			return
+		}
+		select {
+		case <-ctx.Done():
+			responseSent <- ctx.Err()
+		case <-time.After(5250 * time.Millisecond):
+			_, err = listener.WriteTo([]byte("response"), address)
+			responseSent <- err
+		}
+	}()
+
+	s := newTestStreamSession(ctx)
+	s.vifDNS = netip.MustParseAddrPort("198.51.100.53:53")
+	s.localDNS = netip.MustParseAddrPort(listener.LocalAddr().String())
+	stream, err := s.streamCreator()(ctx, tunnel.NewConnID(
+		types.ProtoUDP,
+		netip.MustParseAddrPort("192.0.2.2:43210"),
+		s.vifDNS,
+	))
+	require.NoError(t, err)
+
+	clientConn, vifConn := net.Pipe()
+	defer clientConn.Close()
+	defer vifConn.Close()
+	endpoint := tunnel.NewConnEndpointTTL(
+		stream,
+		vifConn,
+		cancel,
+		tunnel.DNSConnTTL(config.DNS().LookupTimeout),
+		nil,
+		nil,
+	)
+	endpoint.Start(ctx)
+	require.NoError(t, clientConn.SetDeadline(time.Now().Add(7*time.Second)))
+	_, err = clientConn.Write([]byte("query"))
+	require.NoError(t, err)
+
+	response := make([]byte, len("response"))
+	_, err = io.ReadFull(clientConn, response)
+	require.NoError(t, err)
+	require.Equal(t, "response", string(response))
+	require.NoError(t, <-responseSent)
+}
+
 func TestStreamCreatorRedirectsLocalClient(t *testing.T) {
 	ctx := client.WithConfig(context.Background(), client.GetDefaultConfig())
 	ctx, cancel := context.WithCancel(ctx)

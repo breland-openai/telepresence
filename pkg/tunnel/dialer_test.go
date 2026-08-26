@@ -13,6 +13,32 @@ import (
 	rpc "github.com/telepresenceio/telepresence/rpc/v2/manager"
 )
 
+func TestDNSConnTTL(t *testing.T) {
+	tests := []struct {
+		name          string
+		lookupTimeout time.Duration
+		want          time.Duration
+	}{
+		{
+			name:          "default lookup timeout",
+			lookupTimeout: 4 * time.Second,
+			want:          5 * time.Second,
+		},
+		{
+			name:          "custom lookup timeout",
+			lookupTimeout: 9 * time.Second,
+			want:          10 * time.Second,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := DNSConnTTL(tt.lookupTimeout); got != tt.want {
+				t.Fatalf("DNSConnTTL(%s) = %s, want %s", tt.lookupTimeout, got, tt.want)
+			}
+		})
+	}
+}
+
 type blockingTunnelProvider struct {
 	active int32
 	max    int32

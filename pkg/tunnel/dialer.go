@@ -33,6 +33,11 @@ const (
 	slowDialResponse = 2 * time.Second
 )
 
+// DNSConnTTL keeps DNS forwarding endpoints alive throughout a lookup.
+func DNSConnTTL(lookupTimeout time.Duration) time.Duration {
+	return lookupTimeout + time.Second
+}
+
 // Limit selected-intercept dial responders so bursty workloads cannot create
 // unbounded goroutines and gRPC tunnels in the client daemon.
 const (
