@@ -52,9 +52,12 @@ var NewExtendedManagerClient func(conn *grpc.ClientConn, ossManager rpc.ManagerC
 // stuck forever before /tmp/agent/ready is created.
 var managerHandshakeTimeout = 10 * time.Second //nolint:gochecknoglobals // overridden by tests
 
+var managerHeartbeatInterval = time.Minute //nolint:gochecknoglobals // overridden by tests
+
 const (
 	agentSessionIDPrefix        = "agent:"
 	initialInterceptSyncTimeout = 30 * time.Second
+	managerHeartbeatTimeout     = 10 * time.Second
 )
 
 type interceptReadiness struct {
@@ -241,6 +244,7 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 	if err := dos.MkdirAll(ctx, readyDir, 0o777); err != nil {
 		return err
 	}
+	var sessionLost error
 	defer func() {
 		// The ctx might well be cancelled at this point but is used as parent during
 		// the timed clean-up to keep logging intact.
@@ -257,8 +261,10 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 		state.HandleIntercepts(ctx, nil)
 
 		// Depart session
-		if _, err := manager.Depart(ctx, session); err != nil {
-			clog.Errorf(ctx, "depart session: %+v", err)
+		if sessionLost == nil {
+			if _, err := manager.Depart(ctx, session); err != nil {
+				clog.Errorf(ctx, "depart session: %+v", err)
+			}
 		}
 	}()
 
@@ -276,13 +282,28 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 		return handleInterceptLoop(ctx, manager, session, snapshots, state, readiness)
 	})
 	wg.Go("remain", func(ctx context.Context) error {
-		return remainLoop(ctx, manager, session)
+		err := remainLoop(ctx, manager, session)
+		if status.Code(err) == codes.NotFound {
+			// Cancel before withdrawing readiness so an old snapshot cannot
+			// make this session ready again. Its deterministic ID may already
+			// belong to a repaired session, so do not send Depart for it.
+			sessionLost = err
+			cancel()
+			if readinessErr := readiness.setUnsynchronized(context.WithoutCancel(ctx)); readinessErr != nil {
+				return fmt.Errorf("clear traffic-agent readiness after session loss: %w", readinessErr)
+			}
+		}
+		return err
 	})
 	wg.Go("initialInterceptSync", func(ctx context.Context) error {
 		return readiness.awaitInitialSync(ctx, initialInterceptSyncTimeout)
 	})
 
-	return wg.Wait()
+	err = wg.Wait()
+	if sessionLost != nil {
+		return sessionLost
+	}
+	return err
 }
 
 func logLevelWatchLoop(ctx context.Context, level slog.Level, manager rpc.ManagerClient, retryInterval time.Duration) error {
@@ -384,7 +405,7 @@ func sendInterceptSnapshot(ctx context.Context, snapshots chan<- interceptSnapsh
 
 func remainLoop(ctx context.Context, manager rpc.ManagerClient, session *rpc.SessionInfo) error {
 	// Loop calling Remain
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(managerHeartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -393,7 +414,13 @@ func remainLoop(ctx context.Context, manager rpc.ManagerClient, session *rpc.Ses
 		case <-ticker.C:
 		}
 
-		if _, err := manager.Remain(ctx, &rpc.RemainRequest{Session: session}); err != nil {
+		heartbeatCtx, cancel := context.WithTimeout(ctx, managerHeartbeatTimeout)
+		_, err := manager.Remain(heartbeatCtx, &rpc.RemainRequest{Session: session})
+		cancel()
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				return fmt.Errorf("agent session lost: %w", err)
+			}
 			clog.Warnf(ctx, "remain: %v", err)
 		}
 	}

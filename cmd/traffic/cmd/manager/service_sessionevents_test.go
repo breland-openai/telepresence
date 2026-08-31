@@ -371,20 +371,15 @@ func TestWatchSessionEvents_InactiveAgentFiltered(t *testing.T) {
 	aliceSess, err := client.ArriveAsClient(ctx, testClients["alice"])
 	req.NoError(err)
 
-	wse, err := client.WatchSessionEvents(ctx, &rpc.SessionEventsRequest{Session: aliceSess})
-	req.NoError(err)
-
 	inactiveAgent := proto.Clone(testAgents["hello"]).(*rpc.AgentInfo)
 	inactiveAgent.PodUid = "inactive-pod-uid"
 
-	// Mark the pod inactive before the agent's AgentSession ever lands in state.
-	// ArriveAsAgent (which calls state.AddAgent) itself refuses to add an agent
-	// for an already-inactive pod, so RestoreAgents -- which performs no such
-	// check -- is used to get the (inactive) AgentSession into state directly,
-	// the way a manager restart would restore agents that raced with an
-	// eviction.
-	mutator.GetMap(svcCtx).Inactivate(types.UID(inactiveAgent.PodUid))
 	mgr.State().RestoreAgents([]*rpc.AgentInfo{inactiveAgent}, time.Now())
+	mutator.GetMap(svcCtx).Inactivate(types.UID(inactiveAgent.PodUid))
+	req.Equal(1, mgr.State().CountAgents())
+
+	wse, err := client.WatchSessionEvents(ctx, &rpc.SessionEventsRequest{Session: aliceSess})
+	req.NoError(err)
 
 	// A sentinel arrives normally right after; it proves the stream is alive
 	// and that the inactive agent's upsert produced no message of its own.

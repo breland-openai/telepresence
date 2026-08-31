@@ -494,13 +494,15 @@ func (s *service) Depart(ctx context.Context, session *rpc.SessionInfo) (*empty.
 		if err := agentOwnershipError(ctx, sessionID, agent); err != nil {
 			return nil, err
 		}
+		go s.state.RemoveAgentSession(agent)
+		return &empty.Empty{}, nil
 	} else if client := s.state.GetClient(sessionID); client != nil {
 		if err := state.ClientOwnershipError(ctx, sessionID, client); err != nil {
 			return nil, err
 		}
+		// There's no reason for the caller to wait for this removal to complete.
+		go s.state.RemoveSession(context.WithoutCancel(ctx), sessionID)
 	}
-	// There's no reason for the caller to wait for this removal to complete.
-	go s.state.RemoveSession(context.WithoutCancel(ctx), sessionID)
 	return &empty.Empty{}, nil
 }
 

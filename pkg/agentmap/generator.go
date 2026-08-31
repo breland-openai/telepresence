@@ -340,7 +340,7 @@ func (cfg *GeneratorConfig) newContainerConfig(cn *core.Container, index int, ic
 		Name:       cn.Name,
 		EnvPrefix:  CapsBase26(uint64(index)) + "_",
 		MountPoint: agentconfig.MountPrefixApp + "/" + cn.Name,
-		MountPaths: mounts,
+		MountPaths: mounts, //nolint:staticcheck // Legacy agents require MountPaths alongside Mounts.
 		Mounts:     mps,
 		Intercepts: ics,
 		Replace:    rp,
