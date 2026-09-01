@@ -629,8 +629,25 @@ func TestClusterLookupWorkloadPreservesCanceledContext(t *testing.T) {
 		lookupQuestion("service.mesh.example.", dns2.TypeA))
 
 	require.Empty(t, records)
-	require.Equal(t, dns2.RcodeNameError, rCode)
+	require.Equal(t, dns2.RcodeServerFailure, rCode)
 	require.Error(t, err)
 	require.Equal(t, codes.Canceled, status.Code(err))
 	require.Zero(t, fixture.manager.callCount())
+}
+
+func TestClusterLookupManagerErrorsReturnSERVFAIL(t *testing.T) {
+	for _, code := range []codes.Code{codes.Canceled, codes.DeadlineExceeded, codes.Unavailable} {
+		t.Run(code.String(), func(t *testing.T) {
+			fixture := newWorkloadLookupFixture(t, nil, nil, nil)
+			fixture.manager.err = status.Error(code, "lookup failed")
+
+			records, rCode, err := fixture.session.complexClusterLookup(context.Background(),
+				lookupQuestion("service.mesh.example.", dns2.TypeA))
+
+			require.Empty(t, records)
+			require.Equal(t, dns2.RcodeServerFailure, rCode)
+			require.Equal(t, code, status.Code(err))
+			require.Equal(t, 1, fixture.manager.callCount())
+		})
+	}
 }

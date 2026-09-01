@@ -707,14 +707,14 @@ func (s *session) lookupViaWorkload(
 		agent := s.agentClients.GetAgentForWorkload(ctx, workload)
 		if agent == nil {
 			if err := ctx.Err(); err != nil {
-				return nil, rcodeFromError(err), err, true
+				return nil, dns2.RcodeServerFailure, err, true
 			}
 			continue
 		}
 		response, err := agent.Lookup(ctx, &manager.LookupRequest{Session: s.session, Name: question.Name})
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, rcodeFromError(err), err, true
+				return nil, dns2.RcodeServerFailure, err, true
 			}
 			clog.Debugf(ctx, "Workload %s could not resolve %q: %v", workload, question.Name, err)
 			continue
@@ -764,7 +764,7 @@ func (s *session) simpleLookup(ctx context.Context, question *dns2.Question) (dn
 	}
 	if err != nil {
 		s.dnsFailures++
-		rCode := rcodeFromError(err)
+		rCode := dns2.RcodeServerFailure
 		clog.Errorf(ctx, "Lookup %q %s: %v", question.Name, dns2.RcodeToString[rCode], err)
 		return nil, rCode, err
 	}
@@ -847,7 +847,7 @@ func (s *session) complexClusterLookup(ctx context.Context, q *dns2.Question) (d
 	})
 	if err != nil {
 		s.dnsFailures++
-		rCode := rcodeFromError(err)
+		rCode := dns2.RcodeServerFailure
 		clog.Errorf(ctx, "Lookup %s %q %s: %T %v", dns2.TypeToString[q.Qtype], q.Name, dns2.RcodeToString[rCode], err, err)
 		return nil, rCode, err
 	}
@@ -879,19 +879,6 @@ func (s *session) complexClusterLookup(ctx context.Context, q *dns2.Question) (d
 		}
 	}
 	return answer, rCode, err
-}
-
-// rcodeFromError maps lookup errors to appropriate DNS RCODEs.
-func rcodeFromError(err error) int {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded),
-		errors.Is(err, context.Canceled),
-		status.Code(err) == codes.DeadlineExceeded,
-		status.Code(err) == codes.Canceled:
-		return dns2.RcodeNameError
-	default:
-		return dns2.RcodeServerFailure
-	}
 }
 
 func (s *session) GetLocalIP(destinationIP netip.Addr) (netip.Addr, error) {

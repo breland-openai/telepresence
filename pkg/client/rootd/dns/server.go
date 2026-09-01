@@ -362,14 +362,11 @@ func (s *Server) resolveInCluster(c context.Context, q *dns.Question) (result dn
 
 	result, rCode, err = s.clusterLookup(c, q)
 	if err != nil {
-		switch {
-		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled), status.Code(err) == codes.DeadlineExceeded, status.Code(err) == codes.Canceled:
-			rCode = dns.RcodeNameError
-			err = nil
-		default:
+		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) &&
+			status.Code(err) != codes.DeadlineExceeded && status.Code(err) != codes.Canceled {
 			clog.Errorf(s.ctx, "Error resolving %q in cluster: %T %v", query, err, err)
 		}
-		return nil, rCode, client.CheckTimeout(c, err)
+		return nil, dns.RcodeServerFailure, client.CheckTimeout(c, err)
 	}
 
 	// Keep the TTLs of requests resolved in the cluster low. We
@@ -719,9 +716,6 @@ func (s *Server) resolveThruCache(q *dns.Question) (answer dnsproxy.RRs, rCode i
 	answer, rCode, err = s.resolveInCluster(s.ctx, q)
 	if err != nil {
 		clog.Debugf(s.ctx, "cache lookup failed for %s %s: %v", dns.TypeToString[q.Qtype], q.Name, err)
-		if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.Canceled {
-			rCode = dns.RcodeNameError
-		}
 	}
 
 	defer func() {
@@ -731,8 +725,7 @@ func (s *Server) resolveThruCache(q *dns.Question) (answer dnsproxy.RRs, rCode i
 		}
 	}()
 
-	if rCode != dns.RcodeSuccess && s.isNameCachedWithSuccess(q) {
-		err = nil
+	if err == nil && rCode == dns.RcodeNameError && s.isNameCachedWithSuccess(q) {
 		rCode = dns.RcodeSuccess
 	}
 
