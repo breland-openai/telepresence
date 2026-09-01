@@ -94,6 +94,10 @@ func MainWithEnv(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("unable to create the Kubernetes Interface from InClusterConfig: %w", err)
 	}
+	tokenReviewClient, err := newTokenReviewClient(cfg)
+	if err != nil {
+		return fmt.Errorf("unable to create the Kubernetes TokenReview client: %w", err)
+	}
 	ari, err := argorollouts.NewForConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("unable to create the Argo Rollouts Interface from InClusterConfig: %w", err)
@@ -185,7 +189,7 @@ func MainWithEnv(ctx context.Context) (err error) {
 		}
 
 		g := log.NewGroup(ctx)
-		mgr, err := NewService(ctx, g, configWatcher)
+		mgr, err := NewService(ctx, g, configWatcher, tokenReviewClient)
 		if err != nil {
 			return fmt.Errorf("unable to initialize traffic manager: %w", err)
 		}
@@ -328,6 +332,7 @@ func (s *service) servePrometheus(ctx context.Context) error {
 		clog.Info(ctx, "Prometheus metrics server not started")
 		return nil
 	}
+	s.authenticator.RegisterMetrics(prometheus.DefaultRegisterer)
 	newGaugeFunc("telepresence_agent_count", "Number of connected traffic agents", s.state.CountAgents)
 	newGaugeFunc("telepresence_client_count", "Number of connected clients", s.state.CountClients)
 	newGaugeFunc("telepresence_active_intercept_count", "Number of active intercepts", s.state.CountIntercepts)
@@ -439,7 +444,7 @@ func (s *service) serveHTTP(ctx context.Context) error {
 	if mz, ok := env.GrpcMaxReceiveSize.AsInt64(); ok {
 		opts = append(opts, grpc.MaxRecvMsgSize(int(mz)))
 	}
-	ai := auth.NewInterceptor(auth.NewAuthenticator(k8sapi.GetK8sInterface(ctx), auth.WithMintedTokens(s.mintedTokens)), env.AuthenticationMode)
+	ai := auth.NewInterceptor(s.authenticator, env.AuthenticationMode)
 	svc := server.NewWithAuth(ctx, &server.Interceptors{Unary: ai.Unary(), Stream: ai.Stream()}, opts...)
 	s.RegisterServers(svc)
 	clog.Debugf(ctx, "Serving client connections on %s using idle TTL %s", l.Addr(), env.ClientConnectionTTL)

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -126,6 +128,111 @@ func TestInterceptor_Stream(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, seen)
 	assert.Equal(t, "u", seen.Username)
+}
+
+func TestInterceptorExpiredCallerSkipsHandler(t *testing.T) {
+	for _, mode := range []auth.Mode{auth.ModeDisabled, auth.ModePermissive, auth.ModeEnforcing} {
+		for _, rpcType := range []string{"unary", "stream"} {
+			for _, expired := range []bool{false, true} {
+				name := "canceled"
+				if expired {
+					name = "deadline"
+				}
+				t.Run(string(mode)+"/"+rpcType+"/"+name, func(t *testing.T) {
+					ci := fake.NewClientset()
+					i := auth.NewInterceptor(auth.NewAuthenticator(ci), mode)
+					ctx, cancel := context.WithCancel(context.Background())
+					cancel()
+					wantCode := codes.Canceled
+					if expired {
+						ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+						defer cancel()
+						wantCode = codes.DeadlineExceeded
+					}
+					called := false
+					var err error
+					if rpcType == "unary" {
+						_, err = i.Unary()(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/telepresence.manager.Manager/LookupDNS"},
+							func(context.Context, any) (any, error) {
+								called = true
+								return nil, nil
+							})
+					} else {
+						err = i.Stream()(nil, &fakeServerStream{ctx: ctx}, &grpc.StreamServerInfo{FullMethod: "/telepresence.manager.Manager/WatchAgentPods"},
+							func(any, grpc.ServerStream) error {
+								called = true
+								return nil
+							})
+					}
+					assert.Equal(t, wantCode, status.Code(err))
+					assert.False(t, called)
+					assert.Empty(t, ci.Actions())
+				})
+			}
+		}
+	}
+}
+
+func TestInterceptorCanceledAuthenticationWait(t *testing.T) {
+	for _, mode := range []auth.Mode{auth.ModePermissive, auth.ModeEnforcing} {
+		for _, rpcType := range []string{"unary", "stream"} {
+			for _, expired := range []bool{false, true} {
+				name := "canceled"
+				if expired {
+					name = "deadline"
+				}
+				t.Run(string(mode)+"/"+rpcType+"/"+name, func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						ci := fake.NewClientset()
+						started := make(chan struct{})
+						release := make(chan struct{})
+						k8sapi.InstallFakeTokenReviews(ci, func(string, []string) *authnv1.TokenReviewStatus {
+							close(started)
+							<-release
+							return authenticatedStatus("user", "uid")
+						})
+						buf := &bytes.Buffer{}
+						ctx, cancel := context.WithCancel(loggingContext(buf))
+						defer cancel()
+						wantCode := codes.Canceled
+						if expired {
+							ctx, cancel = context.WithTimeout(ctx, time.Second)
+							defer cancel()
+							wantCode = codes.DeadlineExceeded
+						} else {
+							go func() {
+								<-started
+								cancel()
+							}()
+						}
+						ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("authorization", "Bearer secret-token"))
+						i := auth.NewInterceptor(auth.NewAuthenticator(ci), mode)
+						called := false
+						var err error
+						if rpcType == "unary" {
+							_, err = i.Unary()(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/telepresence.manager.Manager/LookupDNS"},
+								func(context.Context, any) (any, error) {
+									called = true
+									return nil, nil
+								})
+						} else {
+							err = i.Stream()(nil, &fakeServerStream{ctx: ctx}, &grpc.StreamServerInfo{FullMethod: "/telepresence.manager.Manager/WatchAgentPods"},
+								func(any, grpc.ServerStream) error {
+									called = true
+									return nil
+								})
+						}
+						close(release)
+						synctest.Wait()
+						assert.Equal(t, wantCode, status.Code(err))
+						assert.False(t, called)
+						assert.NotContains(t, buf.String(), "token authentication unavailable")
+						assert.NotContains(t, buf.String(), "secret-token")
+					})
+				})
+			}
+		}
+	}
 }
 
 func TestInterceptor_LogsNeverContainToken(t *testing.T) {

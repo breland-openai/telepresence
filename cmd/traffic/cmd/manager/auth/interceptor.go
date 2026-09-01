@@ -30,8 +30,8 @@ const unauthenticatedMessage = "this traffic-manager requires an authenticated c
 
 // Interceptor authenticates bearer tokens on incoming gRPC calls. Its behavior is
 // governed by a Mode: ModeDisabled skips authentication entirely, ModePermissive
-// authenticates but never rejects a call, and ModeEnforcing rejects calls that
-// lack a valid token.
+// authenticates without rejecting failed authentication, and ModeEnforcing rejects
+// calls that lack a valid token. Canceled calls never reach application handlers.
 type Interceptor struct {
 	auth *Authenticator
 	mode Mode
@@ -46,6 +46,9 @@ func NewInterceptor(a *Authenticator, mode Mode) *Interceptor {
 // Unary returns a grpc.UnaryServerInterceptor that authenticates the call.
 func (i *Interceptor) Unary() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
 		if i.mode == ModeDisabled || skipAuth(info.FullMethod) {
 			return handler(ctx, req)
 		}
@@ -60,6 +63,9 @@ func (i *Interceptor) Unary() grpc.UnaryServerInterceptor {
 // Stream returns a grpc.StreamServerInterceptor that authenticates the call.
 func (i *Interceptor) Stream() grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if err := ss.Context().Err(); err != nil {
+			return status.FromContextError(err).Err()
+		}
 		if i.mode == ModeDisabled || skipAuth(info.FullMethod) {
 			return handler(srv, ss)
 		}
@@ -76,9 +82,9 @@ func skipAuth(method string) bool {
 }
 
 // authenticate reads the bearer token from ctx's incoming metadata and returns a context carrying
-// the resulting Principal. In ModePermissive, failures are logged and never fatal to the call. In
-// ModeEnforcing, a missing or invalid token is rejected and an infrastructure failure is reported
-// as Unavailable.
+// the resulting Principal. In ModePermissive, authentication failures are logged but allowed.
+// In ModeEnforcing, missing or invalid tokens are rejected and infrastructure failures return
+// Unavailable. A canceled authentication wait returns the caller's context status in either mode.
 func (i *Interceptor) authenticate(ctx context.Context, method string) (context.Context, error) {
 	enforcing := i.mode == ModeEnforcing
 	token, present := bearerTokenFrom(ctx)
@@ -94,6 +100,9 @@ func (i *Interceptor) authenticate(ctx context.Context, method string) (context.
 		return ctx, nil
 	}
 	p, err := i.auth.Authenticate(ctx, token)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctx, status.FromContextError(ctxErr).Err()
+	}
 	switch {
 	case err == nil:
 		return WithPrincipal(ctx, p), nil

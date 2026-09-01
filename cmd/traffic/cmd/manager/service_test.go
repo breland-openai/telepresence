@@ -1262,7 +1262,7 @@ matchExpressions:
 	}
 	s := server.New(ctx)
 	g := log.NewGroup(ctx)
-	mgr, err := NewService(ctx, g, configWatcher)
+	mgr, err := NewService(ctx, g, configWatcher, k8sapi.GetK8sInterface(ctx))
 	if err != nil {
 		t.Fatalf("failed to build manager: %v", err)
 	}

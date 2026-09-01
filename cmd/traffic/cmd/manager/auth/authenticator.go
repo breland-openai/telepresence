@@ -30,8 +30,9 @@ const (
 // Authenticator validates bearer tokens using cached Kubernetes TokenReviews, or,
 // first, a store of tokens minted by the x509 auth listener.
 type Authenticator struct {
-	token  authenticator.Token
-	minted *MintedTokens
+	token   authenticator.Token
+	minted  *MintedTokens
+	metrics *tokenReviewMetrics
 }
 
 // Option configures an Authenticator constructed by NewAuthenticator.
@@ -47,8 +48,10 @@ func WithMintedTokens(m *MintedTokens) Option {
 
 // NewAuthenticator creates an Authenticator that validates tokens with the TokenReview API of ci.
 func NewAuthenticator(ci kubernetes.Interface, opts ...Option) *Authenticator {
+	metrics := newTokenReviewMetrics()
 	a := &Authenticator{
-		token: cache.New(&tokenReviewer{client: ci}, true, successCacheTTL, failureCacheTTL),
+		token:   cache.New(&tokenReviewer{client: ci, metrics: metrics}, true, successCacheTTL, failureCacheTTL),
+		metrics: metrics,
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -64,20 +67,12 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (*Princi
 			return p, nil
 		}
 	}
-	resp, ok, err := a.token.AuthenticateToken(authenticator.WithAudiences(ctx, authenticator.Audiences{agentconfig.ManagerTokenAudience}), token)
+	resp, ok, err := a.token.AuthenticateToken(ctx, token)
 	if err != nil {
 		return nil, fmt.Errorf("token review: %w", err)
 	}
 	if !ok {
-		// The token may be a user/client token, valid against the API server's own
-		// audience rather than the manager's. Retry without an audience constraint.
-		resp, ok, err = a.token.AuthenticateToken(ctx, token)
-		if err != nil {
-			return nil, fmt.Errorf("token review: %w", err)
-		}
-		if !ok {
-			return nil, ErrInvalidToken
-		}
+		return nil, ErrInvalidToken
 	}
 	return principalFromInfo(resp.User), nil
 }
@@ -103,17 +98,34 @@ func principalFromInfo(info user.Info) *Principal {
 
 // tokenReviewer implements authenticator.Token by delegating to the Kubernetes TokenReview API.
 type tokenReviewer struct {
-	client kubernetes.Interface
+	client  kubernetes.Interface
+	metrics *tokenReviewMetrics
 }
 
 func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+	resp, ok, err := t.review(ctx, token, []string{agentconfig.ManagerTokenAudience}, "manager")
+	if err != nil || ok {
+		return resp, ok, err
+	}
+	// API-audience client credentials share one cached decision with the manager-audience attempt.
+	auds, _ := authenticator.AudiencesFrom(ctx)
+	return t.review(ctx, token, auds, "api")
+}
+
+func (t *tokenReviewer) review(ctx context.Context, token string, audiences []string, audienceLabel string) (*authenticator.Response, bool, error) {
 	review := &authenticationv1.TokenReview{
-		Spec: authenticationv1.TokenReviewSpec{Token: token},
+		Spec: authenticationv1.TokenReviewSpec{Token: token, Audiences: audiences},
 	}
-	if auds, ok := authenticator.AudiencesFrom(ctx); ok {
-		review.Spec.Audiences = auds
-	}
+	start := time.Now()
 	result, err := t.client.AuthenticationV1().TokenReviews().Create(ctx, review, metav1.CreateOptions{})
+	outcome := "error"
+	if err == nil {
+		outcome = "rejected"
+		if result.Status.Authenticated {
+			outcome = "authenticated"
+		}
+	}
+	t.metrics.observe(audienceLabel, outcome, time.Since(start))
 	if err != nil {
 		return nil, false, err
 	}

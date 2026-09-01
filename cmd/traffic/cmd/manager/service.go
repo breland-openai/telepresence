@@ -26,6 +26,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/yaml"
 
 	"github.com/telepresenceio/clog"
@@ -73,6 +74,7 @@ type service struct {
 	state              *state.State
 	clusterInfo        cluster.Info
 	configWatcher      config.Watcher
+	authenticator      *auth.Authenticator
 	authorizer         *auth.Authorizer
 	authMode           auth.Mode
 	activeHttpRequests int32
@@ -97,7 +99,7 @@ type service struct {
 	quicDiscovery *quictunnel.Discovery
 
 	// mintedTokens holds the bearer tokens the x509 auth listener has issued, shared
-	// with the Authenticator constructed in serveHTTP so a token minted there is
+	// with the Authenticator so a token minted there is
 	// accepted on the regular gRPC channel. It exists regardless of whether the
 	// listener is enabled; an always-empty store is harmless.
 	mintedTokens *auth.MintedTokens
@@ -126,13 +128,14 @@ func checkCompat(ctx context.Context, name, requiredVersion string) error {
 	return nil
 }
 
-func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher) (Service, error) {
+func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, tokenReviewClient kubernetes.Interface) (Service, error) {
 	ret := &service{
 		id:            uuid.New().String(),
 		configWatcher: configWatcher,
 		authorizer:    auth.NewAuthorizer(k8sapi.GetK8sInterface(ctx)),
 		mintedTokens:  auth.NewMintedTokens(),
 	}
+	ret.authenticator = auth.NewAuthenticator(tokenReviewClient, auth.WithMintedTokens(ret.mintedTokens))
 
 	// These are context-dependent, so build them once the pool is up
 	var err error
