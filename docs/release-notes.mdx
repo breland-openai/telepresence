@@ -9,6 +9,12 @@ import { Note, Title, Body } from '@site/src/components/ReleaseNotes'
 # Telepresence Release Notes
 ## Version 2.32.0
 <Note>
+	<Title type="bugfix">Recover DNS after interrupted root daemon sessions</Title>
+	<Body>
+On Linux, root daemon startup removes recognized stale DNS redirects to unused local UDP endpoints before cluster authentication needs DNS. Reconnecting also waits for the previous session's workers and routing cleanup to finish, including when session initialization fails.
+  </Body>
+</Note>
+<Note>
 	<Title type="bugfix">Recover promptly from stalled manager sessions</Title>
 	<Body>
 Manager keepalive failures now use the existing session repair path instead of ending the client session. Expired sessions recover immediately, while repeated transient failures trigger repair without dropping active intercepts.
