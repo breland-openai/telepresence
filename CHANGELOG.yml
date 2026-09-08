@@ -28,6 +28,13 @@ items:
     date: (TBD)
     notes:
       - type: bugfix
+        title: Recover DNS after interrupted root daemon sessions
+        body: >-
+          On Linux, root daemon startup removes recognized stale DNS redirects
+          to unused local UDP endpoints before cluster authentication needs DNS.
+          Reconnecting also waits for the previous session's workers and routing
+          cleanup to finish, including when session initialization fails.
+      - type: bugfix
         title: Recover promptly from stalled manager sessions
         body: >-
           Manager keepalive failures now use the existing session repair path

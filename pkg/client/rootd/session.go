@@ -1584,15 +1584,24 @@ func (s *session) hasPodConnectivity(info *manager.ClusterInfo) bool {
 	}
 }
 
-func (s *session) run(initErrs chan<- error) {
+func (s *session) run(initErrs chan<- error, cancel context.CancelCauseFunc) {
+	s.runWithStart(initErrs, cancel, func(g log.Group) error { return s.Start(g, 0) })
+}
+
+func (s *session) runWithStart(initErrs chan<- error, cancel context.CancelCauseFunc, start func(log.Group) error) {
 	started := time.Now()
 	defer func() {
 		clog.Info(s, "-- session ended")
 	}()
 	g := log.NewGroup(s)
-	if err := s.Start(g, 0); err != nil {
+	if err := start(g); err != nil {
 		defer close(initErrs)
 		initErrs <- err
+		cancel(fmt.Errorf("root daemon session initialization failed: %w", err))
+		// Start can fail after launching DNS and VIF workers. Their teardown
+		// must finish before the service releases this attempt's barrier.
+		_ = g.Wait()
+		s.stop()
 		return
 	}
 	close(initErrs)
