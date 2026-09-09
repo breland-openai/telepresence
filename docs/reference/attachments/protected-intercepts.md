@@ -22,12 +22,14 @@ A protected intercept must use:
   The HTTP header name is case-insensitive; the value is an exact match.
 - One HTTP target port carried over TCP, with no additional header or path filters,
   extra intercepted ports, wiretap, or container replacement.
-- An [authenticated client session](../authentication.md), including in permissive
-  authentication mode. The key selects traffic; it is not an authentication credential.
-  It is stored in a Kubernetes ConfigMap, so do not use it to carry a secret.
 - A pod selector when targeting a Kubernetes Service. Multiple selected workloads can
   participate in the same intercept; the manager requires route protection from the
   selected pods instead of assuming that one healthy replica is enough.
+
+The intercept uses the existing Telepresence session and the manager's configured
+[authentication mode](../authentication.md); there is no additional workstation
+credential. The routing key selects traffic and is stored in a Kubernetes ConfigMap,
+so do not use it to carry a secret.
 
 In a namespace with durable routing enabled, an intercept using this header in an
 unsupported filter combination is rejected. Intercepts using other headers retain
@@ -88,7 +90,7 @@ destination; it may close during a disruption and must be reconnected by its cli
 
 | Helm value | Default | Meaning |
 |---|---|---|
-| `routeIntent.enabled` | `false` | Stores and distributes desired routes in the traffic-manager namespace. Requires permissive or enforcing [authentication](../authentication.md). |
+| `routeIntent.enabled` | `false` | Stores and distributes desired routes in the traffic-manager namespace. Uses permissive or enforcing [authentication](../authentication.md) to identify traffic-agents and gateway controllers. Permissive mode does not require a developer credential. |
 | `routeIntent.namespaces` | `[]` | Limits the feature to the listed managed workload namespaces. Empty means all namespaces already managed by the traffic-manager. |
 | `routeIntent.requireAuthoritativeAgents` | `false` | Configures injected traffic-agents to require authoritative route state and apply strict routing. Enable only after the serving managers support the protocol; refresh workload pods to install the configured agent. |
 | `routeIntent.controllerServiceAccounts` | `[]` | Full authenticated service account identities allowed to watch routes globally and acknowledge gateway configuration. With an empty list no gateway controller can do so. |

@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -142,27 +141,6 @@ type Kubeconfig struct {
 	EffectiveFlagMap map[string]string
 	ClientConfig     clientcmd.ClientConfig
 	RestConfig       *rest.Config
-
-	// ManagerTokenFile is only used on the traffic-manager gRPC connection. It
-	// must never be installed in RestConfig or used for Kubernetes port-forwards.
-	ManagerTokenFile               string
-	ManagerTokenFileSet            bool
-	managerTokenCallback           managerTokenSource
-	managerTokenCallbackNegotiated bool
-	devboxManagerPolicyOnce        sync.Once
-	devboxManagerPolicyLoader      func() *devboxManagerPolicy
-	devboxManagerPolicyValue       *devboxManagerPolicy
-	devboxManagerPodVerifier       func(context.Context, string, string, string) error
-	devboxManagerTokenOnce         sync.Once
-	devboxManagerTokens            *devboxManagerTokenBroker
-}
-
-// ManagerTokenFileMatchesRequest allows an implicit CLI command to omit the
-// current connection's manager credential. An explicitly different value must
-// establish a new connection instead of changing an existing manager identity.
-func (kf *Kubeconfig) ManagerTokenFileMatchesRequest(environment map[string]string) bool {
-	value, supplied := environment[ManagerTokenFileEnv]
-	return !supplied || (kf != nil && kf.ManagerTokenFileSet && kf.ManagerTokenFile == value)
 }
 
 func (kf *Kubeconfig) ToRESTConfig() (*rest.Config, error) {
@@ -232,24 +210,13 @@ func NewKubeconfig(c context.Context, tpClientConfigIsFinal bool, flagMap map[st
 	if err != nil {
 		return nil, err
 	}
-	kc, err := newKubeconfig(c, tpClientConfigIsFinal, flagMap, flagMap, managerNamespaceOverride, configFlags, kubeconfigData)
-	if kc != nil {
-		kc.ManagerTokenFile, kc.ManagerTokenFileSet = os.LookupEnv(ManagerTokenFileEnv)
-	}
-	return kc, err
+	return newKubeconfig(c, tpClientConfigIsFinal, flagMap, flagMap, managerNamespaceOverride, configFlags, kubeconfigData)
 }
 
 func DaemonKubeconfig(c context.Context, cr *connector.ConnectRequest) (*Kubeconfig, error) {
-	managerTokenFile, managerTokenFileSet := cr.Environment[ManagerTokenFileEnv]
-	setManagerTokenFile := func(kc *Kubeconfig, err error) (*Kubeconfig, error) {
-		if kc != nil {
-			kc.ManagerTokenFile, kc.ManagerTokenFileSet = managerTokenFile, managerTokenFileSet
-		}
-		return kc, err
-	}
 	if cr.IsPodDaemon {
 		ke, err := NewInClusterConfig(c, cr.KubeFlags)
-		return setManagerTokenFile(ke, err)
+		return ke, err
 	}
 	flagMap := cr.KubeFlags
 	if proc.RunningInContainer() {
@@ -257,11 +224,6 @@ func DaemonKubeconfig(c context.Context, cr *connector.ConnectRequest) (*Kubecon
 		delete(cr.Environment, "KUBECONFIG")
 	}
 	for k, v := range cr.Environment {
-		if k == ManagerTokenFileEnv || k == "-"+ManagerTokenFileEnv {
-			// This credential belongs to this manager connection. Do not set
-			// a daemon-wide value that a subsequent cluster could inherit.
-			continue
-		}
 		if k[0] == '-' {
 			_ = os.Unsetenv(k[1:])
 		} else {
@@ -272,8 +234,7 @@ func DaemonKubeconfig(c context.Context, cr *connector.ConnectRequest) (*Kubecon
 	if err != nil {
 		return nil, err
 	}
-	kc, err := newKubeconfig(c, false, cr.KubeFlags, flagMap, cr.ManagerNamespace, configFlags, cr.KubeconfigData)
-	return setManagerTokenFile(kc, err)
+	return newKubeconfig(c, false, cr.KubeFlags, flagMap, cr.ManagerNamespace, configFlags, cr.KubeconfigData)
 }
 
 // AppendKubeFlags appends the flags in the given map to the given slice in the form of

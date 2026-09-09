@@ -175,13 +175,6 @@ type Env struct {
 	// AuthenticationMode controls how strictly the traffic-manager enforces
 	// caller authentication (disabled, permissive, or enforcing).
 	AuthenticationMode auth.Mode `default:"permissive"`
-	// Optional HTTPS SelfSubjectReview endpoint for externally delegated client identities.
-	AuthDelegatedSelfSubjectReviewURL string `env:"AUTH_DELEGATED_SELF_SUBJECT_REVIEW_URL"`
-	// Optional vetted audience clients may use solely to authenticate to this manager.
-	AuthDelegatedDevboxProxyAudience string `env:"AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE"`
-	// Entra tenant and exact DNS authorities trusted to verify the configured audience.
-	AuthDelegatedDevboxProxyTenantID    string   `env:"AUTH_DELEGATED_DEVBOX_PROXY_TENANT_ID"`
-	AuthDelegatedDevboxProxyAuthorities []string `env:"AUTH_DELEGATED_DEVBOX_PROXY_AUTHORITIES" envSeparator:" "`
 
 	// Anonymous usage reporting. The manager produces reports whose only
 	// identifier is the UUID stored in the traffic-manager-install-id
@@ -359,11 +352,6 @@ func LoadEnv(ctx context.Context, envMap map[string]string) (context.Context, er
 	}
 	if envStruct.RouteIntentEnabled && envStruct.AuthenticationMode == auth.ModeDisabled {
 		return ctx, fmt.Errorf("ROUTE_INTENT_ENABLED requires authentication mode permissive or enforcing")
-	}
-	if err := auth.ValidateDelegatedDevboxProxyConfig(envStruct.AuthenticationMode,
-		envStruct.AuthDelegatedSelfSubjectReviewURL, envStruct.AuthDelegatedDevboxProxyAudience,
-		envStruct.AuthDelegatedDevboxProxyTenantID, envStruct.AuthDelegatedDevboxProxyAuthorities); err != nil {
-		return ctx, fmt.Errorf("AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE: %w", err)
 	}
 	return WithEnv(ctx, envStruct), nil
 }

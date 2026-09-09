@@ -55,10 +55,8 @@ type service struct {
 	// The quit function that quits the server.
 	quit func(sessionIsLocked bool)
 
-	clientConfigLock         sync.Mutex
-	clientConfig             clientcmd.ClientConfig
-	managerTokenCallbackLock sync.Mutex
-	managerTokenCallbacks    map[string]managerTokenCallback
+	clientConfigLock sync.Mutex
+	clientConfig     clientcmd.ClientConfig
 
 	sessionLock    sync.RWMutex
 	session        userd.Session

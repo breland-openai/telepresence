@@ -16,7 +16,8 @@ loaded its initial routing state.
 - Ask your administrator whether protected local routing is enabled for your workload's
   namespace. It is off by default and requires compatible clients, traffic-managers and
   traffic-agents. If you use an external gateway, it must support the same routing mode.
-- Connect with an [authenticated client session](../reference/authentication.md).
+- Connect as usual; the intercept uses the existing Telepresence session and
+  does not need a separate workstation credential.
 - Use one HTTP Service port with a pod selector. This example uses a named Service
   port `http` with `appProtocol: http`, and a local application listening on port `8080`.
   See [supported protocols and gateway limitations](../reference/attachments/protected-intercepts.md#protocol-and-gateway-limits)

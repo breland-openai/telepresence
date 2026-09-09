@@ -2,7 +2,6 @@ package manager
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	stderrors "errors"
 	"fmt"
@@ -38,6 +37,8 @@ const (
 	routeIntentPollInterval = 2 * time.Second
 	routeIntentReadTimeout  = 5 * time.Second
 )
+
+var errAmbiguousDurableRoute = stderrors.New("multiple durable routes exist for this session and intercept name")
 
 type routeIntentManager struct {
 	store          routeintent.Store
@@ -94,14 +95,14 @@ func (s *service) reconnectMayUseDurableRoutes(info *rpc.ReconnectClientRequest)
 		slices.ContainsFunc(info.GetIntercepts(), func(info *rpc.InterceptInfo) bool { return s.usesDurableRoute(info.GetSpec()) })
 }
 
-func (s *service) shouldLookupDurableRemoval(ctx context.Context, clientNamespace string, live *state.Intercept, incarnation string) bool {
+func (s *service) shouldLookupDurableRemoval(clientNamespace string, live *state.Intercept, incarnation string) bool {
 	if live != nil {
 		return s.routeIntents.managesNamespace(live.Spec.GetNamespace()) && (live.RouteIncarnation != "" || incarnation != "")
 	}
 	// A missing legacy request has no target namespace in this RPC. A scoped
 	// manager only consults durable state for a scoped client, or when an
-	// authenticated cross-namespace caller supplies an actual incarnation.
-	return s.routeIntents.managesNamespace(clientNamespace) || (s.routeIntents != nil && incarnation != "" && auth.PrincipalFrom(ctx) != nil)
+	// updated cross-namespace client supplies an actual incarnation.
+	return s.routeIntents.managesNamespace(clientNamespace) || (s.routeIntents != nil && incarnation != "")
 }
 
 func (m *routeIntentManager) run(ctx context.Context) error {
@@ -140,6 +141,9 @@ func (m *routeIntentManager) refresh(ctx context.Context) {
 	readCtx, cancel := context.WithTimeout(ctx, routeIntentReadTimeout)
 	defer cancel()
 	records, err := m.store.List(readCtx)
+	if err == nil {
+		records, err = deduplicateDurableRouteRecords(records)
+	}
 	if ctx.Err() != nil {
 		// A closing individual watcher cannot revoke authority for everyone.
 		return
@@ -200,28 +204,40 @@ func (m *routeIntentManager) lockOwner(ctx context.Context, owner string) (func(
 	}
 }
 
-func durableRouteOwner(ctx context.Context, session *rpc.SessionInfo) (string, error) {
-	principal := auth.PrincipalFrom(ctx)
-	if principal == nil || principal.Username == "" {
-		if auth.AuthUnavailable(ctx) {
-			return "", status.Error(codes.Unavailable, "unable to authenticate durable route ownership")
-		}
-		return "", status.Error(codes.Unauthenticated, "durable routes require an authenticated client")
-	}
+func durableRouteOwner(session *rpc.SessionInfo) (string, error) {
 	sid := session.GetSessionId()
-	if sid == "" || strings.Contains(sid, "/") {
+	if !validDurableRouteClientSession(sid) {
 		return "", status.Error(codes.InvalidArgument, "durable routes require a valid client session")
 	}
-	hash := sha256.Sum256([]byte(principal.Username + "\x00" + principal.UID))
 	// A ReconnectClient request carries the same client session UUID across
 	// manager restart. Separating intentional new sessions also isolates a stale
-	// departure from a newly connected instance owned by the same principal.
-	return hex.EncodeToString(hash[:]) + "/" + sid, nil
+	// departure from a newly connected instance on the same workstation.
+	return "session/" + sid, nil
+}
+
+func validDurableRouteClientSession(sid string) bool {
+	return sid != "" && !strings.Contains(sid, "/") && !strings.HasPrefix(sid, state.AgentSessionIDPrefix)
+}
+
+func durableRouteOwnerSession(owner string) string {
+	prefix, sid, ok := strings.Cut(owner, "/")
+	if !ok || !validDurableRouteClientSession(sid) {
+		return ""
+	}
+	if prefix == "session" {
+		return sid
+	}
+	if len(prefix) == 64 {
+		if _, err := hex.DecodeString(prefix); err == nil {
+			return sid
+		}
+	}
+	return ""
 }
 
 func durableRouteInterceptID(record routeintent.Record) string {
-	_, sid, ok := strings.Cut(record.Key.Owner, "/")
-	if !ok {
+	sid := durableRouteOwnerSession(record.Key.Owner)
+	if sid == "" {
 		return ""
 	}
 	return sid + ":" + record.Key.Name
@@ -229,6 +245,8 @@ func durableRouteInterceptID(record routeintent.Record) string {
 
 func durableRouteError(err error) error {
 	switch {
+	case stderrors.Is(err, errAmbiguousDurableRoute):
+		return status.Error(codes.FailedPrecondition, errAmbiguousDurableRoute.Error())
 	case stderrors.Is(err, routeintent.ErrConflict):
 		return status.Error(codes.FailedPrecondition, "durable route incarnation or revision has changed")
 	case stderrors.Is(err, routeintent.ErrInvalid):
@@ -238,6 +256,9 @@ func durableRouteError(err error) error {
 	case stderrors.Is(err, context.Canceled), stderrors.Is(err, context.DeadlineExceeded):
 		return status.FromContextError(err).Err()
 	default:
+		if _, ok := status.FromError(err); ok {
+			return err
+		}
 		return status.Error(codes.Unavailable, "durable route store is unavailable")
 	}
 }
@@ -246,13 +267,17 @@ func (m *routeIntentManager) create(ctx context.Context, key routeintent.Key, in
 	if incarnation == "" {
 		return routeintent.Record{}, status.Error(codes.FailedPrecondition, "this manager requires a client that supplies durable route incarnations")
 	}
-	current, err := m.store.Get(ctx, key)
+	current, err := m.getOwned(ctx, key)
 	switch {
 	case stderrors.Is(err, routeintent.ErrNotFound):
 		current, err = m.store.Create(ctx, key, incarnation, predicate, time.Time{})
 	case err != nil:
 	case current.State == routeintent.Removed:
-		current, err = m.store.Transition(ctx, key, current.Revision, routeintent.Change{State: routeintent.Desired, Incarnation: incarnation, Predicate: predicate})
+		if err = m.removeOwned(ctx, current, current.Revision.Incarnation); err == nil {
+			if current, err = m.getOwned(ctx, key); err == nil {
+				current, err = m.store.Transition(ctx, current.Key, current.Revision, routeintent.Change{State: routeintent.Desired, Incarnation: incarnation, Predicate: predicate})
+			}
+		}
 	case current.Revision.Incarnation != incarnation || current.Predicate != predicate:
 		err = routeintent.ErrConflict
 	}
@@ -277,26 +302,130 @@ func (m *routeIntentManager) remove(ctx context.Context, record routeintent.Reco
 	return nil
 }
 
+func (m *routeIntentManager) removeOwned(ctx context.Context, record routeintent.Record, incarnation string) error {
+	if incarnation == "" || record.Revision.Incarnation != incarnation {
+		return m.remove(ctx, record, incarnation)
+	}
+	records, err := m.store.List(ctx)
+	if err != nil {
+		return durableRouteError(err)
+	}
+	if err = m.remove(ctx, record, incarnation); err != nil {
+		return err
+	}
+	sid := durableRouteOwnerSession(record.Key.Owner)
+	for _, equivalent := range records {
+		if equivalent.Key != record.Key && equivalent.Key.Namespace == record.Key.Namespace && equivalent.Key.Name == record.Key.Name &&
+			durableRouteOwnerSession(equivalent.Key.Owner) == sid && equivalent.Revision.Incarnation == incarnation &&
+			equivalent.Predicate == record.Predicate && equivalent.State == routeintent.Desired {
+			if err = m.remove(ctx, equivalent, incarnation); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (m *routeIntentManager) findOwned(ctx context.Context, owner, name string) (*routeintent.Record, error) {
 	records, err := m.store.List(ctx)
 	if err != nil {
 		return nil, durableRouteError(err)
 	}
-	var result *routeintent.Record
+	result, err := findOwnedRouteRecord(records, owner, name, m.managesNamespace)
+	if err != nil {
+		return nil, durableRouteError(err)
+	}
+	return result, nil
+}
+
+func (m *routeIntentManager) getOwned(ctx context.Context, key routeintent.Key) (routeintent.Record, error) {
+	// One Kubernetes list observes both possible storage keys in the same snapshot.
+	records, err := m.store.List(ctx)
+	if err != nil {
+		return routeintent.Record{}, err
+	}
+	match, err := findOwnedRouteRecord(records, key.Owner, key.Name, func(namespace string) bool { return namespace == key.Namespace })
+	if err != nil {
+		return routeintent.Record{}, err
+	}
+	if match == nil {
+		return routeintent.Record{}, routeintent.ErrNotFound
+	}
+	return *match, nil
+}
+
+func findOwnedRouteRecord(records []routeintent.Record, owner, name string, managesNamespace func(string) bool) (*routeintent.Record, error) {
+	sid := durableRouteOwnerSession(owner)
+	if sid == "" {
+		return nil, routeintent.ErrInvalid
+	}
+	matches := make([]routeintent.Record, 0)
 	for _, record := range records {
-		if !m.managesNamespace(record.Key.Namespace) || record.Key.Owner != owner || record.Key.Name != name {
-			continue
+		if managesNamespace(record.Key.Namespace) && durableRouteOwnerSession(record.Key.Owner) == sid && record.Key.Name == name {
+			matches = append(matches, record)
 		}
+	}
+	matches, err := deduplicateDurableRouteRecords(matches)
+	if err != nil {
+		return nil, err
+	}
+	var result *routeintent.Record
+	for _, record := range matches {
 		// The existing live protocol forbids duplicate intercept names within a
 		// session, even across namespaces; historical tombstones can coexist.
 		if result == nil || (result.State == routeintent.Removed && record.State == routeintent.Desired) {
 			recordCopy := record
 			result = &recordCopy
 		} else if result.State == routeintent.Desired && record.State == routeintent.Desired {
-			return nil, status.Error(codes.FailedPrecondition, "multiple durable routes exist for this session and intercept name")
+			return nil, errAmbiguousDurableRoute
 		}
 	}
 	return result, nil
+}
+
+// A removal wins over an equivalent desired copy. Different active incarnations
+// cannot be safely ordered across the two storage keys.
+func deduplicateDurableRouteRecords(records []routeintent.Record) ([]routeintent.Record, error) {
+	canonicalKey := func(key routeintent.Key) routeintent.Key {
+		if sid := durableRouteOwnerSession(key.Owner); sid != "" {
+			key.Owner = "session/" + sid
+		}
+		return key
+	}
+	canonical := make(map[routeintent.Key]routeintent.Record)
+	selected := make(map[routeintent.Key]routeintent.Record)
+	for _, record := range records {
+		key := canonicalKey(record.Key)
+		if key == record.Key {
+			canonical[key], selected[key] = record, record
+		}
+	}
+	for _, record := range records {
+		key := canonicalKey(record.Key)
+		current, exists := canonical[key]
+		if !exists || key == record.Key || (current.State == routeintent.Removed && record.State == routeintent.Removed) {
+			continue
+		}
+		if current.State == routeintent.Desired && record.State == routeintent.Removed && current.Revision.Incarnation != record.Revision.Incarnation {
+			continue
+		}
+		if current.Revision.Incarnation != record.Revision.Incarnation || current.Predicate != record.Predicate {
+			return nil, errAmbiguousDurableRoute
+		}
+		if record.State == routeintent.Removed && selected[key].State != routeintent.Removed {
+			selected[key] = record
+		}
+	}
+	out := make([]routeintent.Record, 0, len(records))
+	for _, record := range records {
+		key := canonicalKey(record.Key)
+		if replacement, exists := selected[key]; !exists {
+			out = append(out, record)
+		} else if key == record.Key {
+			out = append(out, replacement)
+		}
+	}
+	return out, nil
 }
 
 func usesLocalRoutingKey(spec *rpc.InterceptSpec) bool {
@@ -331,7 +460,7 @@ func (s *service) durableRestoredIntercepts(ctx context.Context, session *rpc.Se
 		}
 		if owner == "" {
 			var err error
-			if owner, err = durableRouteOwner(ctx, session); err != nil {
+			if owner, err = durableRouteOwner(session); err != nil {
 				return nil, err
 			}
 		}
@@ -343,7 +472,7 @@ func (s *service) durableRestoredIntercepts(ctx context.Context, session *rpc.Se
 			return nil, status.Error(codes.PermissionDenied, "the restored durable route does not belong to this client session")
 		}
 		key := routeintent.Key{Namespace: predicate.Namespace, Owner: owner, Name: original.Spec.Name}
-		current, err := s.routeIntents.store.Get(ctx, key)
+		current, err := s.routeIntents.getOwned(ctx, key)
 		if stderrors.Is(err, routeintent.ErrNotFound) {
 			return nil, status.Error(codes.FailedPrecondition, "a restored local routing key has no durable route")
 		}
@@ -363,8 +492,8 @@ func (s *service) durableRestoredIntercepts(ctx context.Context, session *rpc.Se
 	return out, nil
 }
 
-func (s *service) departDurableRoutes(ctx context.Context, session *rpc.SessionInfo) error {
-	owner, err := durableRouteOwner(ctx, session)
+func (s *service) departDurableRoutes(ctx context.Context, session *rpc.SessionInfo, client *state.ClientSession) error {
+	owner, err := durableRouteOwner(session)
 	if err != nil {
 		return err
 	}
@@ -373,12 +502,16 @@ func (s *service) departDurableRoutes(ctx context.Context, session *rpc.SessionI
 		return err
 	}
 	defer unlock()
+	if client != nil && client.CreatedByThisManager() && !s.routeIntents.managesNamespace(client.GetNamespace()) &&
+		!s.state.HasClientDurableIntercept(tunnel.SessionID(session.GetSessionId())) {
+		return nil
+	}
 	records, err := s.routeIntents.store.List(ctx)
 	if err != nil {
 		return durableRouteError(err)
 	}
 	for _, record := range records {
-		if s.routeIntents.managesNamespace(record.Key.Namespace) && record.Key.Owner == owner && record.State == routeintent.Desired {
+		if s.routeIntents.managesNamespace(record.Key.Namespace) && durableRouteOwnerSession(record.Key.Owner) == session.GetSessionId() && record.State == routeintent.Desired {
 			if err = s.routeIntents.remove(ctx, record, record.Revision.Incarnation); err != nil {
 				return err
 			}
@@ -708,6 +841,9 @@ func (s *service) AcknowledgeRouteIntents(ctx context.Context, request *rpc.Rout
 		return &empty.Empty{}, nil
 	}
 	records, err := s.routeIntents.store.List(ctx)
+	if err == nil {
+		records, err = deduplicateDurableRouteRecords(records)
+	}
 	if err != nil {
 		return nil, durableRouteError(err)
 	}

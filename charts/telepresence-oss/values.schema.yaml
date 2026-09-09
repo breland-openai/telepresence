@@ -829,28 +829,6 @@ properties:
               enforcing rejects unauthenticated or unauthorized calls.
             type: string
             enum: ["disabled", "permissive", "enforcing"]
-          delegatedSelfSubjectReviewURL:
-            description: Optional HTTPS Kubernetes SelfSubjectReview endpoint, configured together with the delegated audience, tenant, and exact DNS authorities.
-            type: string
-          delegatedDevboxProxyAudience:
-            description: >-
-              Optional canonical Entra application audience UUID advertised for manager-only
-              authentication when paired with its delegated endpoint, tenant, and exact DNS authorities.
-            type: string
-            pattern: '^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-          delegatedDevboxProxyTenantID:
-            description: Optional canonical Entra tenant UUID whose service principals the delegate verifies.
-            type: string
-            pattern: '^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-          delegatedDevboxProxyAuthorities:
-            description: Optional exact lowercase fully qualified DNS names authorized to receive the configured audience; no wildcard or port.
-            type: array
-            maxItems: 32
-            uniqueItems: true
-            items:
-              type: string
-              maxLength: 253
-              pattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
           x509:
             description: >-
               Client-certificate authentication: an additional, opt-in mechanism for

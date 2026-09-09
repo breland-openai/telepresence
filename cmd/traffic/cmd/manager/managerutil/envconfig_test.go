@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"net/netip"
-	"strings"
 	"testing"
 	"time"
 
@@ -284,52 +283,6 @@ func TestEnvconfigPreStopDrainTimeout(t *testing.T) {
 	env["AGENT_PRE_STOP_DRAIN_TIMEOUT"] = "-1s"
 	_, err = managerutil.LoadEnv(context.Background(), env)
 	require.ErrorContains(t, err, "AGENT_PRE_STOP_DRAIN_TIMEOUT must not be negative")
-}
-
-func TestEnvconfigDelegatedDevboxProxyAudience(t *testing.T) {
-	const staging = "11111111-1111-4111-8111-111111111111"
-	const production = "22222222-2222-4222-8222-222222222222"
-	const tenant = "33333333-3333-4333-8333-333333333333"
-	const stageHost = "staging.proxy.example.test"
-	const prodHost = "production.proxy.example.test"
-	const stageURL = "https://" + stageHost + "/clusters/staging/apis/authentication.k8s.io/v1/selfsubjectreviews"
-	const prodURL = "https://" + prodHost + "/clusters/staging/apis/authentication.k8s.io/v1/selfsubjectreviews"
-	for _, tc := range []struct{ name, mode, endpoint, audience, tenant, authorities, err string }{
-		{name: "default leaves advertisement off", mode: "permissive"},
-		{name: "URL alone fails closed", mode: "permissive", endpoint: prodURL, err: "together"},
-		{name: "staging permissive", mode: "permissive", endpoint: stageURL, audience: staging, tenant: tenant, authorities: stageHost + " secondary.proxy.example.test"},
-		{name: "production enforcing", mode: "enforcing", endpoint: prodURL, audience: production, tenant: tenant, authorities: prodHost},
-		{name: "missing endpoint", mode: "permissive", audience: staging, tenant: tenant, authorities: stageHost, err: "together"},
-		{name: "missing tenant", mode: "permissive", endpoint: stageURL, audience: staging, authorities: stageHost, err: "together"},
-		{name: "missing authorities", mode: "permissive", endpoint: stageURL, audience: staging, tenant: tenant, err: "together"},
-		{name: "mismatch", mode: "permissive", endpoint: prodURL, audience: staging, tenant: tenant, authorities: stageHost, err: "does not match"},
-		{name: "invalid UUID", mode: "enforcing", endpoint: stageURL, audience: "unexpected", tenant: tenant, authorities: stageHost, err: "canonical nonzero"},
-		{name: "disabled", mode: "disabled", endpoint: stageURL, audience: staging, tenant: tenant, authorities: stageHost, err: "authentication mode"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			env := map[string]string{
-				"REGISTRY": "ghcr.io/telepresenceio", "LOG_LEVEL": "info", "SERVER_PORT": "8081", "AUTHENTICATION_MODE": tc.mode,
-				"AUTH_DELEGATED_SELF_SUBJECT_REVIEW_URL": tc.endpoint, "AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE": tc.audience,
-				"AUTH_DELEGATED_DEVBOX_PROXY_TENANT_ID": tc.tenant, "AUTH_DELEGATED_DEVBOX_PROXY_AUTHORITIES": tc.authorities,
-			}
-			ctx, err := managerutil.LoadEnv(t.Context(), env)
-			if tc.err != "" {
-				require.ErrorContains(t, err, "AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE")
-				require.ErrorContains(t, err, tc.err)
-				return
-			}
-			require.NoError(t, err)
-			parsed := managerutil.GetEnv(ctx)
-			require.Equal(t, tc.endpoint, parsed.AuthDelegatedSelfSubjectReviewURL)
-			require.Equal(t, tc.audience, parsed.AuthDelegatedDevboxProxyAudience)
-			require.Equal(t, tc.tenant, parsed.AuthDelegatedDevboxProxyTenantID)
-			if tc.authorities != "" {
-				require.Equal(t, strings.Split(tc.authorities, " "), parsed.AuthDelegatedDevboxProxyAuthorities)
-			} else {
-				require.Empty(t, parsed.AuthDelegatedDevboxProxyAuthorities)
-			}
-		})
-	}
 }
 
 func TestAuthoritativeRoutesRequireAgentInitContainer(t *testing.T) {

@@ -30,15 +30,11 @@ func (s *service) Status(ctx context.Context, _ *emptypb.Empty) (*rpc.DaemonStat
 	s.sessionLock.RLock()
 	defer s.sessionLock.RUnlock()
 	r := &rpc.DaemonStatus{
-		Managed:                       s.managed,
-		Version:                       client.VersionInfo(ctx),
-		SupportsManagerTokenCallback:  true,
-		SupportsNegotiatedDevboxProxy: true,
+		Managed: s.managed,
+		Version: client.VersionInfo(ctx),
 	}
 	if s.session != nil {
 		r.OutboundConfig = s.session.getNetworkConfig()
-		r.ManagerTokenCallbackActive = s.session.managerTokenCallbackActive
-		r.ManagerTokenCallbackId = s.session.managerTokenCallbackID
 		r.TunnelTransport = s.session.tunnelTransportRPC()
 		r.AgentTransports = s.session.agentTransportsRPC()
 	}
@@ -76,13 +72,11 @@ func (s *service) SetDNSMappings(ctx context.Context, req *rpc.SetDNSMappingsReq
 }
 
 func (s *service) Connect(ctx context.Context, info *rpc.NetworkConfig) (reply *rpc.DaemonStatus, err error) {
-	reply = &rpc.DaemonStatus{Version: client.VersionInfo(ctx), SupportsManagerTokenCallback: true, SupportsNegotiatedDevboxProxy: true}
+	reply = &rpc.DaemonStatus{Version: client.VersionInfo(ctx)}
 	for {
 		s.sessionLock.Lock()
 		if s.session != nil && s.session.Err() == nil {
 			reply.OutboundConfig = s.session.getNetworkConfig()
-			reply.ManagerTokenCallbackActive = s.session.managerTokenCallbackActive
-			reply.ManagerTokenCallbackId = s.session.managerTokenCallbackID
 			reply.TunnelTransport = s.session.tunnelTransportRPC()
 			reply.AgentTransports = s.session.agentTransportsRPC()
 			s.sessionLock.Unlock()
@@ -126,8 +120,6 @@ func (s *service) Connect(ctx context.Context, info *rpc.NetworkConfig) (reply *
 		client.ReloadLogLevel(sn)
 	}
 	reply.OutboundConfig = sn.getNetworkConfig()
-	reply.ManagerTokenCallbackActive = sn.managerTokenCallbackActive
-	reply.ManagerTokenCallbackId = sn.managerTokenCallbackID
 	// The QUIC dial (see session.startQuicTunnel) is still in flight at this point, so
 	// this is always "grpc" for a session just created by this call; callers that want
 	// the resolved transport re-check via the Status RPC.

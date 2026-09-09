@@ -2817,13 +2817,9 @@ type VersionInfo2 struct {
 	// that certificate, and receives a short-lived manager-issued bearer token
 	// to use as per-RPC authorization metadata. Only the traffic-manager
 	// populates this.
-	AuthX509Port uint32 `protobuf:"varint,5,opt,name=auth_x509_port,json=authX509Port,proto3" json:"auth_x509_port,omitempty"`
-	// Optional vetted Applied Devbox proxy audience for manager-only bearer
-	// credentials. It is never used to authenticate requests to Kubernetes.
-	// Empty preserves the client's existing manager authentication behavior.
-	AuthDevboxProxyAudience string `protobuf:"bytes,6,opt,name=auth_devbox_proxy_audience,json=authDevboxProxyAudience,proto3" json:"auth_devbox_proxy_audience,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	AuthX509Port  uint32 `protobuf:"varint,5,opt,name=auth_x509_port,json=authX509Port,proto3" json:"auth_x509_port,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VersionInfo2) Reset() {
@@ -2889,13 +2885,6 @@ func (x *VersionInfo2) GetAuthX509Port() uint32 {
 		return x.AuthX509Port
 	}
 	return 0
-}
-
-func (x *VersionInfo2) GetAuthDevboxProxyAudience() string {
-	if x != nil {
-		return x.AuthDevboxProxyAudience
-	}
-	return ""
 }
 
 // TunnelMessage is a message sent over a Tunnel. First byte indicates type of message
@@ -6195,14 +6184,13 @@ const file_manager_manager_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\")\n" +
 	"\x13TelepresenceAPIInfo\x12\x12\n" +
-	"\x04port\x18\x01 \x01(\x05R\x04port\"\xeb\x01\n" +
+	"\x04port\x18\x01 \x01(\x05R\x04port\"\xd0\x01\n" +
 	"\fVersionInfo2\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
 	"\x0eauth_supported\x18\x03 \x01(\bR\rauthSupported\x12#\n" +
 	"\rauth_required\x18\x04 \x01(\bR\fauthRequired\x12$\n" +
-	"\x0eauth_x509_port\x18\x05 \x01(\rR\fauthX509Port\x12;\n" +
-	"\x1aauth_devbox_proxy_audience\x18\x06 \x01(\tR\x17authDevboxProxyAudience\")\n" +
+	"\x0eauth_x509_port\x18\x05 \x01(\rR\fauthX509PortJ\x04\b\x06\x10\aR\x1aauth_devbox_proxy_audience\")\n" +
 	"\rTunnelMessage\x12\x18\n" +
 	"\apayload\x18\x01 \x01(\fR\apayload\"\xbd\x02\n" +
 	"\x12QuicTunnelEndpoint\x12\x18\n" +

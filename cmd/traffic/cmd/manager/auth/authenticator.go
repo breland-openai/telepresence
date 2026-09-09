@@ -30,10 +30,9 @@ const (
 // Authenticator validates bearer tokens using cached Kubernetes TokenReviews, or,
 // first, a store of tokens minted by the x509 auth listener.
 type Authenticator struct {
-	token     authenticator.Token
-	minted    *MintedTokens
-	metrics   *tokenReviewMetrics
-	delegated selfSubjectReviewer
+	token   authenticator.Token
+	minted  *MintedTokens
+	metrics *tokenReviewMetrics
 }
 
 // Option configures an Authenticator constructed by NewAuthenticator.
@@ -51,12 +50,12 @@ func WithMintedTokens(m *MintedTokens) Option {
 func NewAuthenticator(ci kubernetes.Interface, opts ...Option) *Authenticator {
 	metrics := newTokenReviewMetrics()
 	a := &Authenticator{
+		token:   cache.New(&tokenReviewer{client: ci, metrics: metrics}, true, successCacheTTL, failureCacheTTL),
 		metrics: metrics,
 	}
 	for _, opt := range opts {
 		opt(a)
 	}
-	a.token = cache.New(&tokenReviewer{client: ci, metrics: metrics, delegated: a.delegated}, true, successCacheTTL, failureCacheTTL)
 	return a
 }
 
@@ -99,9 +98,8 @@ func principalFromInfo(info user.Info) *Principal {
 
 // tokenReviewer implements authenticator.Token by delegating to the Kubernetes TokenReview API.
 type tokenReviewer struct {
-	client    kubernetes.Interface
-	metrics   *tokenReviewMetrics
-	delegated selfSubjectReviewer
+	client  kubernetes.Interface
+	metrics *tokenReviewMetrics
 }
 
 func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
@@ -111,20 +109,7 @@ func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*a
 	}
 	// API-audience client credentials share one cached decision with the manager-audience attempt.
 	auds, _ := authenticator.AudiencesFrom(ctx)
-	resp, ok, err = t.review(ctx, token, auds, "api")
-	if err != nil || ok || t.delegated == nil {
-		return resp, ok, err
-	}
-	start := time.Now()
-	resp, ok, err = t.delegated.review(ctx, token)
-	outcome := "rejected"
-	if err != nil {
-		outcome = "error"
-	} else if ok {
-		outcome = "authenticated"
-	}
-	t.metrics.observe("delegated", outcome, time.Since(start))
-	return resp, ok, err
+	return t.review(ctx, token, auds, "api")
 }
 
 func (t *tokenReviewer) review(ctx context.Context, token string, audiences []string, audienceLabel string) (*authenticator.Response, bool, error) {

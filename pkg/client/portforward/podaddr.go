@@ -14,13 +14,12 @@ import (
 )
 
 type PodAddress struct {
-	FromSvc        bool
-	Name           string
-	Namespace      string
-	ServiceAccount string
-	Port           uint16
-	Proto          types.Proto
-	PodID          k8sTypes.UID
+	FromSvc   bool
+	Name      string
+	Namespace string
+	Port      uint16
+	Proto     types.Proto
+	PodID     k8sTypes.UID
 }
 
 func parseAddr(fullAddr string) (kind, name, namespace, port string, podID k8sTypes.UID, err error) {

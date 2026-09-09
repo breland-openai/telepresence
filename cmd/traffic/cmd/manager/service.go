@@ -78,7 +78,6 @@ type service struct {
 	authenticator      *auth.Authenticator
 	authorizer         *auth.Authorizer
 	authMode           auth.Mode
-	authDevboxAudience string
 	activeHttpRequests int32
 	activeGrpcRequests int32
 	serviceNameNs      string
@@ -133,21 +132,13 @@ func checkCompat(ctx context.Context, name, requiredVersion string) error {
 
 func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, tokenReviewClient kubernetes.Interface) (Service, error) {
 	env := managerutil.GetEnv(ctx)
-	if err := auth.ValidateDelegatedDevboxProxyConfig(env.AuthenticationMode,
-		env.AuthDelegatedSelfSubjectReviewURL, env.AuthDelegatedDevboxProxyAudience,
-		env.AuthDelegatedDevboxProxyTenantID, env.AuthDelegatedDevboxProxyAuthorities); err != nil {
-		return nil, fmt.Errorf("AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE: %w", err)
-	}
 	ret := &service{
-		id:                 uuid.New().String(),
-		configWatcher:      configWatcher,
-		authorizer:         auth.NewAuthorizer(k8sapi.GetK8sInterface(ctx)),
-		mintedTokens:       auth.NewMintedTokens(),
-		authDevboxAudience: env.AuthDelegatedDevboxProxyAudience,
+		id:            uuid.New().String(),
+		configWatcher: configWatcher,
+		authorizer:    auth.NewAuthorizer(k8sapi.GetK8sInterface(ctx)),
+		mintedTokens:  auth.NewMintedTokens(),
 	}
-	ret.authenticator = auth.NewAuthenticator(tokenReviewClient, auth.WithMintedTokens(ret.mintedTokens),
-		auth.WithDelegatedSelfSubjectReview(env.AuthDelegatedSelfSubjectReviewURL, env.AuthDelegatedDevboxProxyAudience,
-			env.AuthDelegatedDevboxProxyTenantID, env.AuthDelegatedDevboxProxyAuthorities))
+	ret.authenticator = auth.NewAuthenticator(tokenReviewClient, auth.WithMintedTokens(ret.mintedTokens))
 
 	// These are context-dependent, so build them once the pool is up
 	var err error
@@ -224,9 +215,6 @@ func (s *service) Version(ctx context.Context, _ *empty.Empty) (*rpc.VersionInfo
 		Version:       version.Version,
 		AuthSupported: s.authMode != auth.ModeDisabled,
 		AuthRequired:  s.authMode == auth.ModeEnforcing,
-	}
-	if s.authMode == auth.ModePermissive || s.authMode == auth.ModeEnforcing {
-		vi.AuthDevboxProxyAudience = s.authDevboxAudience
 	}
 	// The port is advertised only when the listener is up and accepting
 	// connections, which NewService guarantees by binding it before any server
@@ -310,8 +298,8 @@ func (s *service) ArriveAsClient(ctx context.Context, client *rpc.ClientInfo) (*
 func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClientRequest) (*empty.Empty, error) {
 	ctx = managerutil.WithSessionInfo(ctx, info.Session)
 	sessionID := tunnel.SessionID(info.GetSession().GetSessionId())
-	if s.reconnectMayUseDurableRoutes(info) && auth.PrincipalFrom(ctx) != nil {
-		owner, err := durableRouteOwner(ctx, info.GetSession())
+	if s.reconnectMayUseDurableRoutes(info) {
+		owner, err := durableRouteOwner(info.GetSession())
 		if err != nil {
 			return nil, err
 		}
@@ -553,15 +541,15 @@ func (s *service) Depart(ctx context.Context, session *rpc.SessionInfo) (*empty.
 		if err := state.ClientOwnershipError(ctx, sessionID, client); err != nil {
 			return nil, err
 		}
-		if s.routeIntents != nil && (client.Principal() != nil || auth.PrincipalFrom(ctx) != nil) {
-			if err := s.departDurableRoutes(ctx, session); err != nil {
+		if s.routeIntents != nil {
+			if err := s.departDurableRoutes(ctx, session, client); err != nil {
 				return nil, err
 			}
 		}
 		// There's no reason for the caller to wait for this removal to complete.
 		go s.state.RemoveSession(context.WithoutCancel(ctx), sessionID)
-	} else if s.routeIntents != nil && auth.PrincipalFrom(ctx) != nil && !strings.HasPrefix(string(sessionID), state.AgentSessionIDPrefix) {
-		if err := s.departDurableRoutes(ctx, session); err != nil {
+	} else if s.routeIntents != nil && sessionID != "" && !strings.HasPrefix(string(sessionID), state.AgentSessionIDPrefix) {
+		if err := s.departDurableRoutes(ctx, session, nil); err != nil {
 			return nil, err
 		}
 	}
@@ -1493,13 +1481,7 @@ func (s *service) CreateIntercept(ctx context.Context, ciReq *rpc.CreateIntercep
 		// or target a namespace intentionally left in legacy mode.
 		ciReq.RouteIncarnation = ""
 	case usesLocalRoutingKey(spec):
-		if principal := auth.PrincipalFrom(ctx); principal == nil || client.Principal() == nil || !client.Principal().SameAs(principal) {
-			if auth.AuthUnavailable(ctx) {
-				return nil, status.Error(codes.Unavailable, "unable to verify durable route client session ownership")
-			}
-			return nil, status.Error(codes.Unauthenticated, "durable routes require a client session bound to the authenticated caller")
-		}
-		owner, ownerErr := durableRouteOwner(ctx, ciReq.GetSession())
+		owner, ownerErr := durableRouteOwner(ciReq.GetSession())
 		if ownerErr != nil {
 			return nil, ownerErr
 		}
@@ -1638,8 +1620,8 @@ func (s *service) RemoveIntercept(ctx context.Context, riReq *rpc.RemoveIntercep
 		interceptID := string(managerutil.GetSessionID(ctx)) + ":" + name
 		live, exists := s.state.GetIntercept(interceptID)
 		clientNamespaceManaged := s.routeIntents.managesNamespace(client.GetNamespace())
-		if s.shouldLookupDurableRemoval(ctx, client.GetNamespace(), live, riReq.RouteIncarnation) {
-			owner, ownerErr := durableRouteOwner(ctx, riReq.Session)
+		if s.shouldLookupDurableRemoval(client.GetNamespace(), live, riReq.RouteIncarnation) {
+			owner, ownerErr := durableRouteOwner(riReq.Session)
 			if ownerErr != nil {
 				return nil, ownerErr
 			}
@@ -1653,7 +1635,7 @@ func (s *service) RemoveIntercept(ctx context.Context, riReq *rpc.RemoveIntercep
 				return nil, lookupErr
 			}
 			if record != nil {
-				if removeErr := s.routeIntents.remove(ctx, *record, riReq.RouteIncarnation); removeErr != nil {
+				if removeErr := s.routeIntents.removeOwned(ctx, *record, riReq.RouteIncarnation); removeErr != nil {
 					return nil, removeErr
 				}
 			} else if (clientNamespaceManaged && riReq.RouteIncarnation != "") || (exists && live.RouteIncarnation != "") {

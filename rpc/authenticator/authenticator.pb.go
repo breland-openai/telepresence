@@ -109,114 +109,6 @@ func (x *GetContextExecCredentialsResponse) GetRawCredentials() []byte {
 	return nil
 }
 
-type GetManagerTokenRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// An unguessable connection capability; no caller-supplied filesystem path.
-	Capability []byte `protobuf:"bytes,1,opt,name=capability,proto3" json:"capability,omitempty"`
-	// The responding manager pod observed by the privileged daemon, required for
-	// a negotiated Devbox callback and not used for an explicit token file.
-	ManagerPodUid string `protobuf:"bytes,2,opt,name=manager_pod_uid,json=managerPodUid,proto3" json:"manager_pod_uid,omitempty"`
-	// The vetted manager-only audience advertised by that exact manager pod.
-	DevboxProxyAudience string `protobuf:"bytes,3,opt,name=devbox_proxy_audience,json=devboxProxyAudience,proto3" json:"devbox_proxy_audience,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
-}
-
-func (x *GetManagerTokenRequest) Reset() {
-	*x = GetManagerTokenRequest{}
-	mi := &file_authenticator_authenticator_proto_msgTypes[2]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *GetManagerTokenRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*GetManagerTokenRequest) ProtoMessage() {}
-
-func (x *GetManagerTokenRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_authenticator_authenticator_proto_msgTypes[2]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use GetManagerTokenRequest.ProtoReflect.Descriptor instead.
-func (*GetManagerTokenRequest) Descriptor() ([]byte, []int) {
-	return file_authenticator_authenticator_proto_rawDescGZIP(), []int{2}
-}
-
-func (x *GetManagerTokenRequest) GetCapability() []byte {
-	if x != nil {
-		return x.Capability
-	}
-	return nil
-}
-
-func (x *GetManagerTokenRequest) GetManagerPodUid() string {
-	if x != nil {
-		return x.ManagerPodUid
-	}
-	return ""
-}
-
-func (x *GetManagerTokenRequest) GetDevboxProxyAudience() string {
-	if x != nil {
-		return x.DevboxProxyAudience
-	}
-	return ""
-}
-
-type GetManagerTokenResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Token         string                 `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *GetManagerTokenResponse) Reset() {
-	*x = GetManagerTokenResponse{}
-	mi := &file_authenticator_authenticator_proto_msgTypes[3]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *GetManagerTokenResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*GetManagerTokenResponse) ProtoMessage() {}
-
-func (x *GetManagerTokenResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_authenticator_authenticator_proto_msgTypes[3]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use GetManagerTokenResponse.ProtoReflect.Descriptor instead.
-func (*GetManagerTokenResponse) Descriptor() ([]byte, []int) {
-	return file_authenticator_authenticator_proto_rawDescGZIP(), []int{3}
-}
-
-func (x *GetManagerTokenResponse) GetToken() string {
-	if x != nil {
-		return x.Token
-	}
-	return ""
-}
-
 var File_authenticator_authenticator_proto protoreflect.FileDescriptor
 
 const file_authenticator_authenticator_proto_rawDesc = "" +
@@ -225,18 +117,9 @@ const file_authenticator_authenticator_proto_rawDesc = "" +
 	" GetContextExecCredentialsRequest\x12!\n" +
 	"\fcontext_name\x18\x01 \x01(\tR\vcontextName\"L\n" +
 	"!GetContextExecCredentialsResponse\x12'\n" +
-	"\x0fraw_credentials\x18\x01 \x01(\fR\x0erawCredentials\"\x94\x01\n" +
-	"\x16GetManagerTokenRequest\x12\x1e\n" +
-	"\n" +
-	"capability\x18\x01 \x01(\fR\n" +
-	"capability\x12&\n" +
-	"\x0fmanager_pod_uid\x18\x02 \x01(\tR\rmanagerPodUid\x122\n" +
-	"\x15devbox_proxy_audience\x18\x03 \x01(\tR\x13devboxProxyAudience\"/\n" +
-	"\x17GetManagerTokenResponse\x12\x14\n" +
-	"\x05token\x18\x01 \x01(\tR\x05token2\xa6\x02\n" +
+	"\x0fraw_credentials\x18\x01 \x01(\fR\x0erawCredentials2\xaa\x01\n" +
 	"\rAuthenticator\x12\x98\x01\n" +
-	"\x19GetContextExecCredentials\x12<.telepresence.authenticator.GetContextExecCredentialsRequest\x1a=.telepresence.authenticator.GetContextExecCredentialsResponse\x12z\n" +
-	"\x0fGetManagerToken\x122.telepresence.authenticator.GetManagerTokenRequest\x1a3.telepresence.authenticator.GetManagerTokenResponseB=Z;github.com/telepresenceio/telepresence/rpc/v2/authenticatorb\x06proto3"
+	"\x19GetContextExecCredentials\x12<.telepresence.authenticator.GetContextExecCredentialsRequest\x1a=.telepresence.authenticator.GetContextExecCredentialsResponseB=Z;github.com/telepresenceio/telepresence/rpc/v2/authenticatorb\x06proto3"
 
 var (
 	file_authenticator_authenticator_proto_rawDescOnce sync.Once
@@ -250,20 +133,16 @@ func file_authenticator_authenticator_proto_rawDescGZIP() []byte {
 	return file_authenticator_authenticator_proto_rawDescData
 }
 
-var file_authenticator_authenticator_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_authenticator_authenticator_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_authenticator_authenticator_proto_goTypes = []any{
 	(*GetContextExecCredentialsRequest)(nil),  // 0: telepresence.authenticator.GetContextExecCredentialsRequest
 	(*GetContextExecCredentialsResponse)(nil), // 1: telepresence.authenticator.GetContextExecCredentialsResponse
-	(*GetManagerTokenRequest)(nil),            // 2: telepresence.authenticator.GetManagerTokenRequest
-	(*GetManagerTokenResponse)(nil),           // 3: telepresence.authenticator.GetManagerTokenResponse
 }
 var file_authenticator_authenticator_proto_depIdxs = []int32{
 	0, // 0: telepresence.authenticator.Authenticator.GetContextExecCredentials:input_type -> telepresence.authenticator.GetContextExecCredentialsRequest
-	2, // 1: telepresence.authenticator.Authenticator.GetManagerToken:input_type -> telepresence.authenticator.GetManagerTokenRequest
-	1, // 2: telepresence.authenticator.Authenticator.GetContextExecCredentials:output_type -> telepresence.authenticator.GetContextExecCredentialsResponse
-	3, // 3: telepresence.authenticator.Authenticator.GetManagerToken:output_type -> telepresence.authenticator.GetManagerTokenResponse
-	2, // [2:4] is the sub-list for method output_type
-	0, // [0:2] is the sub-list for method input_type
+	1, // 1: telepresence.authenticator.Authenticator.GetContextExecCredentials:output_type -> telepresence.authenticator.GetContextExecCredentialsResponse
+	1, // [1:2] is the sub-list for method output_type
+	0, // [0:1] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -280,7 +159,7 @@ func file_authenticator_authenticator_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_authenticator_authenticator_proto_rawDesc), len(file_authenticator_authenticator_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   4,
+			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

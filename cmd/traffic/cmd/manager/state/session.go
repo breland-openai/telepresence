@@ -68,6 +68,7 @@ type ClientSession struct {
 	*rpc.ClientInfo
 	sessionState
 	consumptionMetrics *SessionConsumptionMetrics
+	createdHere        bool
 }
 
 func (cs *ClientSession) ConsumptionMetrics() *SessionConsumptionMetrics {

@@ -33,10 +33,6 @@ This is independent of, and does not replace, restricting network reachability
 to the traffic-manager in the first place. NetworkPolicy and a namespaced
 install (see [RBAC](rbac.md)) remain the recommended defense in depth.
 
-[Protected local intercepts](attachments/protected-intercepts.md) always require an
-authenticated client session, including when the traffic-manager runs in permissive
-mode. The routing key selects requests; it is not an authentication credential.
-
 ## How identity is established
 
 ### Clients
@@ -60,27 +56,6 @@ Kubernetes `TokenReview`, which returns the authenticated username and UID.
 A kubeconfig configured to **impersonate** another user or group is authorized
 as the *impersonating* identity's RBAC, not the impersonated one — the
 forwarded token belongs to the credential actually presented.
-
-#### Delegated Devbox identity
-
-An administrator may configure the traffic-manager to verify a Devbox's Entra
-service-principal token through a trusted Kubernetes API proxy. Set all four
-Helm values under `security.authentication` together:
-
-| Value | Purpose |
-|-------|---------|
-| `delegatedSelfSubjectReviewURL` | HTTPS URL for the proxy's cluster-specific Kubernetes `SelfSubjectReview` endpoint, on port 443. |
-| `delegatedDevboxProxyAudience` | Canonical application audience UUID accepted by the proxy and advertised for traffic-manager authentication. |
-| `delegatedDevboxProxyTenantID` | Canonical Entra tenant UUID whose service principals the proxy verifies. |
-| `delegatedDevboxProxyAuthorities` | Exact lowercase fully qualified DNS names authorized to receive this audience. Wildcards, IP addresses, and explicit ports are rejected. |
-
-All four default to unset. Partial configuration and `disabled` authentication
-are rejected. The traffic-manager sends a bearer to the configured endpoint
-only after local token review rejects it and its tenant, issuer, and audience
-match this policy. Proxy redirects are refused. Clients also need an
-administrator-installed [credential policy](config.md#system-policy-for-managed-workstation-credentials); the manager's
-unauthenticated `Version` response cannot authorize a client to obtain a new
-credential by itself.
 
 ### Agents
 

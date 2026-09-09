@@ -689,7 +689,7 @@ func (s *State) AddClient(client *rpc.ClientInfo, principal *auth.Principal, now
 	// (to both humans and computers) if the manager restarts and those existing session IDs
 	// suddenly refer to different sessions.
 	sessionID := tunnel.SessionID(uuid.New().String())
-	s.addClient(sessionID, client, principal, now)
+	s.addClientWithOrigin(sessionID, client, principal, now, true)
 	return sessionID
 }
 
@@ -766,7 +766,12 @@ func (s *State) RestoreIntercepts(ctx context.Context, intercepts []*rpc.Interce
 
 // addClient is like AddClient but takes a sessionID, for testing purposes.
 func (s *State) addClient(id tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) {
+	s.addClientWithOrigin(id, client, principal, now, false)
+}
+
+func (s *State) addClientWithOrigin(id tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time, createdHere bool) {
 	cs := newClientSessionState(s.backgroundCtx, id, client, now)
+	cs.createdHere = createdHere
 	if principal != nil {
 		cs.SetPrincipal(principal)
 	}

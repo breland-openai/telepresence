@@ -601,10 +601,8 @@ message VersionInfo2 {
   // populates this.
   uint32 auth_x509_port = 5;
 
-  // Optional vetted Applied Devbox proxy audience for manager-only bearer
-  // credentials. It is never used to authenticate requests to Kubernetes.
-  // Empty preserves the client's existing manager authentication behavior.
-  string auth_devbox_proxy_audience = 6;
+  reserved 6;
+  reserved "auth_devbox_proxy_audience";
 }
 
 // TunnelMessage is a message sent over a Tunnel. First byte indicates type of message

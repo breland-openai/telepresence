@@ -20,9 +20,8 @@ var (
 	ErrInvalid  = errors.New("invalid route intent")
 )
 
-// Key names a route within a stable, manager-authenticated owner's namespace.
-// Owner must survive an ordinary reconnect; an ephemeral manager session ID is
-// unsuitable. The caller is responsible for authenticating ownership.
+// Key names a route within the namespace of a client session. The client
+// retains its session ID when reconnecting after a manager restart.
 type Key struct {
 	Namespace string `json:"namespace"`
 	Owner     string `json:"owner"`

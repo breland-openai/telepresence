@@ -16,11 +16,11 @@ func newTokenReviewMetrics() *tokenReviewMetrics {
 	return &tokenReviewMetrics{
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "telepresence_token_review_requests_total",
-			Help: "Kubernetes TokenReview or delegated SelfSubjectReview API requests, excluding cached authentication results.",
+			Help: "Kubernetes TokenReview API requests, excluding cached authentication results.",
 		}, labels),
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "telepresence_token_review_duration_seconds",
-			Help:    "Kubernetes TokenReview or delegated SelfSubjectReview request duration, including client-side rate-limit waits.",
+			Help:    "Kubernetes TokenReview API request duration, including client-side rate-limit waits.",
 			Buckets: []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
 		}, labels),
 	}

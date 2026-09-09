@@ -8,43 +8,6 @@ There are a number of configuration values that can be tweaked to change how Tel
 These can be set in three ways: globally, by a platform engineer with powers to deploy the Telepresence Traffic Manager, or locally by any user, either in the Telepresence configuration file `config.yml`, or as a Telepresence extension the Kubernetes configuration.
 One important exception is the configuration of the of the traffic manager namespace, which, if it's different from the default of `ambassador`, [must be set](#manager) locally to be able to connect.
 
-## System policy for managed-workstation credentials
-
-On Linux, a system administrator can install `/etc/telepresence/manager-auth-policy.json`
-to allow a managed workstation to negotiate a Traffic Manager credential for approved
-Microsoft Entra application audiences. This file is separate from `config.yml` and the
-kubeconfig. The manager cannot supply or override this trust policy. Both daemons read it
-independently. The file and its parent directories must be owned by root, must not be
-writable by group or others, and must not be symbolic links.
-
-```json
-{
-  "version": 1,
-  "tenantID": "11111111-1111-4111-8111-111111111111",
-  "managerNamespace": "ambassador",
-  "managerServiceAccount": "traffic-manager",
-  "proxyAudiences": {
-    "kube-proxy.staging.example.test": "22222222-2222-4222-8222-222222222222"
-  },
-  "clusterAudiences": {
-    "staging-1": "22222222-2222-4222-8222-222222222222"
-  }
-}
-```
-
-Proxy names are exact lowercase DNS names; application and tenant IDs are canonical
-nonzero UUIDs. The kubeconfig must use HTTPS, the approved proxy with a `/clusters/<name>`
-path, and the standard Microsoft workload identity credential plugin. Each exact cluster
-name permits only its configured manager audience, even when its Kubernetes API is reached
-through a proxy using another audience. The manager must also be resolved through the
-`traffic-manager` Service in the trusted namespace, and its Pod must use the trusted
-ServiceAccount. These recipient checks also apply to managed-workstation credentials
-when an older manager does not advertise an audience. Without a valid policy, negotiation
-is disabled and managed-workstation credentials can only reach the default
-`ambassador/traffic-manager` namespace and ServiceAccount. Explicit manager token files
-and ordinary workstation credentials keep their existing behavior. Restart the daemons
-after changing this policy.
-
 ## Global Configuration
 
 Global configuration is set at the Traffic Manager level and applies to any user connecting to that Traffic Manager.
@@ -303,12 +266,6 @@ to filtered intercepts always takes the round trip through the cluster. The
 assumption that filters exist to limit how an intercept impacts other users of the
 cluster, not the developer's own traffic. Set it to `false` when local traffic must honor
 the filters exactly.
-
-An intercept that the Traffic Manager confirms as a protected exact
-`X-Local-Routing-Key` route always takes the round trip through the cluster, even when
-`localShortcutIsGlobal` is `true`. The Traffic Agent evaluates each HTTP request: the
-developer's key goes to the local handler; unrelated keys and requests without a key
-keep their normal cluster destination.
 
 ### Node Agent
 

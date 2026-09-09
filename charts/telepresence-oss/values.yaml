@@ -82,15 +82,6 @@ security:
     #
     # Default: permissive
     mode: permissive
-    # Optional HTTPS Kubernetes SelfSubjectReview endpoint for delegated bearer identities.
-    # Set all four delegated values together; otherwise leave them all unset.
-    delegatedSelfSubjectReviewURL: ""
-    # Canonical Entra application audience UUID, advertised for manager-only authentication.
-    delegatedDevboxProxyAudience: ""
-    # Canonical Entra tenant UUID whose service principals the delegate verifies.
-    delegatedDevboxProxyTenantID: ""
-    # Exact, lowercase, fully qualified DNS names authorized to receive this audience. No wildcard or port.
-    delegatedDevboxProxyAuthorities: []
 
     # x509 configures client-certificate authentication: an additional,
     # opt-in mechanism for identifying clients whose kubeconfig credentials

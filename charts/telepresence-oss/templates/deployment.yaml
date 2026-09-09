@@ -92,33 +92,9 @@ spec:
           {{- end }}
           {{- with .security }}
           {{- with .authentication }}
-          {{- if or .delegatedSelfSubjectReviewURL .delegatedDevboxProxyAudience .delegatedDevboxProxyTenantID .delegatedDevboxProxyAuthorities }}
-          {{- if or (not .delegatedSelfSubjectReviewURL) (not .delegatedDevboxProxyAudience) (not .delegatedDevboxProxyTenantID) (not .delegatedDevboxProxyAuthorities) }}
-          {{- fail "delegated Devbox authentication requires delegatedSelfSubjectReviewURL, delegatedDevboxProxyAudience, delegatedDevboxProxyTenantID, and delegatedDevboxProxyAuthorities together" }}
-          {{- end }}
-          {{- if eq (.mode | default "permissive") "disabled" }}
-          {{- fail "delegated Devbox authentication requires authentication mode permissive or enforcing" }}
-          {{- end }}
-          {{- end }}
           {{- if .mode }}
           - name: AUTHENTICATION_MODE
             value: {{ .mode }}
-          {{- end }}
-          {{- if .delegatedSelfSubjectReviewURL }}
-          - name: AUTH_DELEGATED_SELF_SUBJECT_REVIEW_URL
-            value: {{ .delegatedSelfSubjectReviewURL | quote }}
-          {{- end }}
-          {{- if .delegatedDevboxProxyAudience }}
-          - name: AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE
-            value: {{ .delegatedDevboxProxyAudience | quote }}
-          {{- end }}
-          {{- if .delegatedDevboxProxyTenantID }}
-          - name: AUTH_DELEGATED_DEVBOX_PROXY_TENANT_ID
-            value: {{ .delegatedDevboxProxyTenantID | quote }}
-          {{- end }}
-          {{- if .delegatedDevboxProxyAuthorities }}
-          - name: AUTH_DELEGATED_DEVBOX_PROXY_AUTHORITIES
-            value: {{ join " " .delegatedDevboxProxyAuthorities | quote }}
           {{- end }}
           {{- with .x509 }}
           {{- if include "telepresence.x509AuthEnabled" $ }}

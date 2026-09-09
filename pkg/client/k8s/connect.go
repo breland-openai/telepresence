@@ -29,6 +29,7 @@ import (
 func (kc *Cluster) ConnectToManager(dialCtx context.Context, namespace string) (conn *grpc.ClientConn, name string, ver semver.Version, err error) {
 	dialCtx, cancel := client.GetConfig(kc).Timeouts().TimeoutContext(dialCtx, client.TimeoutTrafficManagerConnect)
 	defer cancel()
+
 	pap, err := portforward.ResolveSvcToPod(kc, "traffic-manager", namespace, "8081")
 	if err != nil {
 		se := &k8serrors.StatusError{}
@@ -48,8 +49,26 @@ func (kc *Cluster) ConnectToManager(dialCtx context.Context, namespace string) (
 	// resolution.
 	grpcAddr := fmt.Sprintf("pod/%s.%s:%d#%s", pap.Name, pap.Namespace, pap.Port, pap.PodID)
 
-	credentialGate := &managerCredentialGate{}
-	conn, err = kc.dialGRPC(dialCtx, grpcAddr, grpc.WithPerRPCCredentials(credentialGate))
+	bearerSrc := newManagerTokenSource(kc.Kubeconfig)
+	x509Src := newX509TokenSource(kc.Kubeconfig)
+	hasBearerSource := bearerSrc != nil
+	hasX509Source := x509Src != nil
+
+	var extra []grpc.DialOption
+	switch {
+	case hasBearerSource && hasX509Source:
+		clog.Debugf(kc, "manager calls will carry the kubeconfig's bearer credentials, falling back to x509 client-certificate credentials")
+		extra = append(extra, grpc.WithPerRPCCredentials(newManagerTokenCredentials(&managerAuthTokenSource{bearer: bearerSrc, x509: x509Src})))
+	case hasBearerSource:
+		clog.Debugf(kc, "manager calls will carry the kubeconfig's bearer credentials")
+		extra = append(extra, grpc.WithPerRPCCredentials(newManagerTokenCredentials(bearerSrc)))
+	case hasX509Source:
+		clog.Debugf(kc, "manager calls will carry x509 client-certificate credentials, if the manager supports it")
+		extra = append(extra, grpc.WithPerRPCCredentials(newManagerTokenCredentials(x509Src)))
+	default:
+		clog.Debugf(kc, "the kubeconfig yields no bearer token or client certificate for the traffic-manager connection")
+	}
+	conn, err = kc.dialGRPC(dialCtx, grpcAddr, extra...)
 	if err != nil {
 		return nil, "", ver, err
 	}
@@ -65,31 +84,24 @@ func (kc *Cluster) ConnectToManager(dialCtx context.Context, namespace string) (
 	if err != nil {
 		return conn, "", ver, client.CheckTimeout(dialCtx, fmt.Errorf("dial manager: %w", err))
 	}
-	managerAuth, err := connectionManagerAuthenticationForVersion(dialCtx, kc.Kubeconfig, devboxManagerTarget{
-		pod: string(pap.PodID), namespace: pap.Namespace, serviceAccount: pap.ServiceAccount,
-	}, vi.GetAuthDevboxProxyAudience())
-	if err != nil {
-		return conn, "", ver, err
-	}
-	credentialGate.activate(managerAuth.credentials)
 
 	hasX509Path := false
-	if managerAuth.x509 != nil {
+	if hasX509Source {
 		if authPort := vi.GetAuthX509Port(); authPort != 0 {
 			// The exchange targets the same pinned pod, over the same shared
 			// per-pod stream connection as the gRPC channel, so the pod that
 			// mints the token is the pod that receives it.
-			managerAuth.x509.activate(portforward.Dialer(kc),
+			x509Src.activate(portforward.Dialer(kc),
 				fmt.Sprintf("pod/%s.%s:%d#%s", pap.Name, pap.Namespace, authPort, pap.PodID))
 			hasX509Path = true
 			clog.Debugf(kc, "manager calls will carry x509 client-certificate credentials via the manager's auth port %d", authPort)
 		}
 	}
 
-	if err = managerAuthError(vi, managerAuth.hasBearer, hasX509Path); err != nil {
+	if err = managerAuthError(vi, hasBearerSource, hasX509Path); err != nil {
 		return conn, "", ver, err
 	}
-	if vi.GetAuthSupported() && !vi.GetAuthRequired() && !managerAuth.hasBearer && !hasX509Path {
+	if vi.GetAuthSupported() && !vi.GetAuthRequired() && !hasBearerSource && !hasX509Path {
 		clog.Debugf(kc, "traffic-manager %s supports authentication, but the current kubeconfig yields no bearer token or usable client certificate", vi.GetName())
 	}
 	verStr := strings.TrimPrefix(vi.Version, "v")
@@ -98,51 +110,6 @@ func (kc *Cluster) ConnectToManager(dialCtx context.Context, namespace string) (
 		err = fmt.Errorf("failed to parse manager version %q: %w", verStr, err)
 	}
 	return conn, vi.Name, ver, err
-}
-
-type managerConnectionAuth struct {
-	credentials *managerTokenCredentials
-	x509        *x509TokenSource
-	hasBearer   bool
-}
-
-func connectionManagerAuthentication(ctx context.Context, kc *Kubeconfig) (managerConnectionAuth, error) {
-	if kc != nil && kc.managerTokenCallback != nil {
-		if _, err := kc.managerTokenCallback.Token(ctx); err != nil {
-			return managerConnectionAuth{}, errcat.User.Errorf(err, "unable to use the user daemon's traffic-manager bearer credential")
-		}
-		clog.Debug(ctx, "manager calls will use the user daemon's manager-only bearer credential")
-		return managerConnectionAuth{credentials: newRequiredManagerTokenCredentials(kc.managerTokenCallback), hasBearer: true}, nil
-	}
-	if kc != nil && kc.ManagerTokenFileSet {
-		fileSource := managerFileTokenSource(kc.ManagerTokenFile)
-		if _, err := fileSource.Token(ctx); err != nil {
-			return managerConnectionAuth{}, errcat.User.Errorf(err, "unable to use the explicitly configured traffic-manager bearer credential")
-		}
-		clog.Debug(ctx, "manager calls will use the explicitly configured manager-only bearer token file")
-		return managerConnectionAuth{credentials: newRequiredManagerTokenCredentials(fileSource), hasBearer: true}, nil
-	}
-	return kubeconfigManagerAuthentication(ctx, kc), nil
-}
-
-func kubeconfigManagerAuthentication(ctx context.Context, kc *Kubeconfig) managerConnectionAuth {
-	bearer := newManagerTokenSource(kc)
-	x509 := newX509TokenSource(kc)
-	out := managerConnectionAuth{x509: x509, hasBearer: bearer != nil}
-	switch {
-	case bearer != nil && x509 != nil:
-		clog.Debug(ctx, "manager calls will carry the kubeconfig's bearer credentials, falling back to x509 client-certificate credentials")
-		out.credentials = newManagerTokenCredentials(&managerAuthTokenSource{bearer: bearer, x509: x509})
-	case bearer != nil:
-		clog.Debug(ctx, "manager calls will carry the kubeconfig's bearer credentials")
-		out.credentials = newManagerTokenCredentials(bearer)
-	case x509 != nil:
-		clog.Debug(ctx, "manager calls will carry x509 client-certificate credentials, if the manager supports it")
-		out.credentials = newManagerTokenCredentials(x509)
-	default:
-		clog.Debug(ctx, "the kubeconfig yields no bearer token or client certificate for the traffic-manager connection")
-	}
-	return out
 }
 
 // managerAuthError returns a user-facing error when vi reports that the

@@ -2,7 +2,6 @@ package rootd
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -90,8 +89,6 @@ type agentVIP struct {
 // A zero session is invalid; you must use the createSession or the newSession function.
 type session struct {
 	*k8s.Cluster
-	managerTokenCallbackActive bool
-	managerTokenCallbackID     []byte
 
 	tunVif *vif.TunnelingDevice
 
@@ -370,9 +367,6 @@ func createSession(
 	if err != nil {
 		return nil, err
 	}
-	if err = configureManagerTokenCallback(sessionCtx, kc, mi); err != nil {
-		return nil, err
-	}
 	cl, err := k8s.NewCluster(kc, mi.MappedNamespaces)
 	if err != nil {
 		return nil, err
@@ -382,11 +376,6 @@ func createSession(
 		return nil, err
 	}
 	return newSession(cl, mi, conn, true, ver, activity, false)
-}
-
-func configureManagerTokenCallback(ctx context.Context, kc *k8s.Kubeconfig, mi *rpc.NetworkConfig) error {
-	callback := mi.GetManagerTokenCallback()
-	return kc.ConfigureRootManagerTokenCallback(ctx, callback != nil, callback.GetAddress(), callback.GetCapability(), callback.GetNegotiatedDevboxProxy())
 }
 
 func nope() bool { return false }
@@ -403,35 +392,30 @@ func newSession(
 	clog.Debugf(cluster, "Creating session with id %v", mi.Session)
 
 	s := &session{
-		Cluster:                    cluster,
-		managerTokenCallbackActive: mi.GetManagerTokenCallback() != nil,
-		handlers:                   tunnel.NewPool(),
-		datagramCounters:           &tunnel.DatagramCounters{},
-		rndSource:                  rand.NewSource(time.Now().UnixNano()),
-		session:                    mi.Session,
-		managerConn:                managerConn,
-		ownsManagerConn:            ownsManagerConn,
-		managerNamespace:           mi.ManagerNamespace,
-		managerVersion:             ver,
-		subnetViaWorkloads:         mi.SubnetViaWorkloads,
-		agentPodNamespaces:         mi.AgentPodNamespaces,
-		proxyClusterPods:           true,
-		proxyClusterSvcs:           true,
-		vifReady:                   make(chan error, 2),
-		routesCh:                   make(chan []netip.Prefix, 2),
-		activity:                   activity,
-		podDaemon:                  isPodDaemon,
-		localTranslationTable:      xsync.NewMap[netip.Addr, netip.Addr](),
-		virtualIPs:                 xsync.NewMap[netip.Addr, agentVIP](),
-		l4PortMap:                  xsync.NewMap[types.AddrPortProto, uint16](),
-		sessionStart:               time.Now(),
-		quicReprobeTrigger:         make(chan struct{}, 1),
-		quicSessionCache:           tls.NewLRUClientSessionCache(16),
-		localClientRedirects:       xsync.NewMap[types.AddrPortProto, netip.AddrPort](),
-	}
-	if s.managerTokenCallbackActive {
-		id := sha256.Sum256(mi.GetManagerTokenCallback().GetCapability())
-		s.managerTokenCallbackID = id[:]
+		Cluster:               cluster,
+		handlers:              tunnel.NewPool(),
+		datagramCounters:      &tunnel.DatagramCounters{},
+		rndSource:             rand.NewSource(time.Now().UnixNano()),
+		session:               mi.Session,
+		managerConn:           managerConn,
+		ownsManagerConn:       ownsManagerConn,
+		managerNamespace:      mi.ManagerNamespace,
+		managerVersion:        ver,
+		subnetViaWorkloads:    mi.SubnetViaWorkloads,
+		agentPodNamespaces:    mi.AgentPodNamespaces,
+		proxyClusterPods:      true,
+		proxyClusterSvcs:      true,
+		vifReady:              make(chan error, 2),
+		routesCh:              make(chan []netip.Prefix, 2),
+		activity:              activity,
+		podDaemon:             isPodDaemon,
+		localTranslationTable: xsync.NewMap[netip.Addr, netip.Addr](),
+		virtualIPs:            xsync.NewMap[netip.Addr, agentVIP](),
+		l4PortMap:             xsync.NewMap[types.AddrPortProto, uint16](),
+		sessionStart:          time.Now(),
+		quicReprobeTrigger:    make(chan struct{}, 1),
+		quicSessionCache:      tls.NewLRUClientSessionCache(16),
+		localClientRedirects:  xsync.NewMap[types.AddrPortProto, netip.AddrPort](),
 	}
 	cfg := client.GetConfig(s)
 

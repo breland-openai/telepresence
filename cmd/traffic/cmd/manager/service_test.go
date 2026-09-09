@@ -552,48 +552,6 @@ func TestVersion_AuthFlags(t *testing.T) {
 	}
 }
 
-func TestVersionAdvertisesOnlyConfiguredDevboxProxyAudience(t *testing.T) {
-	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
-	ctx := testutil.NewContext(t, true)
-	const staging = "11111111-1111-4111-8111-111111111111"
-	const production = "22222222-2222-4222-8222-222222222222"
-	const tenant = "33333333-3333-4333-8333-333333333333"
-	const stageHost = "staging.proxy.example.test"
-	const prodHost = "production.proxy.example.test"
-	const stageURL = "https://" + stageHost + "/clusters/staging/apis/authentication.k8s.io/v1/selfsubjectreviews"
-	const prodURL = "https://" + prodHost + "/clusters/staging/apis/authentication.k8s.io/v1/selfsubjectreviews"
-	for _, tc := range []struct {
-		name, endpoint, audience, authority string
-		mode                                auth.Mode
-	}{
-		{name: "disabled defaults empty", mode: auth.ModeDisabled},
-		{name: "permissive defaults empty", mode: auth.ModePermissive},
-		{name: "staging permissive", mode: auth.ModePermissive, endpoint: stageURL, audience: staging, authority: stageHost},
-		{name: "production enforcing", mode: auth.ModeEnforcing, endpoint: prodURL, audience: production, authority: prodHost},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			conn, mgr, sctx := getTestClientConnAndService(ctx, t, nil, func(e *managerutil.Env) {
-				e.AuthenticationMode = tc.mode
-				e.AuthDelegatedSelfSubjectReviewURL, e.AuthDelegatedDevboxProxyAudience = tc.endpoint, tc.audience
-				if tc.authority != "" {
-					e.AuthDelegatedDevboxProxyTenantID = tenant
-					e.AuthDelegatedDevboxProxyAuthorities = []string{tc.authority}
-				}
-			})
-			ver, err := mgr.Version(sctx, &empty.Empty{})
-			require.NoError(t, err)
-			require.Equal(t, tc.audience, ver.GetAuthDevboxProxyAudience())
-			wireVersion, err := rpc.NewManagerClient(conn).Version(sctx, &empty.Empty{})
-			require.NoError(t, err, "Version must be callable without bearer metadata")
-			require.Equal(t, tc.audience, wireVersion.GetAuthDevboxProxyAudience())
-		})
-	}
-	disabled := &service{authMode: auth.ModeDisabled, authDevboxAudience: staging}
-	ver, err := disabled.Version(ctx, &empty.Empty{})
-	require.NoError(t, err)
-	require.Empty(t, ver.GetAuthDevboxProxyAudience())
-}
-
 // agentPrincipal returns the Principal a bound projected ServiceAccount token for
 // agent would produce, as auth.NewInterceptor would inject it into ctx.
 func agentPrincipal(agent *rpc.AgentInfo) *auth.Principal {
