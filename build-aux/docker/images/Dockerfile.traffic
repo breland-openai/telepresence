@@ -26,8 +26,6 @@ COPY go.mod go.sum .
 COPY cmd/ cmd/
 COPY pkg/ pkg/
 COPY rpc/ rpc/
-COPY charts/ charts/
-COPY build-output/version.txt .
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -35,11 +33,19 @@ ARG TARGETARCH
 # TEL_COVER is "-cover" when the image is built with `make tel2-image
 # TELEPRESENCE_COVER=1`, and empty (today's behavior) otherwise.
 ARG TEL_COVER=
+# The version is a build input rather than an ignored file in the source checkout.
+# Accept release tags both with and without their leading v.
+ARG TELEPRESENCE_VERSION
 
 RUN \
     --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    GOOS=$TARGETOS GOARCH=$TARGETARCH go build $TEL_COVER -o /usr/local/bin/ -trimpath -ldflags="-s -w -X=$(go list ./pkg/version).Version=$(cat version.txt)" ./cmd/traffic/...
+    case "$TELEPRESENCE_VERSION" in \
+      v2.?*) version="$TELEPRESENCE_VERSION" ;; \
+      2.?*) version="v$TELEPRESENCE_VERSION" ;; \
+      *) echo "TELEPRESENCE_VERSION must be a v2 release" >&2; exit 1 ;; \
+    esac && \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build $TEL_COVER -o /usr/local/bin/ -trimpath -ldflags="-s -w -X=$(go list ./pkg/version).Version=$version" ./cmd/traffic/...
 
 # The tel2 target is the one that gets published. It aims to be a small as possible.
 FROM alpine as tel2

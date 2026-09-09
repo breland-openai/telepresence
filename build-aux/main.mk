@@ -295,10 +295,10 @@ TEL2_IMAGE_FQN=$(TELEPRESENCE_REGISTRY)/tel2:$(TELEPRESENCE_SEMVER)
 images-deps: build-deps setup-build-dir
 
 .PHONY: tel2-image
-tel2-image: images-deps
+tel2-image:
 	$(eval PLATFORM_ARG := $(if $(TELEPRESENCE_TEL2_IMAGE_PLATFORM), --platform=$(TELEPRESENCE_TEL2_IMAGE_PLATFORM),))
 	$(eval COVER_BUILD_ARG := $(if $(TELEPRESENCE_COVER), --build-arg TEL_COVER=-cover,))
-	docker build $(PLATFORM_ARG) $(COVER_BUILD_ARG) --target tel2 --tag tel2 --tag $(TEL2_IMAGE_FQN) -f build-aux/docker/images/Dockerfile.traffic .
+	docker build $(PLATFORM_ARG) $(COVER_BUILD_ARG) --build-arg TELEPRESENCE_VERSION=$(TELEPRESENCE_VERSION) --target tel2 --tag tel2 --tag $(TEL2_IMAGE_FQN) -f build-aux/docker/images/Dockerfile.traffic .
 
 .PHONY: client-image
 client-image: images-deps
@@ -323,6 +323,7 @@ load-tel2-image: tel2-image ## (Build) Load the manager/agent container image in
 
 .PHONY: save-tel2-image
 save-tel2-image: tel2-image
+	mkdir -p $(BUILDDIR)
 	docker save $(TEL2_IMAGE_FQN) > $(BUILDDIR)/tel2-image.tar
 
 .PHONY: push-client-image
