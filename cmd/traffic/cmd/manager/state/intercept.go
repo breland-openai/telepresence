@@ -17,6 +17,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	core "k8s.io/api/core/v1"
 	events "k8s.io/api/events/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
@@ -410,6 +411,47 @@ func discoverServiceWorkloads(ctx context.Context, spec *rpc.InterceptSpec) ([]k
 	return sortedServiceWorkloads(workloads), true, nil
 }
 
+// DiscoverRouteIntentServiceWorkloads returns all workloads selected by the exact
+// Service identity, including scaled-to-zero workloads whose templates match.
+// The caller must not label an incomplete result authoritative when known is false.
+func DiscoverRouteIntentServiceWorkloads(ctx context.Context, spec *rpc.InterceptSpec, expectedService *core.Service) ([]k8sapi.Workload, bool, error) {
+	f := informer.GetFactory(ctx, spec.Namespace)
+	if f == nil {
+		return nil, false, nil
+	}
+	kf := f.GetK8sInformerFactory()
+	if !kf.Core().V1().Services().Informer().HasSynced() || !kf.Core().V1().Pods().Informer().HasSynced() {
+		return nil, false, nil
+	}
+	for _, kind := range managerutil.GetEnv(ctx).EnabledWorkloadKinds {
+		var synced bool
+		switch kind {
+		case k8sapi.DeploymentKind:
+			synced = kf.Apps().V1().Deployments().Informer().HasSynced()
+		case k8sapi.ReplicaSetKind:
+			synced = kf.Apps().V1().ReplicaSets().Informer().HasSynced()
+		case k8sapi.StatefulSetKind:
+			synced = kf.Apps().V1().StatefulSets().Informer().HasSynced()
+		case k8sapi.RolloutKind:
+			synced = f.GetArgoRolloutsInformerFactory().Argoproj().V1alpha1().Rollouts().Informer().HasSynced()
+		}
+		if !synced {
+			return nil, false, nil
+		}
+	}
+	cached, err := kf.Core().V1().Services().Lister().Services(spec.Namespace).Get(spec.ServiceName)
+	if err != nil {
+		return nil, false, err
+	}
+	if cached.UID != expectedService.UID || cached.ResourceVersion != expectedService.ResourceVersion ||
+		!apiequality.Semantic.DeepEqual(cached.Spec.Selector, expectedService.Spec.Selector) || !apiequality.Semantic.DeepEqual(cached.Spec.Ports, expectedService.Spec.Ports) {
+		// A fresher API read saw a selector or port update that the Service
+		// discovery cache has not observed. Do not publish its old participant set.
+		return nil, false, nil
+	}
+	return discoverServiceWorkloads(ctx, spec)
+}
+
 // serviceWorkloads keeps the explicitly requested workload when informer
 // state is unavailable, preserving single-workload interception.
 func serviceWorkloads(ctx context.Context, spec *rpc.InterceptSpec, primary k8sapi.Workload) ([]k8sapi.Workload, error) {
@@ -452,7 +494,7 @@ func (s *State) checkServiceWorkloadConflictsIgnoring(
 	if client == nil {
 		return fmt.Errorf("client session is unavailable")
 	}
-	agentImage := managerutil.GetAgentImage(ctx)
+	agentImage := managerutil.GetAgentImageForNamespace(ctx, workload.GetNamespace())
 	if err := s.ValidateAgentImage(agentImage, s.isExtended(spec)); err != nil {
 		return err
 	}
@@ -891,6 +933,14 @@ func serviceScopesOverlap(a, b *rpc.InterceptSpec) bool {
 }
 
 func (s *State) AddIntercept(ctx context.Context, cir *rpc.CreateInterceptRequest) (*ClientSession, *rpc.InterceptInfo, error) {
+	return s.AddInterceptWithRoute(ctx, cir, nil)
+}
+
+// AddInterceptWithRoute invokes persist on the resolved spec after Service fallback
+// and agent checks, but before publishing the intercept to any live consumers.
+func (s *State) AddInterceptWithRoute(
+	ctx context.Context, cir *rpc.CreateInterceptRequest, persist func(*rpc.CreateInterceptRequest) error,
+) (*ClientSession, *rpc.InterceptInfo, error) {
 	clientSession := cir.Session
 	sessionID := tunnel.SessionID(clientSession.SessionId)
 	client := s.GetClient(sessionID)
@@ -941,6 +991,11 @@ func (s *State) AddIntercept(ctx context.Context, cir *rpc.CreateInterceptReques
 		}
 		serviceWorkloads = s.ensureServiceWorkloads(ctx, spec, wl, primaryConfig, primaryAgents, rp, client)
 	}
+	if persist != nil {
+		if err = persist(cir); err != nil {
+			return nil, nil, err
+		}
+	}
 
 	is, err := s.addIntercept(interceptID, cir, serviceWorkloads)
 	if err != nil {
@@ -956,6 +1011,7 @@ func (s *State) AddIntercept(ctx context.Context, cir *rpc.CreateInterceptReques
 			return nil, nil, grpcErrors.Errorf(codes.Internal, "invalid pod_port %q: %v", pm, err)
 		}
 		pmCir := proto.Clone(cir).(*rpc.CreateInterceptRequest)
+		pmCir.RouteIncarnation = "" // additional pod ports have no independent durable guard
 		pmSpec := pmCir.InterceptSpec
 		pmSpec.Name = fmt.Sprintf("%s-%d-%s", spec.Name, from, strings.ToLower(string(to.Proto)))
 		pmSpec.PodPorts = nil
@@ -1060,12 +1116,13 @@ func (s *State) addIntercept(id string, cir *rpc.CreateInterceptRequest, service
 func (s *State) NewInterceptInfo(interceptID string, ciReq *rpc.CreateInterceptRequest) *Intercept {
 	return &Intercept{
 		InterceptInfo: &rpc.InterceptInfo{
-			Spec:          ciReq.InterceptSpec,
-			Disposition:   rpc.InterceptDispositionType_WAITING,
-			Message:       "Waiting for Agent approval",
-			Id:            interceptID,
-			ClientSession: ciReq.Session,
-			ModifiedAt:    timestamppb.Now(),
+			Spec:             ciReq.InterceptSpec,
+			Disposition:      rpc.InterceptDispositionType_WAITING,
+			Message:          "Waiting for Agent approval",
+			Id:               interceptID,
+			ClientSession:    ciReq.Session,
+			ModifiedAt:       timestamppb.Now(),
+			RouteIncarnation: ciReq.RouteIncarnation,
 		},
 	}
 }
@@ -1403,23 +1460,35 @@ func (s *State) getOrCreateAgentConfig(
 		return nil, errcat.User.Newf("%s is not interceptable", wl)
 	}
 
-	agentImage := managerutil.GetAgentImage(ctx)
+	agentImage := managerutil.GetAgentImageForNamespace(ctx, wl.GetNamespace())
 	if err = s.ValidateAgentImage(agentImage, extended); err != nil {
 		return nil, err
+	}
+	env := managerutil.GetEnv(ctx)
+	needsScopedUpdate := func(sc *agentconfig.Sidecar) bool {
+		return sc != nil && !sc.Manual && env.RouteIntentAgentImageForNamespace(wl.GetNamespace()) != "" &&
+			(sc.AgentImage != agentImage || sc.RequireAuthoritativeRoutes != env.AgentRequireAuthoritativeRoutes)
 	}
 	mm := mutator.GetMap(ctx)
 	if dryRun {
 		sc := mm.Get(wl.GetName(), wl.GetNamespace())
 		if sc == nil {
 			sc, err = s.createAgentConfig(ctx, wl, agentImage)
+		} else if needsScopedUpdate(sc) {
+			sc, err = s.generateAgentConfig(ctx, wl, agentImage, sc)
 		}
 		return sc, err
 	}
 
 	return mm.Update(wl.GetName(), wl.GetNamespace(), func(sc *agentconfig.Sidecar) (*agentconfig.Sidecar, error) {
 		if sc != nil {
-			// If the agentImage has changed, and the extended image is requested, then update
-			if sc.AgentImage != agentImage {
+			if needsScopedUpdate(sc) {
+				sc, err = s.generateAgentConfig(ctx, wl, agentImage, sc)
+				if err != nil {
+					return nil, err
+				}
+			} else if sc.AgentImage != agentImage {
+				// Keep the standard pre-existing update behavior outside staged workloads.
 				sc.AgentImage = agentImage
 			}
 			if serviceScopedIntercept(spec) && !sidecarClaimsService(sc, spec) {

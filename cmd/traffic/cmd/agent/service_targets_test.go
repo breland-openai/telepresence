@@ -3,6 +3,7 @@ package agent
 import (
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 
@@ -10,6 +11,17 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/types"
 )
+
+func TestAdvertisedRouteGuardInstanceIsStrictAndStableForThisProcess(t *testing.T) {
+	legacy := &agentconfig.Sidecar{}
+	require.Empty(t, advertisedRouteGuardInstance(legacy))
+	strict := &agentconfig.Sidecar{RequireAuthoritativeRoutes: true}
+	first, err := uuid.Parse(advertisedRouteGuardInstance(strict))
+	require.NoError(t, err)
+	require.Equal(t, uuid.Version(4), first.Version())
+	require.Equal(t, first.String(), advertisedRouteGuardInstance(strict))
+	require.Equal(t, first.String(), advertisedRouteGuardInstance(&agentconfig.Sidecar{RequireAuthoritativeRoutes: true}))
+}
 
 func TestAdvertisedInterceptTargets(t *testing.T) {
 	ac := &agentconfig.Sidecar{Containers: []*agentconfig.Container{{
@@ -21,7 +33,9 @@ func TestAdvertisedInterceptTargets(t *testing.T) {
 				ServicePortName: "http",
 				ServicePort:     80,
 				Protocol:        types.ProtoTCP,
+				AppProtocol:     "http",
 				ContainerPort:   8080,
+				AgentPort:       9901,
 			},
 			{
 				// Duplicates are intentionally omitted from AgentInfo.
@@ -48,5 +62,9 @@ func TestAdvertisedInterceptTargets(t *testing.T) {
 		Protocol:        "TCP",
 		ContainerName:   "app",
 		ContainerPort:   8080,
+		AppProtocol:     "http",
+		AgentPort:       9901,
 	}}, advertisedInterceptTargets(ac))
+	ac.Containers[0].Replace = agentconfig.ReplacePolicyContainer
+	require.EqualValues(t, 8080, advertisedInterceptTargets(ac)[0].AgentPort, "replacement listeners bind the original container port")
 }

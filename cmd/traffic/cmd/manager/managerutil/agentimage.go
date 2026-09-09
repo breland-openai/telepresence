@@ -76,3 +76,12 @@ func GetAgentImage(ctx context.Context) string {
 	clog.Error(ctx, string(debug.Stack()))
 	panic("no ImageRetriever has been configured")
 }
+
+// GetAgentImageForNamespace returns the staged image for an explicitly covered
+// workload namespace and the standard retriever image for every other workload.
+func GetAgentImageForNamespace(ctx context.Context, namespace string) string {
+	if img := GetEnv(ctx).RouteIntentAgentImageForNamespace(namespace); img != "" {
+		return img
+	}
+	return GetAgentImage(ctx)
+}

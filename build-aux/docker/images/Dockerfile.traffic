@@ -14,7 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM --platform=$BUILDPLATFORM golang:alpine as tel2-build
+# Match go.mod: encoding/json/v2 agent-config formats can change across Go releases.
+FROM --platform=$BUILDPLATFORM golang:1.26.3-alpine@sha256:91eda9776261207ea25fd06b5b7fed8d397dd2c0a283e77f2ab6e91bfa71079d as tel2-build
 
 ENV GOEXPERIMENT=jsonv2
 

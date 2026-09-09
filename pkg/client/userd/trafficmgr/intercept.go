@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	core "k8s.io/api/core/v1"
 
 	"github.com/telepresenceio/clog"
@@ -76,6 +77,10 @@ type intercept struct {
 	// finalRemovalDone is closed when the traffic-manager sends a snapshot that no longer contains
 	// this intercept.
 	finalRemovalDone chan struct{}
+
+	// localRouteIncarnation identifies which local creation first received this
+	// watch entry; it is never sent unless the manager confirms it.
+	localRouteIncarnation string
 }
 
 // interceptResult is what gets written to the awaitIntercept's waitCh channel when the
@@ -99,6 +104,15 @@ type awaitIntercept struct {
 
 	readOnly bool
 	waitCh   chan<- interceptResult
+
+	// The locally proposed incarnation filters out watch events for a previous route
+	// with the same name. Only a manager-echoed incarnation is copied into snapshots.
+	routeIncarnation     string
+	confirmedIncarnation string
+}
+
+func (a *awaitIntercept) acceptsRoute(incarnation string) bool {
+	return a != nil && (a.routeIncarnation == "" || incarnation == "" || a.routeIncarnation == incarnation)
 }
 
 func (ic *intercept) localPorts() []string {
@@ -187,8 +201,10 @@ func (s *session) handleInterceptSnapshot(pat *podAccessTracker, intercepts []*m
 		s.currentInterceptsLock.Lock()
 		ic := s.currentIntercepts[ii.Id]
 		aw := s.interceptWaiters[ii.Spec.Name]
-		if aw != nil {
+		if aw.acceptsRoute(ii.RouteIncarnation) {
 			delete(s.interceptWaiters, ii.Spec.Name)
+		} else {
+			aw = nil
 		}
 		s.currentInterceptsLock.Unlock()
 
@@ -240,7 +256,7 @@ func (s *session) handleInterceptSnapshot(pat *podAccessTracker, intercepts []*m
 		pat.start(pa)
 	}
 	pat.cancelUnwanted(s, nil)
-	s.pushInterceptShortcuts(intercepts)
+	s.pushInterceptShortcuts()
 }
 
 // getCurrentIntercepts returns a copy of the current intercept snapshot. This snapshot does
@@ -267,22 +283,39 @@ func (s *session) getCurrentInterceptInfos() []*manager.InterceptInfo {
 func (s *session) setCurrentIntercepts(iis []*manager.InterceptInfo) {
 	s.currentInterceptsLock.Lock()
 	intercepts := make(map[string]*intercept, len(iis))
+	var removed []*intercept
 	sb := strings.Builder{}
 	sb.WriteByte('[')
 	for i, ii := range iis {
+		aw := s.interceptWaiters[ii.Spec.Name]
+		if ii.RouteIncarnation == "" && aw.acceptsRoute(ii.RouteIncarnation) && aw.confirmedIncarnation != "" {
+			ii.RouteIncarnation = aw.confirmedIncarnation
+		}
 		ic, ok := s.currentIntercepts[ii.Id]
+		if ok && ii.RouteIncarnation != "" && ic.RouteIncarnation != "" && ii.RouteIncarnation != ic.RouteIncarnation {
+			// The manager reuses the ID for a new route with the same name. Its
+			// local handler, mounts, and removal notification belong to the old route.
+			removed = append(removed, ic)
+			ok = false
+		}
 		if ok {
 			// retain ClientMountPoint, it's assigned in the client and never passed from the traffic-manager
 			ii.ClientMountPoint = ic.ClientMountPoint
+			// A manager that does not support route fencing may omit it; preserve a
+			// previously confirmed value for a later reconnect to an upgraded manager.
+			if ii.RouteIncarnation == "" {
+				ii.RouteIncarnation = ic.RouteIncarnation
+			}
 			ic.InterceptInfo = ii
 		} else {
 			ic = &intercept{InterceptInfo: ii, finalRemovalDone: make(chan struct{})}
 			ic.ctx, ic.cancel = context.WithCancel(s)
 			clog.Debugf(s, "Received new intercept %s", ic.Spec.Name)
-			if aw, ok := s.interceptWaiters[ii.Spec.Name]; ok {
+			if aw.acceptsRoute(ii.RouteIncarnation) {
 				ic.ClientMountPoint = aw.mountPoint
 				ic.localMountPort = aw.mountPort
 				ic.readOnly = aw.readOnly
+				ic.localRouteIncarnation = aw.routeIncarnation
 			}
 		}
 		intercepts[ii.Id] = ic
@@ -297,7 +330,6 @@ func (s *session) setCurrentIntercepts(iis []*manager.InterceptInfo) {
 	clog.Debugf(s, "setCurrentIntercepts(%s)", sb.String())
 
 	// Cancel those that no longer exists
-	var removed []*intercept
 	for id, ic := range s.currentIntercepts {
 		if _, ok := intercepts[id]; !ok {
 			removed = append(removed, ic)
@@ -312,6 +344,39 @@ func (s *session) setCurrentIntercepts(iis []*manager.InterceptInfo) {
 		ic.cancel()
 		close(ic.finalRemovalDone)
 	}
+}
+
+// rememberRouteIncarnation keeps an acknowledgment that may arrive before or
+// after the watcher has already received this route. Legacy managers echo none.
+func (s *session) rememberRouteIncarnation(ii *manager.InterceptInfo, proposed string) {
+	if ii.RouteIncarnation == "" {
+		return
+	}
+	_, newlyConfirmed := s.trackDurableRouteMediation(ii)
+	defer func() {
+		if newlyConfirmed && s.Cluster != nil {
+			// A watch entry with omitted metadata may have installed a shortcut
+			// before Create returned. Retract it before acknowledging creation locally.
+			s.pushInterceptShortcuts()
+		}
+	}()
+	s.currentInterceptsLock.Lock()
+	aw := s.interceptWaiters[ii.Spec.Name]
+	if aw != nil && aw.routeIncarnation != proposed {
+		s.currentInterceptsLock.Unlock()
+		return
+	}
+	if aw != nil {
+		aw.routeIncarnation = ii.RouteIncarnation
+		aw.confirmedIncarnation = ii.RouteIncarnation
+	}
+	if ic := s.currentIntercepts[ii.Id]; ic != nil && ic.Spec.Name == ii.Spec.Name && ic.RouteIncarnation == "" &&
+		(ic.localRouteIncarnation == "" || ic.localRouteIncarnation == proposed) {
+		confirmed := proto.Clone(ic.InterceptInfo).(*manager.InterceptInfo)
+		confirmed.RouteIncarnation = ii.RouteIncarnation
+		ic.InterceptInfo = confirmed
+	}
+	s.currentInterceptsLock.Unlock()
 }
 
 type interceptInfo struct {
@@ -552,7 +617,7 @@ func (s *session) CanIntercept(ctx context.Context, ir *rpc.CreateInterceptReque
 		spec.TargetHost = targetIP.String()
 	}
 
-	mgrIr := s.newCreateInterceptRequest(spec)
+	mgrIr := s.newCreateInterceptRequest(spec, "")
 	timeoutCtx, cancel := client.GetConfig(ctx).Timeouts().TimeoutContext(ctx, client.TimeoutIntercept)
 	defer cancel()
 	var pi *manager.PreparedIntercept
@@ -609,11 +674,51 @@ func (s *session) ResolveName(addr netip.Addr) string {
 	return s.syntheticIPs[addr]
 }
 
-func (s *session) newCreateInterceptRequest(spec *manager.InterceptSpec) *manager.CreateInterceptRequest {
+func (s *session) newCreateInterceptRequest(spec *manager.InterceptSpec, incarnation string) *manager.CreateInterceptRequest {
 	return &manager.CreateInterceptRequest{
-		Session:       s.SessionInfo(),
-		InterceptSpec: spec,
+		Session:          s.SessionInfo(),
+		InterceptSpec:    spec,
+		RouteIncarnation: incarnation,
 	}
+}
+
+func (s *session) newInterceptCreation(spec *manager.InterceptSpec) *manager.CreateInterceptRequest {
+	return s.newCreateInterceptRequest(spec, uuid.NewString())
+}
+
+// createInterceptWithRetry uses the same creation ID after a broken manager
+// connection. If the first response was lost and an old manager reports only
+// AlreadyExists, it is not safe to claim that an existing route is ours.
+func createInterceptWithRetry(
+	ctx context.Context,
+	req *manager.CreateInterceptRequest,
+	managerClient func() (manager.ManagerClient, uint64),
+	reconnect func(uint64) error,
+) (*manager.InterceptInfo, error) {
+	mgr, generation := managerClient()
+	ii, firstErr := mgr.CreateIntercept(ctx, req)
+	if firstErr == nil {
+		return ii, nil
+	}
+	st, ok := status.FromError(firstErr)
+	if !ok || (st.Code() != codes.Unavailable && (st.Code() != codes.NotFound || !strings.HasPrefix(st.Message(), "Client session "))) || ctx.Err() != nil {
+		return nil, firstErr
+	}
+	if reconnect(generation) != nil || ctx.Err() != nil {
+		return nil, firstErr
+	}
+	mgr, _ = managerClient()
+	ii, err := mgr.CreateIntercept(ctx, req)
+	if status.Code(err) == codes.AlreadyExists {
+		if req.RouteIncarnation != "" {
+			existing, lookupErr := mgr.GetIntercept(ctx, &manager.GetInterceptRequest{Session: req.Session, Name: req.InterceptSpec.Name})
+			if lookupErr == nil && existing.GetRouteIncarnation() == req.RouteIncarnation {
+				return existing, nil
+			}
+		}
+		return nil, firstErr
+	}
+	return ii, err
 }
 
 // AddIntercept adds one intercept.
@@ -632,8 +737,6 @@ func (s *session) AddIntercept(ctx context.Context, ir *rpc.CreateInterceptReque
 	// Start the workload info watcher early so that the workload snapshot is up to
 	// date with this intercept's workload by the time this call returns.
 	go s.ensureWatchers([]string{spec.Namespace})
-
-	mgrClient := s.ManagerClient()
 
 	// iInfo.preparedIntercept == nil means that we're using an older traffic-manager, incapable
 	// of using PrepareIntercept.
@@ -675,41 +778,51 @@ func (s *session) AddIntercept(ctx context.Context, ir *rpc.CreateInterceptReque
 	spec.DialTimeout = int64(tos.Get(client.TimeoutInterceptEndpointDial))
 	c, cancel := tos.TimeoutContext(ctx, client.TimeoutIntercept)
 	defer cancel()
+	creation := s.newInterceptCreation(spec)
+	defer s.beginDurableShortcutCandidate(spec)()
 
 	// The agent is in place and the traffic-manager has acknowledged the creation of the intercept. It
 	// should become active within a few seconds.
 	waitCh := make(chan interceptResult, 2) // Need a buffer because reply can come before we're reading the channel,
-	s.currentInterceptsLock.Lock()
-	s.interceptWaiters[spec.Name] = &awaitIntercept{
-		mountPoint: ir.MountPoint,
-		mountPort:  ir.LocalMountPort,
-		readOnly:   ir.MountReadOnly,
-		waitCh:     waitCh,
+	pending := &awaitIntercept{
+		mountPoint:       ir.MountPoint,
+		mountPort:        ir.LocalMountPort,
+		readOnly:         ir.MountReadOnly,
+		waitCh:           waitCh,
+		routeIncarnation: creation.RouteIncarnation,
 	}
+	s.currentInterceptsLock.Lock()
+	if _, ok := s.interceptWaiters[spec.Name]; ok {
+		s.currentInterceptsLock.Unlock()
+		return nil, status.Errorf(codes.AlreadyExists, "intercept with name %q is already being created", spec.Name)
+	}
+	s.interceptWaiters[spec.Name] = pending
 	s.currentInterceptsLock.Unlock()
 	defer func() {
 		s.currentInterceptsLock.Lock()
-		if _, ok := s.interceptWaiters[spec.Name]; ok {
+		if s.interceptWaiters[spec.Name] == pending {
 			delete(s.interceptWaiters, spec.Name)
 			close(waitCh)
 		}
 		s.currentInterceptsLock.Unlock()
 	}()
 
-	ii, err := mgrClient.CreateIntercept(c, s.newCreateInterceptRequest(spec))
+	ii, err := createInterceptWithRetry(c, creation, s.managerClient, s.reconnectManager)
 	if err != nil {
 		clog.Debugf(c, "manager responded to CreateIntercept with error %v", err)
 		return nil, err
 	}
+	s.rememberRouteIncarnation(ii, creation.RouteIncarnation)
 
 	clog.Debugf(c, "created intercept %s", ii.Spec.Name)
 
+	createdName, createdIncarnation := ii.Spec.Name, ii.RouteIncarnation
 	success := false
 	defer func() {
 		if !success {
-			clog.Debugf(c, "intercept %s failed to create, will remove...", ii.Spec.Name)
-			if removeErr := s.RemoveIntercept(ii.Spec.Name); removeErr != nil {
-				clog.Warnf(c, "failed to remove failed intercept %s: %v", ii.Spec.Name, removeErr)
+			clog.Debugf(c, "intercept %s failed to create, will remove...", createdName)
+			if removeErr := s.removeCreatedIntercept(createdName, createdIncarnation); removeErr != nil {
+				clog.Warnf(c, "failed to remove failed intercept %s: %v", createdName, removeErr)
 			}
 		}
 	}()
@@ -769,32 +882,70 @@ func (s *session) RemoveIntercept(name string) error {
 	// context is already done.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(s), 5*time.Second)
 	defer cancel()
-	ii := s.getInterceptByName(name)
-	if ii == nil {
+	s.currentInterceptsLock.Lock()
+	ic := s.getInterceptByNameLocked(name)
+	var incarnation string
+	if ic != nil {
+		name, incarnation = ic.Spec.Name, ic.RouteIncarnation
+	}
+	s.currentInterceptsLock.Unlock()
+	if ic == nil {
 		clog.Debugf(ctx, "Intercept %s was already removed", name)
 		return nil
 	}
-	return s.removeIntercept(ii)
+	return s.removeInterceptRoute(ctx, ic, name, incarnation)
 }
 
 func (s *session) removeIntercept(ic *intercept) error {
-	name := ic.Spec.Name
-	s.stopHandler(name, ic.handlerContainer, ic.pid)
+	s.currentInterceptsLock.Lock()
+	name, incarnation := ic.Spec.Name, ic.RouteIncarnation
+	s.currentInterceptsLock.Unlock()
+	return s.removeInterceptRoute(s, ic, name, incarnation)
+}
 
-	// Unmount filesystems before telling the manager to remove the intercept
-	ic.cancel()
-	ic.wg.Wait()
+// A failed creation must never cancel a newer intercept that reused its name.
+// If its watch event has not arrived, an echoed token still lets the manager
+// safely remove exactly the acknowledged route. Legacy managers echo no token.
+func (s *session) removeCreatedIntercept(name, incarnation string) error {
+	s.currentInterceptsLock.Lock()
+	ic := s.createdInterceptForRemovalLocked(name, incarnation)
+	s.currentInterceptsLock.Unlock()
+	if ic == nil && incarnation == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(s), 5*time.Second)
+	defer cancel()
+	return s.removeInterceptRoute(ctx, ic, name, incarnation)
+}
 
-	c := s.Context
+func (s *session) createdInterceptForRemovalLocked(name, incarnation string) *intercept {
+	for _, ic := range s.currentIntercepts {
+		if ic.Spec.Name == name && ic.RouteIncarnation == incarnation {
+			return ic
+		}
+	}
+	return nil
+}
+
+func (s *session) removeInterceptRoute(c context.Context, ic *intercept, name, incarnation string) error {
+	if ic != nil {
+		s.stopHandler(name, ic.handlerContainer, ic.pid)
+
+		// Unmount filesystems before telling the manager to remove the intercept.
+		ic.cancel()
+		ic.wg.Wait()
+	}
+
 	clog.Debugf(c, "telling manager to remove intercept %s", name)
 	tos := client.GetConfig(c).Timeouts()
 	cc, cancel := tos.TimeoutContext(c, client.TimeoutTrafficManagerAPI)
 	defer cancel()
 	_, err := s.ManagerClient().RemoveIntercept(cc, &manager.RemoveInterceptRequest2{
-		Session: s.SessionInfo(),
-		Name:    name,
+		Session:          s.SessionInfo(),
+		Name:             name,
+		RouteIncarnation: incarnation,
 	})
-	if err == nil {
+	if err == nil && ic != nil {
 		select {
 		case <-c.Done():
 		case <-ic.finalRemovalDone:
@@ -912,6 +1063,10 @@ func (s *session) GetInterceptInfo(name string) *manager.InterceptInfo {
 func (s *session) getInterceptByName(name string) *intercept {
 	s.currentInterceptsLock.Lock()
 	defer s.currentInterceptsLock.Unlock()
+	return s.getInterceptByNameLocked(name)
+}
+
+func (s *session) getInterceptByNameLocked(name string) *intercept {
 	for _, ic := range s.currentIntercepts {
 		if ic.Spec.Name == name {
 			return ic

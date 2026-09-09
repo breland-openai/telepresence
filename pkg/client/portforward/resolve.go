@@ -93,6 +93,7 @@ func ResolveSvcToPod(ctx context.Context, name, namespace, portName string) (pa 
 			containerPort, err := containerPortNumber(p, svcPort.TargetPort)
 			if err == nil {
 				pa.Name = p.Name
+				pa.ServiceAccount = p.Spec.ServiceAccountName
 				pa.Port = containerPort
 				pa.Proto = types.FromK8sProtocol(svcPort.Protocol)
 				pa.PodID = p.UID

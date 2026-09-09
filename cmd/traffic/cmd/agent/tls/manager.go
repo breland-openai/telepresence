@@ -131,7 +131,7 @@ func (m *manager) createPortConfigs(ctx context.Context, am map[string]string) e
 			// reach the application for cp; its port is the same proxy/container port
 			// InterceptorInactivePort would return. A node-agent (non-nil dialer)
 			// always programs the nftables redirects.
-			nftRedirects := m.dialer != nil || m.sidecarConfig.NftRedirectsActive()
+			nftRedirects := m.dialer != nil || m.sidecarConfig.NftRedirectsPort(cp, types.ProtoTCP)
 			target := m.sidecarConfig.PassThroughTarget(m.appPodIP, cp, types.ProtoTCP, nftRedirects)
 			iap := target.Port()
 			pc := newPortConfig(target, m.dialer, cn.Name, m.sidecarConfig.EnableH2cProbing)
@@ -289,7 +289,7 @@ func (m *manager) configuredTLS(containerPort uint16) ValueState {
 
 func isCleartextHTTP1(appProtocol string) bool {
 	switch appProtocol {
-	case "http", "kubernetes.io/http", "http1", "http1.0", "http1.1", "http/1.0", "http/1.1":
+	case "http", "kubernetes.io/http", "http1", "http1.0", "http1.1", "http/1.0", "http/1.1", "ws", "kubernetes.io/ws":
 		return true
 	default:
 		return false

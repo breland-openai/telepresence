@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	core "k8s.io/api/core/v1"
@@ -303,6 +304,10 @@ type Sidecar struct {
 
 	// WatchRetryInterval is the interval between retries that a watcher uses when the gRPC connection to the traffic-manager is lost.
 	WatchRetryInterval time.Duration `json:"watchRetryInterval,format:units"`
+
+	// RequireAuthoritativeRoutes withholds initial readiness until the manager has
+	// supplied the complete durable route list, and preserves it during reconnects.
+	RequireAuthoritativeRoutes bool `json:"requireAuthoritativeRoutes,omitzero"`
 }
 
 // InterceptTarget returns the container and intercepts that are parents of the given container port and protocol.
@@ -342,7 +347,7 @@ func (s *Sidecar) InterceptorInactivePort(containerPort uint16, proto types.Prot
 		if inactivePort := it.InactivePort(); inactivePort != 0 {
 			return inactivePort
 		}
-		if it.TargetPortNumeric() {
+		if it.TargetPortNumeric() || s.RouteIntentPortRedirect(containerPort, proto) {
 			return s.ProxyPort(it.AgentPort())
 		}
 	}
@@ -379,14 +384,24 @@ func (s *Sidecar) PassThroughTarget(appPodIP netip.Addr, containerPort uint16, p
 	return netip.AddrPortFrom(targetIP, cp)
 }
 
-// NftRedirectsActive reports whether this config makes a sidecar's pod carry the
-// agent's nftables ruleset: a headless or numeric-target intercept in a container
-// that is replaced on intercept requires the init container to program it. Without
-// the ruleset there is no pod-IP redirect gate, and the pass-through dial must use
-// the pod IP so that an application that binds to it (rather than to a wildcard or
-// loopback address) stays reachable. A node-agent programs the ruleset
-// unconditionally, so this predicate only applies to the sidecar.
+// NftRedirectsActive reports whether a sidecar needs the pod's nftables ruleset.
 func (s *Sidecar) NftRedirectsActive() bool {
+	if s.legacyNftRedirectsActive() {
+		return true
+	}
+	if s.RequireAuthoritativeRoutes {
+		for _, cc := range s.Containers {
+			for _, ic := range cc.Intercepts {
+				if s.RouteIntentPortRedirect(ic.ContainerPort, ic.Protocol) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (s *Sidecar) legacyNftRedirectsActive() bool {
 	for _, cc := range s.Containers {
 		if cc.Replace == ReplacePolicyIntercept {
 			for _, ic := range cc.Intercepts {
@@ -394,6 +409,31 @@ func (s *Sidecar) NftRedirectsActive() bool {
 					return true
 				}
 			}
+		}
+	}
+	return false
+}
+
+// NftRedirectsPort reports whether a sidecar's ruleset redirects this application
+// port. A node-agent always redirects all of its configured ports.
+func (s *Sidecar) NftRedirectsPort(containerPort uint16, proto types.Proto) bool {
+	return s.legacyNftRedirectsActive() || s.RouteIntentPortRedirect(containerPort, proto)
+}
+
+// RouteIntentPortRedirect reports whether a protected clear HTTP port must reach
+// the agent even when a mesh proxy still routes directly to the application port.
+func (s *Sidecar) RouteIntentPortRedirect(containerPort uint16, proto types.Proto) bool {
+	if !s.RequireAuthoritativeRoutes || proto != types.ProtoTCP {
+		return false
+	}
+	c, target := s.InterceptTarget(containerPort, proto)
+	if c == nil || c.Replace != ReplacePolicyIntercept {
+		return false
+	}
+	for _, ic := range target {
+		switch strings.ToLower(ic.AppProtocol) {
+		case "http", "kubernetes.io/http", "http1", "http1.0", "http1.1", "http/1.0", "http/1.1", "ws", "kubernetes.io/ws":
+			return true
 		}
 	}
 	return false

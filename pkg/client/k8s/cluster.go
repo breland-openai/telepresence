@@ -291,6 +291,13 @@ func ConnectCluster(cr *rpc.ConnectRequest, config *Kubeconfig) (*Cluster, error
 //  3. If the client has access to the default namespace, then return it.
 //  4. Return an error stating that it isn't possible to determine the namespace.
 func (kc *Cluster) determineTrafficManagerNamespace() (string, error) {
+	if kc.managerTokenCallbackNegotiated || usesDevboxWorkloadIdentity(kc.RestConfig) {
+		namespace, _ := kc.trustedDevboxManagerPolicy().managerLocation()
+		if _, err := k8sapi.GetService(kc, agentconfig.ManagerAppName, namespace); err != nil {
+			return "", errcat.User.Newf("unable to access traffic-manager in system-trusted namespace %s", namespace)
+		}
+		return namespace, nil
+	}
 	// Search for the traffic-manager in mapped namespaces
 	nss := kc.GetCurrentNamespaces(true)
 	for _, ns := range nss {

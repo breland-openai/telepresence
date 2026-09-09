@@ -26,6 +26,7 @@ import (
 	"github.com/telepresenceio/telepresence/rpc/v2/connector"
 	"github.com/telepresenceio/telepresence/rpc/v2/daemon"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/global"
+	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
 	"github.com/telepresenceio/telepresence/v2/pkg/errcat"
 	"github.com/telepresenceio/telepresence/v2/pkg/maps"
 	"github.com/telepresenceio/telepresence/v2/pkg/slice"
@@ -346,7 +347,7 @@ func (cr *Request) addKubeconfigEnv() {
 	// and since those files can be specified, both as a --kubeconfig flag and in the KUBECONFIG setting, and since the flag won't
 	// accept multiple path entries, we need to pass the environment setting to the connector daemon so that it can set it every
 	// time it receives a new config.
-	cr.Environment = make(map[string]string, 2)
+	cr.Environment = make(map[string]string, 3)
 	addEnv := func(key string) {
 		if v, ok := os.LookupEnv(key); ok {
 			cr.Environment[key] = v
@@ -357,6 +358,12 @@ func (cr *Request) addKubeconfigEnv() {
 	}
 	addEnv("KUBECONFIG")
 	addEnv("GOOGLE_APPLICATION_CREDENTIALS")
+	// Carry this per-connection path to userd even when the daemon already
+	// exists. An implicit command without the variable retains the connection's
+	// existing credential; explicitly changing it requires a new connection.
+	if path, ok := os.LookupEnv(k8s.ManagerTokenFileEnv); ok {
+		cr.Environment[k8s.ManagerTokenFileEnv] = path
+	}
 }
 
 // setContext deals with the global --context flag and assigns it to KubeFlags because it's

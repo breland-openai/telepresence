@@ -32,6 +32,16 @@ rules:
   - list
   - get
   - watch
+{{- if .routeIntent.enabled }}
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
+  - watch
+{{- end }}
 {{- if .agentInjector.enabled }}
 - apiGroups:
   - ""

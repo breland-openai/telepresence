@@ -23,21 +23,53 @@ var errClientStream = errors.New("failed to create client stream")
 
 type tcp struct {
 	*interceptor
-	tlsManager         tls.Manager
-	listenerSwitch     ListenerSwitch
-	httpTransportCache sync.Map
-	httpRequestID      atomic.Uint64
+	tlsManager             tls.Manager
+	listenerSwitch         ListenerSwitch
+	permanentHTTP          bool
+	routeSnapshotInstalled bool // guarded by mu; never cleared across manager reconnects
+	httpTransportCache     sync.Map
+	httpRequestID          atomic.Uint64
 }
 
 func NewTCPInterceptor(ctx context.Context, listenPort types.PortAndProto, tag tunnel.Tag, tlsManager tls.Manager, target netip.AddrPort, opts ...forwarder.Option) Interceptor {
+	return newTCPInterceptor(ctx, listenPort, tag, tlsManager, target, false, opts...)
+}
+
+// NewHTTPMediatedTCPInterceptor routes each HTTP request or upgrade through the
+// interceptor for the listener's entire lifetime. A connection opened when no
+// routes exist must not permanently bypass a route installed later.
+func NewHTTPMediatedTCPInterceptor(
+	ctx context.Context, listenPort types.PortAndProto, tag tunnel.Tag, tlsManager tls.Manager, target netip.AddrPort, opts ...forwarder.Option,
+) Interceptor {
+	return newTCPInterceptor(ctx, listenPort, tag, tlsManager, target, true, opts...)
+}
+
+func newTCPInterceptor(
+	ctx context.Context, listenPort types.PortAndProto, tag tunnel.Tag, tlsManager tls.Manager, target netip.AddrPort, permanentHTTP bool, opts ...forwarder.Option,
+) Interceptor {
 	return &tcp{
-		interceptor: newInterceptor(ctx, listenPort, tag, target, opts...),
-		tlsManager:  tlsManager,
+		interceptor:   newInterceptor(ctx, listenPort, tag, target, opts...),
+		tlsManager:    tlsManager,
+		permanentHTTP: permanentHTTP,
 	}
 }
 
+func (f *tcp) SupportsHTTPRouteGuards() bool { return f.permanentHTTP }
+
+func (f *tcp) MarkRouteSnapshotInstalled() {
+	f.mu.Lock()
+	f.routeSnapshotInstalled = true
+	f.mu.Unlock()
+}
+
 func (f *tcp) IsHTTP() bool {
-	return f.intercepts.isHTTP() || f.wiretaps.isHTTP()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.isHTTPLocked()
+}
+
+func (f *tcp) isHTTPLocked() bool {
+	return f.permanentHTTP || len(f.routeGuards) > 0 || len(f.pendingGuards) > 0 || f.intercepts.isHTTP() || f.wiretaps.isHTTP()
 }
 
 // SetIntercepting overrides the base implementation to handle HTTP intercepts.
@@ -53,12 +85,22 @@ func (f *tcp) SetWiretapping(intercepts []*manager.InterceptInfo) {
 	f.setListenerSwitch()
 }
 
+func (f *tcp) SetRouteGuards(desired, removed []RouteGuard) {
+	f.interceptor.SetRouteGuards(desired, removed)
+	f.setListenerSwitch()
+}
+
+func (f *tcp) SetPendingRouteGuards(guards []RouteGuard) {
+	f.interceptor.SetPendingRouteGuards(guards)
+	f.setListenerSwitch()
+}
+
 // Configure the listener switch based on the intercepts. The switch will be on (HTTP) if there is at least
 // one intercept with a header or path filter.
 func (f *tcp) setListenerSwitch() {
 	f.mu.Lock()
 	if f.listenerSwitch != nil {
-		f.listenerSwitch.Switch(f.IsHTTP())
+		f.listenerSwitch.Switch(f.isHTTPLocked())
 	}
 	f.mu.Unlock()
 }
@@ -76,26 +118,27 @@ func (f *tcp) Serve(_ context.Context, initCh chan<- netip.AddrPort) error {
 	}()
 
 	la := listener.Addr().(*net.TCPAddr)
+	clog.Debugf(ctx, "Forwarding from %s", la)
+	defer clog.Debugf(ctx, "Done forwarding from %s", la)
+
+	// The legacy listener switches between raw TCP and HTTP when filters change.
+	// A permanently mediated port must select HTTP before any connection is accepted.
+	ls := NewListenerSwitch(listener, func(l net.Listener) {
+		f.acceptHTTPLoop(ctx, l)
+	})
+	f.mu.Lock()
+	f.listenerSwitch = ls
+	f.mu.Unlock()
+	f.setListenerSwitch()
 	if initCh != nil {
 		initCh <- la.AddrPort()
 		close(initCh)
 	}
 
-	clog.Debugf(ctx, "Forwarding from %s", la)
-	defer clog.Debugf(ctx, "Done forwarding from %s", la)
-
-	// The listener switch is used to switch between the primary listener (for TCP) and the secondary listener (for HTTP).
-	// The switch is initially on the primary listener and will be switched to the secondary listener when there is at least
-	// one intercept with a header or path filter.
-	f.listenerSwitch = NewListenerSwitch(listener, func(l net.Listener) {
-		f.acceptHTTPLoop(ctx, l)
-	})
-	f.setListenerSwitch()
-
 	// Dispatch to the primary and secondary listeners in separate go routines.
-	go forwarder.AcceptLoop(ctx, f.listenerSwitch.Primary(), f.Forward)
+	go forwarder.AcceptLoop(ctx, ls.Primary(), f.Forward)
 
-	return f.listenerSwitch.Serve()
+	return ls.Serve()
 }
 
 // Number of []byte chunks that can be cached by a wiretap connection before it discards data.

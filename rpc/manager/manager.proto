@@ -104,6 +104,9 @@ message AgentInfo {
     string protocol = 5;
     string container_name = 6;
     int32 container_port = 7;
+    // Explicit application protocol used for stable local-route mediation.
+    string app_protocol = 8;
+    int32 agent_port = 9;
   }
 
   // Service-backed targets advertised by this agent. Older agents leave this
@@ -114,6 +117,11 @@ message AgentInfo {
   // container environment maps were intentionally omitted. Callers that need
   // those maps must fetch a full AgentInfo through EnsureAgent.
   bool container_environment_omitted = 18;
+
+  // Random identity of this traffic-agent process's in-memory route guards.
+  // It stays constant over manager reconnects and changes on container restart.
+  string route_guard_instance = 19;
+  google.protobuf.Timestamp route_guard_started_at = 20;
 
   reserved 6;
 }
@@ -348,6 +356,9 @@ message InterceptInfo {
   // server-side integrations can configure every participating workload.
   repeated InterceptWorkload service_workloads = 23;
 
+  // Identifies this creation of a durably guarded local HTTP route.
+  string route_incarnation = 24;
+
   reserved 7; // was preview_domain
 
   reserved 9; // was PreviewSpec preview_spec
@@ -430,6 +441,8 @@ message SessionEventsDelta {
 message CreateInterceptRequest {
   SessionInfo session = 1;
   InterceptSpec intercept_spec = 2;
+  // An idempotent creation identifier for a durably guarded local HTTP route.
+  string route_incarnation = 4;
   reserved 3; // was api_key;
 }
 
@@ -474,6 +487,8 @@ message PreparedIntercept {
 message RemoveInterceptRequest2 {
   SessionInfo session = 1;
   string name = 2;
+  // Only the indicated creation of a durably guarded route may be removed.
+  string route_incarnation = 3;
 }
 
 message GetInterceptRequest {
@@ -585,6 +600,11 @@ message VersionInfo2 {
   // to use as per-RPC authorization metadata. Only the traffic-manager
   // populates this.
   uint32 auth_x509_port = 5;
+
+  // Optional vetted Applied Devbox proxy audience for manager-only bearer
+  // credentials. It is never used to authenticate requests to Kubernetes.
+  // Empty preserves the client's existing manager authentication behavior.
+  string auth_devbox_proxy_audience = 6;
 }
 
 // TunnelMessage is a message sent over a Tunnel. First byte indicates type of message
@@ -1027,6 +1047,79 @@ message UninstallAgentsRequest {
   repeated string agents = 2;
 }
 
+// RouteIntentTarget identifies a workload port protected by a local routing rule.
+message RouteIntentTarget {
+  string namespace = 1;
+  string workload_kind = 2;
+  string workload_name = 3;
+  int32 container_port = 4;
+  string service_name = 5;
+  string service_uid = 6;
+  int32 service_port = 7;
+  // Actual configured HTTP listener on the workload traffic-agent.
+  int32 agent_port = 8;
+  string app_protocol = 9;
+}
+
+// RouteIntent contains the exact local routing rule a consumer must protect.
+message RouteIntent {
+  // State describes desired routing independently of tunnel availability.
+  enum State {
+    UNSPECIFIED = 0;
+    DESIRED = 1;
+    REMOVED = 2;
+  }
+
+  string intercept_id = 1;
+  string incarnation = 2;
+  uint64 revision = 3;
+  State state = 4;
+  string routing_key = 5;
+  repeated RouteIntentTarget targets = 6;
+  google.protobuf.Timestamp lease_until = 7;
+  // True only when the exact desired revision has been installed and
+  // acknowledged by every currently eligible routable agent pod.
+  bool agents_guarded = 8;
+  // Controller-only fingerprint of the currently gateway-compatible target and
+  // protocol set. Empty means that the topology is not proven or unsupported.
+  string gateway_topology = 9;
+}
+
+// RouteIntentSnapshot is complete only when its state is AUTHORITATIVE.
+message RouteIntentSnapshot {
+  // SyncState reports whether the entire scoped route list is known.
+  enum SyncState {
+    UNSPECIFIED = 0;
+    SYNCHRONIZING = 1;
+    AUTHORITATIVE = 2;
+  }
+
+  SyncState sync_state = 1;
+  string manager_epoch = 2;
+  repeated RouteIntent intents = 3;
+  // Controller-only inventory for installing stable HTTP mediation before the
+  // first local route. An authoritative empty route list does not remove it.
+  repeated RouteIntentTarget eligible_targets = 4;
+}
+
+message RouteIntentAck {
+  string intercept_id = 1;
+  string incarnation = 2;
+  uint64 revision = 3;
+  // Controllers must echo the nonempty fingerprint they applied. Agents omit it.
+  string gateway_topology = 4;
+}
+
+message RouteIntentAckRequest {
+  // An agent provides its own authenticated session. An authorized controller
+  // omits this; its ACK reports Kubernetes accepted its gateway configuration,
+  // not that Envoy has received xDS.
+  SessionInfo session = 1;
+  repeated RouteIntentAck applied = 2; // protolint:disable:this REPEATED_FIELD_NAMES_PLURALIZED
+  string agent_guard_instance = 3;
+  google.protobuf.Timestamp applied_at = 4;
+}
+
 service Manager {
   // Version returns the version information of the Manager.
   rpc Version(google.protobuf.Empty) returns (VersionInfo2);
@@ -1211,4 +1304,12 @@ service Manager {
   // UninstallAgents will uninstall the traffic-agent from the given workloads (or all
   // workloads if the list is empty).
   rpc UninstallAgents(UninstallAgentsRequest) returns (google.protobuf.Empty);
+
+  // WatchRouteIntents sends complete routing guards scoped to the caller.
+  // Agents receive their own workload's guards; an authorized controller can
+  // request all managed routes with an empty session.
+  rpc WatchRouteIntents(SessionInfo) returns (stream RouteIntentSnapshot);
+
+  // AcknowledgeRouteIntents confirms exact revisions after local installation.
+  rpc AcknowledgeRouteIntents(RouteIntentAckRequest) returns (google.protobuf.Empty);
 }

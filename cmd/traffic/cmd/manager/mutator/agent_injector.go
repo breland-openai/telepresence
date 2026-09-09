@@ -133,7 +133,7 @@ func (a *agentInjector) Inject(ctx context.Context, req *admission.AdmissionRequ
 		}
 		fallthrough
 	case "enabled":
-		img := managerutil.GetAgentImage(ctx)
+		img := managerutil.GetAgentImageForNamespace(ctx, pod.Namespace)
 		if img == "" {
 			clog.Debug(ctx, "Skipping webhook injection because the traffic-manager is unable to determine what image to use for injected traffic-agents.")
 			return nil, nil
@@ -163,6 +163,12 @@ func (a *agentInjector) Inject(ctx context.Context, req *admission.AdmissionRequ
 			if sc == nil {
 				clog.Tracef(ctx, "Skipping %s (no agent config)", wl)
 				return nil, nil
+			}
+			if env.RouteIntentAgentImageForNamespace(wl.GetNamespace()) != "" && !sc.Manual {
+				sc, err = a.agentConfigs.GetOrGenerate(ctx, wl)
+				if err != nil {
+					return nil, fmt.Errorf("unable to update scoped agent config for workload %s.%s: %w", wl.GetNamespace(), wl.GetName(), err)
+				}
 			}
 		}
 		if sc.Manual {
@@ -336,6 +342,9 @@ func addInitContainer(ctx context.Context, pod *core.Pod, wlTpl *core.PodTemplat
 		}
 		return patches, nil
 	}
+	if err := config.ValidateRouteIntentInitSecurity(); err != nil {
+		return nil, err
+	}
 
 	pis := pod.Spec.InitContainers
 	ab := agentconfig.ContainerBuilder{
@@ -363,7 +372,8 @@ func addInitContainer(ctx context.Context, pod *core.Pod, wlTpl *core.PodTemplat
 				slices.Equal(ic.Args, oc.Args) &&
 				compareAgentOwnerEnv(ic.Env, oc.Env) &&
 				compareVolumeMounts(ic.VolumeMounts, oc.VolumeMounts) &&
-				compareCapabilities(ic.SecurityContext, oc.SecurityContext) {
+				compareCapabilities(ic.SecurityContext, oc.SecurityContext) &&
+				(!config.RequireAuthoritativeRoutes || sameRouteIntentInitIdentity(ic.SecurityContext, oc.SecurityContext)) {
 				return patches, nil
 			}
 			return append(patches, PatchOperation{
@@ -379,6 +389,12 @@ func addInitContainer(ctx context.Context, pod *core.Pod, wlTpl *core.PodTemplat
 		Path:  "/spec/initContainers/-",
 		Value: ic,
 	}), nil
+}
+
+func sameRouteIntentInitIdentity(a, b *core.SecurityContext) bool {
+	return b != nil && cmp.Equal(a.RunAsUser, b.RunAsUser) && cmp.Equal(a.RunAsGroup, b.RunAsGroup) &&
+		cmp.Equal(a.RunAsNonRoot, b.RunAsNonRoot) && cmp.Equal(a.AllowPrivilegeEscalation, b.AllowPrivilegeEscalation) &&
+		cmp.Equal(a.Privileged, b.Privileged)
 }
 
 func addAgentVolumes(agentName string, pod *core.Pod, coverDir string, patches PatchOps) (PatchOps, error) {
@@ -432,6 +448,9 @@ func compareProbes(a, b *core.Probe) bool {
 }
 
 func compareCapabilities(a *core.SecurityContext, b *core.SecurityContext) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
 	ac := a.Capabilities
 	bc := b.Capabilities
 	if ac == bc {

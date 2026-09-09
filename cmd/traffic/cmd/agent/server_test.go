@@ -6,6 +6,7 @@ package agent
 
 import (
 	"context"
+	"net"
 	"net/netip"
 	"sync"
 	"testing"
@@ -25,11 +26,242 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/sessiontoken"
 	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
+	"github.com/telepresenceio/telepresence/v2/pkg/types"
 )
 
 type metricsManagerClient struct {
 	rpc.ManagerClient
 	reports chan *rpc.TunnelMetrics
+}
+
+func TestAwaitingForwardAbandonedBeforePeerReturns(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(t.Context())
+	aw := &awaitingForward{streamCh: make(chan tunnel.Stream), doneCh: requestCtx.Done()}
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- aw.serve(t.Context(), nil) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("late Tunnel handler blocked sending to the abandoned waiter")
+	}
+}
+
+func TestAwaitingForwardPeerCanCancelBeforeHandoff(t *testing.T) {
+	peerCtx, cancel := context.WithCancel(t.Context())
+	aw := &awaitingForward{streamCh: make(chan tunnel.Stream), doneCh: t.Context().Done()}
+	done := make(chan error, 1)
+	go func() { done <- aw.serve(peerCtx, nil) }()
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("canceled Tunnel handler blocked sending its stream")
+	}
+}
+
+func TestAwaitingForwardEstablishedTunnelLastsUntilConnectionCloses(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	aw := &awaitingForward{streamCh: make(chan tunnel.Stream), doneCh: requestCtx.Done()}
+	done := make(chan error, 1)
+	go func() { done <- aw.serve(t.Context(), nil) }()
+	select {
+	case <-aw.streamCh:
+	case <-time.After(time.Second):
+		t.Fatal("Tunnel handler did not deliver its stream")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Tunnel handler stopped immediately after its stream was accepted: %v", err)
+	default:
+	}
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Tunnel handler remained active after its connection closed")
+	}
+}
+
+func TestAwaitingForwardLegacyTombstoneExpiresOrCanBeReplaced(t *testing.T) {
+	const timeout = 25 * time.Millisecond
+	t.Run("unused entry expires", func(t *testing.T) {
+		aw := &awaitingForward{}
+		removed := make(chan struct{})
+		aw.keepForLateResponse(timeout, func() { close(removed) })
+		select {
+		case <-removed:
+		case <-time.After(time.Second):
+			t.Fatal("legacy dial response tombstone did not expire")
+		}
+	})
+	t.Run("replacement prevents old cleanup", func(t *testing.T) {
+		aw := &awaitingForward{}
+		removed := make(chan struct{}, 2)
+		aw.keepForLateResponse(timeout, func() { removed <- struct{}{} })
+		aw.stopCleanup()
+		aw.keepForLateResponse(timeout, func() { removed <- struct{}{} })
+		select {
+		case <-removed:
+			t.Fatal("a replaced legacy tombstone attempted to remove its successor")
+		case <-time.After(3 * timeout):
+		}
+	})
+}
+
+func TestCreateClientStreamRejectsConcurrentConnIDAndReplacesAbandonedWaiter(t *testing.T) {
+	ctx := testutil.NewContext(t, false)
+	cfg := &fakeConfig{sidecar: &agentconfig.Sidecar{}, podIP: netip.MustParseAddr("127.0.0.1")}
+	st, err := NewState(ctx, cfg)
+	require.NoError(t, err)
+	s := st.(*state)
+	sid := tunnel.SessionID("developer")
+	id := tunnel.NewConnID(types.ProtoTCP, netip.MustParseAddrPort("192.0.2.1:1234"), netip.MustParseAddrPort("127.0.0.1:8080"))
+	dials := make(chan *rpc.DialRequest, 2)
+	s.dialWatchers.Store(sid, dials)
+
+	firstCtx, cancelFirst := context.WithCancel(ctx)
+	defer cancelFirst()
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := s.CreateClientStream(firstCtx, tunnel.AgentToClient, sid, id, 0, 0)
+		firstDone <- err
+	}()
+	select {
+	case <-dials:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not send a dial")
+	}
+	awaiting, ok := s.awaitingForwards.Load(sid)
+	require.True(t, ok)
+	first, ok := awaiting.Load(id)
+	require.True(t, ok)
+	_, err = s.CreateClientStream(ctx, tunnel.AgentToClient, sid, id, 0, 0)
+	require.ErrorContains(t, err, "is already pending")
+	select {
+	case <-dials:
+		t.Fatal("duplicate connection ID sent a second dial request")
+	default:
+	}
+	cancelFirst()
+	require.ErrorIs(t, <-firstDone, context.Canceled)
+	retained, ok := awaiting.Load(id)
+	require.True(t, ok)
+	require.Same(t, first, retained, "abandoned sent requests must retain a temporary legacy tombstone")
+
+	secondCtx, cancelSecond := context.WithCancel(ctx)
+	defer cancelSecond()
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := s.CreateClientStream(secondCtx, tunnel.AgentToClient, sid, id, 0, 0)
+		secondDone <- err
+	}()
+	select {
+	case <-dials:
+	case <-time.After(time.Second):
+		t.Fatal("retry did not replace abandoned legacy tombstone")
+	}
+	second, ok := awaiting.Load(id)
+	require.True(t, ok)
+	require.NotSame(t, first, second)
+	cancelSecond()
+	require.ErrorIs(t, <-secondDone, context.Canceled)
+	second.stopCleanup()
+	awaiting.LoadAndDelete(id)
+}
+
+type fakeAgentTunnelServer struct {
+	grpc.ServerStream
+	ctx      context.Context
+	incoming chan *rpc.TunnelMessage
+	outgoing chan *rpc.TunnelMessage
+}
+
+func (s *fakeAgentTunnelServer) Context() context.Context { return s.ctx }
+
+func (s *fakeAgentTunnelServer) Recv() (*rpc.TunnelMessage, error) {
+	select {
+	case msg := <-s.incoming:
+		return msg, nil
+	case <-s.ctx.Done():
+		return nil, s.ctx.Err()
+	}
+}
+
+func (s *fakeAgentTunnelServer) Send(msg *rpc.TunnelMessage) error {
+	select {
+	case s.outgoing <- msg:
+		return nil
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	}
+}
+
+func TestTunnelDropsMarkedAbandonedReplyButPermitsUnmarkedClientDial(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		marked bool
+	}{
+		{name: "marked abandoned response is dropped", marked: true},
+		{name: "ordinary legacy client can still dial cluster"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(testutil.NewContext(t, false))
+			defer cancel()
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer listener.Close()
+			accepted := make(chan bool, 1)
+			go func() {
+				conn, err := listener.Accept()
+				accepted <- err == nil
+				if err == nil {
+					_ = conn.Close()
+				}
+			}()
+			cfg := &fakeConfig{sidecar: &agentconfig.Sidecar{}, podIP: netip.MustParseAddr("127.0.0.1")}
+			st, err := NewState(ctx, cfg)
+			require.NoError(t, err)
+			s := st.(*state)
+			server := &fakeAgentTunnelServer{ctx: ctx, incoming: make(chan *rpc.TunnelMessage, 1), outgoing: make(chan *rpc.TunnelMessage, 10)}
+			id := tunnel.NewConnID(types.ProtoTCP, netip.MustParseAddrPort("192.0.2.1:1234"), listener.Addr().(*net.TCPAddr).AddrPort())
+			msg := tunnel.StreamInfoMessage(id, "developer", 0, time.Second).TunnelMessage()
+			if tt.marked {
+				// The additive StreamInfo flags byte marks this as a dial-response tunnel.
+				msg.Payload = append(msg.Payload, 1)
+			}
+			server.incoming <- msg
+			done := make(chan error, 1)
+			go func() { done <- s.Tunnel(server) }()
+			if tt.marked {
+				select {
+				case err := <-done:
+					require.NoError(t, err)
+				case <-time.After(time.Second):
+					t.Fatal("agent did not promptly drop an abandoned marked response")
+				}
+				_ = listener.Close()
+				require.False(t, <-accepted, "an abandoned response must never be used to dial a cluster address")
+			} else {
+				select {
+				case ok := <-accepted:
+					require.True(t, ok, "an ordinary client-initiated tunnel must continue to dial the cluster")
+				case <-time.After(time.Second):
+					t.Fatal("agent failed to dial the cluster for an ordinary legacy client tunnel")
+				}
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("ordinary tunnel did not stop after its client disconnected")
+				}
+			}
+		})
+	}
 }
 
 func (m *metricsManagerClient) ReportMetrics(

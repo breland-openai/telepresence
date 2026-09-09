@@ -37,6 +37,7 @@ import (
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/mutator"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/quictunnel"
+	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/routeintent"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/state"
 	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/cache"
@@ -77,12 +78,14 @@ type service struct {
 	authenticator      *auth.Authenticator
 	authorizer         *auth.Authorizer
 	authMode           auth.Mode
+	authDevboxAudience string
 	activeHttpRequests int32
 	activeGrpcRequests int32
 	serviceNameNs      string
 	serviceNameFQN     string
 	dotClusterDomain   string
 	tmConfigMapUpdated atomic.Bool
+	routeIntents       *routeIntentManager
 
 	// quicCA is always non-nil: it backs both the QUIC tunnel's mTLS trust (gated
 	// separately by the QUIC listener) and the session credential minted by
@@ -129,13 +132,22 @@ func checkCompat(ctx context.Context, name, requiredVersion string) error {
 }
 
 func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, tokenReviewClient kubernetes.Interface) (Service, error) {
-	ret := &service{
-		id:            uuid.New().String(),
-		configWatcher: configWatcher,
-		authorizer:    auth.NewAuthorizer(k8sapi.GetK8sInterface(ctx)),
-		mintedTokens:  auth.NewMintedTokens(),
+	env := managerutil.GetEnv(ctx)
+	if err := auth.ValidateDelegatedDevboxProxyConfig(env.AuthenticationMode,
+		env.AuthDelegatedSelfSubjectReviewURL, env.AuthDelegatedDevboxProxyAudience,
+		env.AuthDelegatedDevboxProxyTenantID, env.AuthDelegatedDevboxProxyAuthorities); err != nil {
+		return nil, fmt.Errorf("AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE: %w", err)
 	}
-	ret.authenticator = auth.NewAuthenticator(tokenReviewClient, auth.WithMintedTokens(ret.mintedTokens))
+	ret := &service{
+		id:                 uuid.New().String(),
+		configWatcher:      configWatcher,
+		authorizer:         auth.NewAuthorizer(k8sapi.GetK8sInterface(ctx)),
+		mintedTokens:       auth.NewMintedTokens(),
+		authDevboxAudience: env.AuthDelegatedDevboxProxyAudience,
+	}
+	ret.authenticator = auth.NewAuthenticator(tokenReviewClient, auth.WithMintedTokens(ret.mintedTokens),
+		auth.WithDelegatedSelfSubjectReview(env.AuthDelegatedSelfSubjectReviewURL, env.AuthDelegatedDevboxProxyAudience,
+			env.AuthDelegatedDevboxProxyTenantID, env.AuthDelegatedDevboxProxyAuthorities))
 
 	// These are context-dependent, so build them once the pool is up
 	var err error
@@ -144,7 +156,6 @@ func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, 
 		clog.Errorf(ctx, "unable to initialize cluster info: %v", err)
 		return nil, err
 	}
-	env := managerutil.GetEnv(ctx)
 	ns := env.ManagerNamespace
 	ret.authMode = env.AuthenticationMode
 	ret.dotClusterDomain = "." + ret.clusterInfo.ClusterDomain()
@@ -180,6 +191,13 @@ func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, 
 	}
 
 	ret.state = state.NewState(ctx, g, configWatcher.AdminCommandChannel())
+	if env.RouteIntentEnabled {
+		ret.routeIntents = newRouteIntentManager(routeintent.NewKubernetes(k8sapi.GetK8sInterface(ctx).CoreV1().ConfigMaps(ns)),
+			env.RouteIntentControllerServiceAccounts, env.RouteIntentNamespaces...)
+		ret.routeIntents.requireGateway = !env.RouteIntentSkipGatewayAck
+		ret.routeIntents.reconcile = ret.reconcileRouteActivations
+		g.Go("route-intents", ret.routeIntents.run)
+	}
 	return ret, nil
 }
 
@@ -206,6 +224,9 @@ func (s *service) Version(ctx context.Context, _ *empty.Empty) (*rpc.VersionInfo
 		Version:       version.Version,
 		AuthSupported: s.authMode != auth.ModeDisabled,
 		AuthRequired:  s.authMode == auth.ModeEnforcing,
+	}
+	if s.authMode == auth.ModePermissive || s.authMode == auth.ModeEnforcing {
+		vi.AuthDevboxProxyAudience = s.authDevboxAudience
 	}
 	// The port is advertised only when the listener is up and accepting
 	// connections, which NewService guarantees by binding it before any server
@@ -289,6 +310,17 @@ func (s *service) ArriveAsClient(ctx context.Context, client *rpc.ClientInfo) (*
 func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClientRequest) (*empty.Empty, error) {
 	ctx = managerutil.WithSessionInfo(ctx, info.Session)
 	sessionID := tunnel.SessionID(info.GetSession().GetSessionId())
+	if s.reconnectMayUseDurableRoutes(info) && auth.PrincipalFrom(ctx) != nil {
+		owner, err := durableRouteOwner(ctx, info.GetSession())
+		if err != nil {
+			return nil, err
+		}
+		unlock, err := s.routeIntents.lockOwner(ctx, owner)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+	}
 	if session := s.state.GetClient(sessionID); session != nil {
 		if err := state.ClientOwnershipError(ctx, sessionID, session); err != nil {
 			return nil, err
@@ -306,7 +338,6 @@ func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClient
 		return nil, status.Error(codes.InvalidArgument, val)
 	}
 	now := time.Now()
-	st.RestoreClient(sessionID, client, auth.PrincipalFrom(ctx), now)
 	restoredAgents := info.Agents
 	if legacyForkClient(client) && len(restoredAgents) != 0 {
 		// Legacy compact snapshots encode their omitted-environment marker at
@@ -317,6 +348,11 @@ func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClient
 		restoredAgents = nil
 	}
 	agents := slices.DeleteFunc(slices.Clone(restoredAgents), func(agent *rpc.AgentInfo) bool {
+		if s.routeIntents.managesNamespace(agent.GetNamespace()) && agent.GetRouteGuardInstance() != "" {
+			// A client cannot attest to an agent process's guards or seed a future
+			// process timestamp; wait for the pod-bound traffic-agent to register.
+			return true
+		}
 		if agent.GetContainerEnvironmentOmitted() {
 			// Compact watch snapshots are intentionally incomplete. Restoring
 			// one after a manager restart would make the omitted container
@@ -339,6 +375,14 @@ func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClient
 		clog.Debugf(ctx, "Not restoring intercept %s because its namespace is not managed", intercept.GetId())
 		return true
 	})
+	if s.routeIntents != nil {
+		var err error
+		intercepts, err = s.durableRestoredIntercepts(ctx, info.GetSession(), intercepts)
+		if err != nil {
+			return nil, err
+		}
+	}
+	st.RestoreClient(sessionID, client, auth.PrincipalFrom(ctx), now)
 	st.RestoreAgents(agents, now)
 	st.RestoreIntercepts(ctx, intercepts, now)
 	return &empty.Empty{}, nil
@@ -359,6 +403,9 @@ func (s *service) ArriveAsAgent(ctx context.Context, agent *rpc.AgentInfo) (*rpc
 	}
 
 	principal, mismatch := verifiedAgentPrincipal(ctx, agent)
+	if err := s.validateRouteAgentProcess(agent, principal); err != nil {
+		return nil, err
+	}
 	if mismatch && s.authMode == auth.ModeEnforcing {
 		return nil, errors.Errorf(codes.PermissionDenied,
 			"bound token does not match the presented agent identity %s.%s", agent.PodName, agent.Namespace)
@@ -384,6 +431,9 @@ func (s *service) ReconnectAgent(ctx context.Context, rq *rpc.ReconnectAgentRequ
 		return nil, status.Errorf(codes.InvalidArgument, "invalid legacy agent information: %v", err)
 	}
 	principal, mismatch := verifiedAgentPrincipal(ctx, rq.Agent)
+	if err := s.validateRouteAgentProcess(rq.Agent, principal); err != nil {
+		return nil, err
+	}
 	if mismatch && s.authMode == auth.ModeEnforcing {
 		return nil, errors.Errorf(codes.PermissionDenied,
 			"bound token does not match the presented agent identity %s.%s", rq.Agent.PodName, rq.Agent.Namespace)
@@ -503,8 +553,17 @@ func (s *service) Depart(ctx context.Context, session *rpc.SessionInfo) (*empty.
 		if err := state.ClientOwnershipError(ctx, sessionID, client); err != nil {
 			return nil, err
 		}
+		if s.routeIntents != nil && (client.Principal() != nil || auth.PrincipalFrom(ctx) != nil) {
+			if err := s.departDurableRoutes(ctx, session); err != nil {
+				return nil, err
+			}
+		}
 		// There's no reason for the caller to wait for this removal to complete.
 		go s.state.RemoveSession(context.WithoutCancel(ctx), sessionID)
+	} else if s.routeIntents != nil && auth.PrincipalFrom(ctx) != nil && !strings.HasPrefix(string(sessionID), state.AgentSessionIDPrefix) {
+		if err := s.departDurableRoutes(ctx, session); err != nil {
+			return nil, err
+		}
 	}
 	return &empty.Empty{}, nil
 }
@@ -941,6 +1000,8 @@ func agentInfoForWatch(ai *rpc.AgentInfo, compact bool) *rpc.AgentInfo {
 		QuicPort:                    ai.QuicPort,
 		InterceptTargets:            ai.InterceptTargets,
 		ContainerEnvironmentOmitted: true,
+		RouteGuardInstance:          ai.RouteGuardInstance,
+		RouteGuardStartedAt:         ai.RouteGuardStartedAt,
 	}
 }
 
@@ -1257,6 +1318,7 @@ func watcherInterceptInfo(info *rpc.InterceptInfo, agentWatch bool) *rpc.Interce
 		MechanismArgsDesc: info.MechanismArgsDesc,
 		ModifiedAt:        info.ModifiedAt,
 		ServiceWorkloads:  info.ServiceWorkloads,
+		RouteIncarnation:  info.RouteIncarnation,
 	}
 }
 
@@ -1398,6 +1460,7 @@ func (s *service) ReleaseAgent(ctx context.Context, request *rpc.ReleaseAgentReq
 // CreateIntercept lets a client create an intercept.
 func (s *service) CreateIntercept(ctx context.Context, ciReq *rpc.CreateInterceptRequest) (*rpc.InterceptInfo, error) {
 	ctx = managerutil.WithSessionInfo(ctx, ciReq.GetSession())
+	ciReq = proto.Clone(ciReq).(*rpc.CreateInterceptRequest)
 	spec := ciReq.InterceptSpec
 	clog.Debugf(ctx, "Intercept name %s", ciReq.InterceptSpec.Name)
 
@@ -1422,7 +1485,55 @@ func (s *service) CreateIntercept(ctx context.Context, ciReq *rpc.CreateIntercep
 		clog.Warnf(ctx, "intercept %q in namespace %s: %v (not enforced)", spec.Name, namespace, err)
 	}
 
-	client, interceptInfo, err := s.state.AddIntercept(ctx, ciReq)
+	var persist func(*rpc.CreateInterceptRequest) error
+	switch {
+	case !s.routeIntents.managesNamespace(namespace):
+		// Never advertise an incarnation that the active manager did not
+		// durably acknowledge; updated clients may connect to legacy managers
+		// or target a namespace intentionally left in legacy mode.
+		ciReq.RouteIncarnation = ""
+	case usesLocalRoutingKey(spec):
+		if principal := auth.PrincipalFrom(ctx); principal == nil || client.Principal() == nil || !client.Principal().SameAs(principal) {
+			if auth.AuthUnavailable(ctx) {
+				return nil, status.Error(codes.Unavailable, "unable to verify durable route client session ownership")
+			}
+			return nil, status.Error(codes.Unauthenticated, "durable routes require a client session bound to the authenticated caller")
+		}
+		owner, ownerErr := durableRouteOwner(ctx, ciReq.GetSession())
+		if ownerErr != nil {
+			return nil, ownerErr
+		}
+		unlock, lockErr := s.routeIntents.lockOwner(ctx, owner)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		defer unlock()
+		if existing, ok := s.state.GetIntercept(ciReq.Session.SessionId + ":" + spec.Name); ok && existing.Disposition != rpc.InterceptDispositionType_REMOVED {
+			if existing.RouteIncarnation != "" && existing.RouteIncarnation == ciReq.RouteIncarnation {
+				predicate, supported := durableRoutePredicate(existing.Spec)
+				requested, requestedSupported := durableRoutePredicate(spec)
+				if supported && requestedSupported && predicate == requested {
+					return existing.InterceptInfo, nil
+				}
+			}
+			return nil, status.Errorf(codes.AlreadyExists, "Intercept named %q already exists", spec.Name)
+		}
+		persist = func(resolved *rpc.CreateInterceptRequest) error {
+			predicate, supported := durableRoutePredicate(resolved.InterceptSpec)
+			if !supported {
+				return status.Error(codes.FailedPrecondition, "this local routing key predicate cannot be durably guarded")
+			}
+			if err := validateDurableDeclaredProtocol(ctx, predicate); err != nil {
+				return err
+			}
+			key := routeintent.Key{Namespace: predicate.Namespace, Owner: owner, Name: resolved.InterceptSpec.Name}
+			_, persistErr := s.routeIntents.create(ctx, key, resolved.RouteIncarnation, predicate)
+			return persistErr
+		}
+	default:
+		ciReq.RouteIncarnation = ""
+	}
+	client, interceptInfo, err := s.state.AddInterceptWithRoute(ctx, ciReq, persist)
 	if err != nil {
 		return nil, err
 	}
@@ -1522,6 +1633,33 @@ func (s *service) RemoveIntercept(ctx context.Context, riReq *rpc.RemoveIntercep
 	ctx, client, err := s.ensureClientSession(ctx, riReq.Session)
 	if err != nil {
 		return nil, err
+	}
+	if s.routeIntents != nil {
+		interceptID := string(managerutil.GetSessionID(ctx)) + ":" + name
+		live, exists := s.state.GetIntercept(interceptID)
+		clientNamespaceManaged := s.routeIntents.managesNamespace(client.GetNamespace())
+		if s.shouldLookupDurableRemoval(ctx, client.GetNamespace(), live, riReq.RouteIncarnation) {
+			owner, ownerErr := durableRouteOwner(ctx, riReq.Session)
+			if ownerErr != nil {
+				return nil, ownerErr
+			}
+			unlock, lockErr := s.routeIntents.lockOwner(ctx, owner)
+			if lockErr != nil {
+				return nil, lockErr
+			}
+			defer unlock()
+			record, lookupErr := s.routeIntents.findOwned(ctx, owner, name)
+			if lookupErr != nil {
+				return nil, lookupErr
+			}
+			if record != nil {
+				if removeErr := s.routeIntents.remove(ctx, *record, riReq.RouteIncarnation); removeErr != nil {
+					return nil, removeErr
+				}
+			} else if (clientNamespaceManaged && riReq.RouteIncarnation != "") || (exists && live.RouteIncarnation != "") {
+				return nil, status.Error(codes.NotFound, "durable route not found")
+			}
+		}
 	}
 	SetGauge(ctx, s.state.GetInterceptActiveStatus(), client.Name, client.InstallId, &name, 0)
 

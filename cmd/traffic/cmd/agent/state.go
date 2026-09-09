@@ -31,6 +31,9 @@ type State interface {
 	ContainerStates() map[string]ContainerState
 	InterceptStates() []InterceptState
 	HandleIntercepts(ctx context.Context, cepts []*rpc.InterceptInfo) []*rpc.ReviewInterceptRequest
+	HandleRouteIntents(ctx context.Context, snapshot *rpc.RouteIntentSnapshot) (bool, error)
+	RouteIntentAcknowledgments(snapshot *rpc.RouteIntentSnapshot) []*rpc.RouteIntentAck
+	RouteReadiness() *interceptReadiness
 	ManagerClient() rpc.ManagerClient
 	ManagerVersion() semver.Version
 	SessionInfo() *rpc.SessionInfo
@@ -123,6 +126,7 @@ type state struct {
 
 	interceptStates []InterceptState
 	containerStates map[string]ContainerState
+	routeReadiness  *interceptReadiness
 	agent.UnimplementedAgentServer
 }
 
@@ -168,7 +172,12 @@ func NewState(ctx context.Context, config Config) (State, error) {
 		awaitingForwards: xsync.NewMap[tunnel.SessionID, *xsync.Map[tunnel.ConnID, *awaitingForward]](),
 		quicAgent:        &quicAgentState{},
 		fileShareAuth:    &fileShareAuth{},
+		routeReadiness:   newAuthoritativeRouteReadiness(),
 	}, nil
+}
+
+func (s *state) RouteReadiness() *interceptReadiness {
+	return s.routeReadiness
 }
 
 func (s *state) AddInterceptState(is InterceptState) {

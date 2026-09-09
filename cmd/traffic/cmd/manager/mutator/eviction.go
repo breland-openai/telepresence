@@ -513,12 +513,16 @@ func triggerScalingEviction(ctx context.Context, wl k8sapi.Workload, pod *core.P
 }
 
 func evictPod(ctx context.Context, pod *core.Pod) (bool, error) {
+	return evictPodWithVersion(ctx, pod, nil)
+}
+
+func evictPodWithVersion(ctx context.Context, pod *core.Pod, resourceVersion *string) (bool, error) {
 	clog.Debugf(ctx, "Attempting to evict pod %s", pod.Name)
 	uid := pod.UID
 	err := k8sapi.GetK8sInterface(ctx).CoreV1().Pods(pod.Namespace).EvictV1(ctx, &v1.Eviction{
 		ObjectMeta: meta.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace},
 		DeleteOptions: &meta.DeleteOptions{
-			Preconditions: &meta.Preconditions{UID: &uid},
+			Preconditions: &meta.Preconditions{UID: &uid, ResourceVersion: resourceVersion},
 		},
 	})
 	if err == nil || k8sErrors.IsNotFound(err) {

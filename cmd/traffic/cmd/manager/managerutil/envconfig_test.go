@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +88,14 @@ func TestEnvconfig(t *testing.T) {
 			},
 			Output: func(e *managerutil.Env) {
 				e.AgentRegistry = "ghcr.io/telepresenceio"
+			},
+		},
+		"routeIntentNamespaces": {
+			Input: map[string]string{"ROUTE_INTENT_ENABLED": "true", "ROUTE_INTENT_NAMESPACES": "ambassador testing", "AGENT_ROUTE_INTENT_IMAGE": "registry.example/tel2@sha256:abc123"},
+			Output: func(e *managerutil.Env) {
+				e.RouteIntentEnabled = true
+				e.RouteIntentNamespaces = []string{"ambassador", "testing"}
+				e.AgentRouteIntentImage = "registry.example/tel2@sha256:abc123"
 			},
 		},
 		"complex": {
@@ -237,6 +246,30 @@ func TestEnvconfig(t *testing.T) {
 	}
 }
 
+func TestRouteIntentAgentImageOnlyOverridesEnabledNamespaces(t *testing.T) {
+	const standard, candidate = "registry.example/tel2:stable", "registry.example/tel2@sha256:abc123"
+	for _, test := range []struct {
+		name, namespace, candidate, want string
+		enabled                          bool
+		scoped                           []string
+	}{
+		{name: "enabled included", namespace: "ambassador", candidate: candidate, enabled: true, scoped: []string{"ambassador"}, want: candidate},
+		{name: "enabled excluded", namespace: "application", candidate: candidate, enabled: true, scoped: []string{"ambassador"}, want: standard},
+		{name: "disabled ignored", namespace: "ambassador", candidate: candidate, scoped: []string{"ambassador"}, want: standard},
+		{name: "unset ignored", namespace: "ambassador", enabled: true, scoped: []string{"ambassador"}, want: standard},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			e := &managerutil.Env{RouteIntentEnabled: test.enabled, AgentRouteIntentImage: test.candidate, RouteIntentNamespaces: test.scoped}
+			ctx := managerutil.WithResolvedAgentImageRetriever(managerutil.WithEnv(t.Context(), e), managerutil.ImageFromEnv(standard))
+			require.Equal(t, standard, managerutil.GetAgentImage(ctx), "the global image must not change")
+			require.Equal(t, test.want, managerutil.GetAgentImageForNamespace(ctx, test.namespace))
+			gc, err := e.GeneratorConfig(standard)
+			require.NoError(t, err)
+			require.Equal(t, test.want, gc.AgentImageForNamespace(test.namespace), "direct comparisons and generated image must match")
+		})
+	}
+}
+
 func TestEnvconfigPreStopDrainTimeout(t *testing.T) {
 	env := map[string]string{
 		"REGISTRY":    "ghcr.io/telepresenceio",
@@ -251,6 +284,112 @@ func TestEnvconfigPreStopDrainTimeout(t *testing.T) {
 	env["AGENT_PRE_STOP_DRAIN_TIMEOUT"] = "-1s"
 	_, err = managerutil.LoadEnv(context.Background(), env)
 	require.ErrorContains(t, err, "AGENT_PRE_STOP_DRAIN_TIMEOUT must not be negative")
+}
+
+func TestEnvconfigDelegatedDevboxProxyAudience(t *testing.T) {
+	const staging = "11111111-1111-4111-8111-111111111111"
+	const production = "22222222-2222-4222-8222-222222222222"
+	const tenant = "33333333-3333-4333-8333-333333333333"
+	const stageHost = "staging.proxy.example.test"
+	const prodHost = "production.proxy.example.test"
+	const stageURL = "https://" + stageHost + "/clusters/staging/apis/authentication.k8s.io/v1/selfsubjectreviews"
+	const prodURL = "https://" + prodHost + "/clusters/staging/apis/authentication.k8s.io/v1/selfsubjectreviews"
+	for _, tc := range []struct{ name, mode, endpoint, audience, tenant, authorities, err string }{
+		{name: "default leaves advertisement off", mode: "permissive"},
+		{name: "URL alone fails closed", mode: "permissive", endpoint: prodURL, err: "together"},
+		{name: "staging permissive", mode: "permissive", endpoint: stageURL, audience: staging, tenant: tenant, authorities: stageHost + " secondary.proxy.example.test"},
+		{name: "production enforcing", mode: "enforcing", endpoint: prodURL, audience: production, tenant: tenant, authorities: prodHost},
+		{name: "missing endpoint", mode: "permissive", audience: staging, tenant: tenant, authorities: stageHost, err: "together"},
+		{name: "missing tenant", mode: "permissive", endpoint: stageURL, audience: staging, authorities: stageHost, err: "together"},
+		{name: "missing authorities", mode: "permissive", endpoint: stageURL, audience: staging, tenant: tenant, err: "together"},
+		{name: "mismatch", mode: "permissive", endpoint: prodURL, audience: staging, tenant: tenant, authorities: stageHost, err: "does not match"},
+		{name: "invalid UUID", mode: "enforcing", endpoint: stageURL, audience: "unexpected", tenant: tenant, authorities: stageHost, err: "canonical nonzero"},
+		{name: "disabled", mode: "disabled", endpoint: stageURL, audience: staging, tenant: tenant, authorities: stageHost, err: "authentication mode"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{
+				"REGISTRY": "ghcr.io/telepresenceio", "LOG_LEVEL": "info", "SERVER_PORT": "8081", "AUTHENTICATION_MODE": tc.mode,
+				"AUTH_DELEGATED_SELF_SUBJECT_REVIEW_URL": tc.endpoint, "AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE": tc.audience,
+				"AUTH_DELEGATED_DEVBOX_PROXY_TENANT_ID": tc.tenant, "AUTH_DELEGATED_DEVBOX_PROXY_AUTHORITIES": tc.authorities,
+			}
+			ctx, err := managerutil.LoadEnv(t.Context(), env)
+			if tc.err != "" {
+				require.ErrorContains(t, err, "AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE")
+				require.ErrorContains(t, err, tc.err)
+				return
+			}
+			require.NoError(t, err)
+			parsed := managerutil.GetEnv(ctx)
+			require.Equal(t, tc.endpoint, parsed.AuthDelegatedSelfSubjectReviewURL)
+			require.Equal(t, tc.audience, parsed.AuthDelegatedDevboxProxyAudience)
+			require.Equal(t, tc.tenant, parsed.AuthDelegatedDevboxProxyTenantID)
+			if tc.authorities != "" {
+				require.Equal(t, strings.Split(tc.authorities, " "), parsed.AuthDelegatedDevboxProxyAuthorities)
+			} else {
+				require.Empty(t, parsed.AuthDelegatedDevboxProxyAuthorities)
+			}
+		})
+	}
+}
+
+func TestAuthoritativeRoutesRequireAgentInitContainer(t *testing.T) {
+	for _, tc := range []struct {
+		name, routeEnabled, agentStrict, initEnabled, err string
+	}{
+		{name: "strict defaults to enabled init", routeEnabled: "true", agentStrict: "true"},
+		{name: "strict explicitly enabled init", routeEnabled: "true", agentStrict: "true", initEnabled: "true"},
+		{
+			name: "strict rejects disabled init", routeEnabled: "true", agentStrict: "true", initEnabled: "false",
+			err: "AGENT_REQUIRE_AUTHORITATIVE_ROUTES requires AGENT_INIT_CONTAINER_ENABLED",
+		},
+		{name: "feature off may disable init", routeEnabled: "false", agentStrict: "false", initEnabled: "false"},
+		{name: "non-strict may disable init", routeEnabled: "true", agentStrict: "false", initEnabled: "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{
+				"REGISTRY": "ghcr.io/telepresenceio", "LOG_LEVEL": "info", "SERVER_PORT": "8081",
+				"ROUTE_INTENT_ENABLED": tc.routeEnabled, "AGENT_REQUIRE_AUTHORITATIVE_ROUTES": tc.agentStrict,
+			}
+			if tc.initEnabled != "" {
+				env["AGENT_INIT_CONTAINER_ENABLED"] = tc.initEnabled
+			}
+			ctx, err := managerutil.LoadEnv(t.Context(), env)
+			if tc.err != "" {
+				require.ErrorContains(t, err, tc.err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.initEnabled != "false", managerutil.GetEnv(ctx).AgentInitContainerEnabled)
+		})
+	}
+}
+
+func TestAuthoritativeRoutesValidateInitSecurityAtStartup(t *testing.T) {
+	for _, tc := range []struct {
+		security, wantError string
+	}{
+		{`{}`, ""},
+		{`{"runAsUser":0,"runAsNonRoot":false,"capabilities":{"add":["NET_ADMIN"],"drop":["ALL"]}}`, ""},
+		{`{"runAsUser":1000}`, "UID 0"},
+		{`{"runAsNonRoot":true}`, "UID 0"},
+		{`{"capabilities":{"drop":["ALL"]}}`, "NET_ADMIN"},
+	} {
+		t.Run(tc.security, func(t *testing.T) {
+			env := map[string]string{
+				"REGISTRY": "ghcr.io/telepresenceio", "LOG_LEVEL": "info", "SERVER_PORT": "8081",
+				"ROUTE_INTENT_ENABLED": "true", "AGENT_REQUIRE_AUTHORITATIVE_ROUTES": "true", "AGENT_INIT_SECURITY_CONTEXT": tc.security,
+			}
+			_, err := managerutil.LoadEnv(t.Context(), env)
+			if tc.wantError == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantError)
+			}
+			env["AGENT_REQUIRE_AUTHORITATIVE_ROUTES"] = "false"
+			_, err = managerutil.LoadEnv(t.Context(), env)
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestEnvconfigAgentArrivalTimeoutDefault(t *testing.T) {

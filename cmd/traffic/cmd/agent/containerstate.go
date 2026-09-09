@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"strings"
 
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/agent/fwd"
+	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/agent/tls"
 	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/forwarder"
 	"github.com/telepresenceio/telepresence/v2/pkg/log"
@@ -24,13 +26,13 @@ type containerState struct {
 
 func (c *containerState) AddPortHandler(g log.Group, pp types.PortAndProto, it agentconfig.InterceptTarget) {
 	ph := c.newPortHandler(g, pp, it)
+	c.AddInterceptState(c.NewInterceptState(ph, it, c.container.Name))
 	g.Go(fmt.Sprintf("forward-%s-%s:%d", c.container.Name, it.Protocol(), it.ContainerPort()), func(ctx context.Context) error {
 		return ph.Serve(tunnel.WithPool(ctx, tunnel.NewPool()), nil)
 	})
-	c.AddInterceptState(c.NewInterceptState(ph, it, c.container.Name))
 }
 
-func (c *containerState) newPortHandler(ctx context.Context, pp types.PortAndProto, ics []*agentconfig.Intercept) fwd.Interceptor {
+func (c *containerState) newPortHandler(ctx context.Context, pp types.PortAndProto, ics agentconfig.InterceptTarget) fwd.Interceptor {
 	ic := ics[0] // They all have the same protocol container port, so the first one will do.
 	var opts []forwarder.Option
 	if lf := c.ListenerFactory(); lf != nil {
@@ -39,7 +41,12 @@ func (c *containerState) newPortHandler(ctx context.Context, pp types.PortAndPro
 	if d := c.DialerFactory(); d != nil {
 		opts = append(opts, forwarder.WithDialer(d))
 	}
-	if pp.Proto == types.ProtoTCP && c.container.Replace == agentconfig.ReplacePolicyIntercept {
+	if pp.Proto != types.ProtoTCP {
+		return fwd.NewInterceptor(ctx, pp, tunnel.AgentToClient, netip.AddrPort{}, opts...)
+	}
+	var defaultTarget netip.AddrPort
+	var tlsManager tls.Manager
+	if c.container.Replace == agentconfig.ReplacePolicyIntercept {
 		// The agent's own pass-through dial to the real app -- made here,
 		// once, when no intercept is active -- must land somewhere the
 		// nftables pod-IP redirect gate doesn't reach; see the doc comment on
@@ -47,12 +54,32 @@ func (c *containerState) newPortHandler(ctx context.Context, pp types.PortAndPro
 		// distinction. The TLS/H2C prober in cmd/traffic/cmd/agent/tls uses
 		// the same helper for the identical reason.
 		cfg := c.AgentConfig()
-		nftRedirects := c.DialerFactory() != nil || cfg.NftRedirectsActive()
-		defaultTarget := cfg.PassThroughTarget(c.AppPodIP(), ic.ContainerPort, pp.Proto, nftRedirects)
-		return fwd.NewTCPInterceptor(ctx, pp, tunnel.AgentToClient, c.TLSManager(), defaultTarget, opts...)
+		nftRedirects := c.DialerFactory() != nil || cfg.NftRedirectsPort(ic.ContainerPort, pp.Proto)
+		defaultTarget = cfg.PassThroughTarget(c.AppPodIP(), ic.ContainerPort, pp.Proto, nftRedirects)
+		tlsManager = c.TLSManager()
 	}
-	// The agent will intercept all traffic intended for this container.
-	return fwd.NewInterceptor(ctx, pp, tunnel.AgentToClient, netip.AddrPort{}, opts...)
+	if c.AgentConfig().RequireAuthoritativeRoutes && permanentHTTPMediation(ics.AppProtocol(ctx), tlsManager, defaultTarget.Port()) {
+		return fwd.NewHTTPMediatedTCPInterceptor(ctx, pp, tunnel.AgentToClient, tlsManager, defaultTarget, opts...)
+	}
+	return fwd.NewTCPInterceptor(ctx, pp, tunnel.AgentToClient, tlsManager, defaultTarget, opts...)
+}
+
+func permanentHTTPMediation(appProtocol string, tlsManager tls.Manager, targetPort uint16) bool {
+	switch strings.ToLower(appProtocol) {
+	case "http", "kubernetes.io/http", "http1", "http1.0", "http1.1", "http/1.0", "http/1.1",
+		"ws", "kubernetes.io/ws", "h2c", "kubernetes.io/h2c":
+		return true
+	case "https", "http2", "wss", "kubernetes.io/wss", "grpc":
+		// End-to-end encrypted connections cannot expose request headers without
+		// the application's downstream certificate. Certificate watchers complete
+		// their initial load before Sidecar creates the port handlers. A plaintext
+		// gRPC service can explicitly declare h2c to avoid ambiguous TLS detection.
+		return tlsManager != nil && tlsManager.GetDownstreamCertificate(targetPort) != nil
+	default:
+		// Do not turn databases, opaque TCP, or undeclared ports into HTTP. An
+		// unsupported port does not acknowledge a durable exact-header route.
+		return false
+	}
 }
 
 func (c *containerState) GlobalState() State {

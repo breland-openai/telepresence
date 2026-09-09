@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"net/netip"
+	"os"
 	"reflect"
 	"testing"
 
@@ -10,7 +11,23 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/telepresenceio/telepresence/rpc/v2/daemon"
+	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
 )
+
+func TestManagerTokenFileIsForwardedOnlyWhenExplicitlyConfigured(t *testing.T) {
+	t.Setenv(k8s.ManagerTokenFileEnv, "/temporary/manager-token")
+	req := NewDefaultRequest()
+	require.Equal(t, "/temporary/manager-token", req.Environment[k8s.ManagerTokenFileEnv])
+	t.Setenv(k8s.ManagerTokenFileEnv, "")
+	req = NewDefaultRequest()
+	value, configured := req.Environment[k8s.ManagerTokenFileEnv]
+	require.True(t, configured, "an explicitly empty file is an invalid configuration, not kubeconfig fallback")
+	require.Empty(t, value)
+	require.NoError(t, os.Unsetenv(k8s.ManagerTokenFileEnv))
+	req = NewDefaultRequest()
+	require.NotContains(t, req.Environment, k8s.ManagerTokenFileEnv)
+	require.NotContains(t, req.Environment, "-"+k8s.ManagerTokenFileEnv, "an implicit command must not clear an existing connection credential")
+}
 
 func TestWithDefaultRequestIgnoresLocalNamespace(t *testing.T) {
 	cmd := &cobra.Command{Use: "intercept"}

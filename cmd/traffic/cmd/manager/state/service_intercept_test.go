@@ -1136,6 +1136,13 @@ func TestRestoreInterceptsRebuildsServiceParticipants(t *testing.T) {
 			{Namespace: "default", WorkloadKind: "Deployment", WorkloadName: "example-service-canary"},
 		},
 	}
+	t.Cleanup(func() {
+		st.RemoveIntercept(restored.Id)
+		require.Eventually(t, func() bool {
+			_, running := st.serviceInterceptWatchers.Load(restored.Id)
+			return !running
+		}, 5*time.Second, time.Millisecond)
+	})
 
 	st.RestoreIntercepts(ctx, []*rpc.InterceptInfo{restored}, time.Now())
 	intercept, ok := st.intercepts.Load(restored.Id)
@@ -1449,6 +1456,40 @@ func TestServiceInterceptRemovalTransfersSecondaryParticipantReview(t *testing.T
 	require.NotNil(t, participant.review)
 	require.Equal(t, canaryReplacement.PodName, participant.podName)
 	require.Equal(t, canaryReplacement.PodIp, participant.review.PodIp)
+}
+
+func TestDurableServiceReviewerTransferPreservesApprovalBehindBarrier(t *testing.T) {
+	ctx, st := newServiceInterceptState(t)
+	stable := serviceAgent("example-service", "stable-pod", "10.0.0.1")
+	sibling := serviceAgent("example-service", "stable-pod-2", "10.0.0.3")
+	st.agents.Store("stable", stable)
+	st.agents.Store("sibling", sibling)
+	intercept := &Intercept{InterceptInfo: &rpc.InterceptInfo{
+		Id: "client:example-service", Spec: sharedServiceSpec(), RouteIncarnation: "one", Disposition: rpc.InterceptDispositionType_WAITING,
+		ClientSession: &rpc.SessionInfo{SessionId: "client"}, ServiceWorkloads: sharedServiceWorkloads(stable.Name),
+	}}
+	st.initializeParticipants(intercept)
+	st.intercepts.Store(intercept.Id, intercept)
+	intercept = st.ApplyAgentReview(ctx, intercept.Id, stable, &rpc.ReviewInterceptRequest{Disposition: rpc.InterceptDispositionType_ACTIVE, PodIp: stable.PodIp})
+	require.Equal(t, rpc.InterceptDispositionType_WAITING, intercept.Disposition)
+	intercept = st.SetRouteActivation(intercept.Id, "one", true)
+	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, intercept.Disposition)
+	require.Equal(t, stable.PodName, intercept.PodName)
+	intercept = st.SetRouteActivation(intercept.Id, "one", false)
+	require.Equal(t, rpc.InterceptDispositionType_WAITING, intercept.Disposition)
+	require.Equal(t, stable.PodName, intercept.routePendingActivation.PodName)
+	st.agents.Delete("stable")
+	st.consolidateAgentSessionIntercepts(stable)
+	intercept, ok := st.GetIntercept(intercept.Id)
+	require.True(t, ok)
+	require.Equal(t, rpc.InterceptDispositionType_WAITING, intercept.Disposition, "transfer cannot bypass actual missing durable proof")
+	require.Empty(t, intercept.PodName)
+	require.NotNil(t, intercept.routePendingActivation)
+	require.Equal(t, sibling.PodName, intercept.routePendingActivation.PodName)
+	require.Equal(t, sibling.PodName, intercept.participants[agentParticipantKey(sibling.AgentInfo)].podName)
+	intercept = st.SetRouteActivation(intercept.Id, "one", true)
+	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, intercept.Disposition)
+	require.Equal(t, sibling.PodName, intercept.PodName)
 }
 
 func TestServiceInterceptRemovalTransfersPublishedParticipantReview(t *testing.T) {

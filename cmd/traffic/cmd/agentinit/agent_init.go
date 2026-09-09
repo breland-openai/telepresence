@@ -74,7 +74,7 @@ func (c *config) buildNftConfig(loopback string, podIP netip.Addr) (agentnft.Con
 	if err != nil {
 		return agentnft.Config{}, err
 	}
-	return agentnft.ConfigFor(c.Sidecar, loopback, podIP, owner), nil
+	return agentnft.ConfigForSidecar(c.Sidecar, loopback, podIP, owner), nil
 }
 
 func findLoopback() (string, error) {

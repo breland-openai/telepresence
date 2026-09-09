@@ -26,7 +26,11 @@ type interceptControllerMap map[string]*interceptController
 func (im interceptControllerMap) sorted() []*interceptController {
 	infos := make([]*interceptController, len(im))
 	for i, k := range maps.SortedKeys(im) {
-		infos[i] = im[k]
+		// Request handlers use the selected controller after releasing the map
+		// lock. Its cancellation still belongs to the original shared context,
+		// but the intercept identity must not change underneath a routed request.
+		controller := *im[k]
+		infos[i] = &controller
 	}
 	return infos
 }
@@ -78,7 +82,8 @@ func (im interceptControllerMap) global() (*interceptController, error) {
 		return nil, errors.New("multiple intercepts found when requesting the global intercept")
 	}
 	for _, ic := range im {
-		return ic, nil
+		controller := *ic
+		return &controller, nil
 	}
 	return nil, nil
 }

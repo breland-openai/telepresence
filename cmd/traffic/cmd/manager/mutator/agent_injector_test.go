@@ -58,6 +58,19 @@ func stringP(s string) *string {
 
 const mgrNs = "default"
 
+func TestAuthoritativeInitReplacesSameImageWithInheritedNonRootIdentity(t *testing.T) {
+	wanted := agentconfig.InitContainer(&agentconfig.Sidecar{RequireAuthoritativeRoutes: true}, nil, "").SecurityContext
+	old := wanted.DeepCopy()
+	old.RunAsUser = nil
+	old.RunAsGroup = nil
+	old.RunAsNonRoot = nil
+	require.True(t, compareCapabilities(wanted, old))
+	require.False(t, sameRouteIntentInitIdentity(wanted, old))
+	require.False(t, compareCapabilities(wanted, nil))
+	require.False(t, sameRouteIntentInitIdentity(wanted, nil))
+	require.True(t, sameRouteIntentInitIdentity(wanted, wanted.DeepCopy()))
+}
+
 func TestTrafficAgentConfigGenerator(t *testing.T) {
 	// The fake clientset doesn't support the WatchListClient feature (no bookmark events),
 	// which is enabled by default in client-go v0.35+. Disable it for this test.

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -151,6 +152,13 @@ type session struct {
 	// is keyeed by the intercept ID
 	currentIntercepts map[string]*intercept
 
+	// A manager-confirmed exact route must never become a TCP shortcut if a
+	// replacement manager temporarily omits its incarnation or watch entry.
+	shortcutPushLock        sync.Mutex
+	durableShortcutLock     sync.Mutex
+	durableShortcutRoutes   map[durableShortcutRoute]struct{}
+	pendingDurableShortcuts map[pendingDurableShortcutRoute]int
+
 	// currentMatches hold the matchers used when using the APIServer.
 	currentMatchers map[string]*apiMatcher
 
@@ -257,6 +265,11 @@ func NewSession(
 		clog.Errorf(config, "Unable to connect to session: %s", err)
 		return nil, nil, err
 	}
+	defer func() {
+		if err != nil {
+			_ = tmgr.managerConnection().Close()
+		}
+	}()
 	if tmgr.compareFinalizedManagerVersion(2, 21, 0) < 0 {
 		return nil, nil,
 			fmt.Errorf("traffic manager version %s is too old. Minimum supported version is 2.21.0, please upgrade", tmgr.ManagerVersion())
@@ -267,18 +280,24 @@ func NewSession(
 
 	oi := tmgr.getNetworkInfo(cr)
 	if !service.RootSessionInProcess() {
+		callbackAddr := rootDaemonCallbackAddress(service.ListenerAddress())
+		callback, revoke, callbackErr := registerRootManagerTokenCallback(tmgr.Context, service, config, callbackAddr, k8s.GetManagerNamespace(tmgr))
+		if callbackErr != nil {
+			return nil, nil, callbackErr
+		}
+		if callback != nil {
+			context.AfterFunc(tmgr.Context, revoke)
+			defer func() {
+				if err != nil {
+					revoke()
+				}
+			}()
+			oi.ManagerTokenCallback = callback
+		}
 		// Root daemon needs this to authenticate with the cluster. Potential exec configurations in the kubeconfig
 		// must be executed by the user, not by root.
 		oi.KubeconfigData, err = patcher.CreateExternalKubeConfig(tmgr.Context, config.ClientConfig, tmgr.KubeContext, func([]string) (string, string, string, error) {
-			addr := service.ListenerAddress()
-			if addr.Addr().IsUnspecified() {
-				loopback := netip.AddrFrom4([4]byte{127, 0, 0, 1})
-				if addr.Addr().Is6() {
-					loopback = netip.IPv6Loopback()
-				}
-				addr = netip.AddrPortFrom(loopback, addr.Port())
-			}
-			return client.GetExe(tmgr), addr.String(), client.GetConfigFile(tmgr), nil
+			return client.GetExe(tmgr), callbackAddr.String(), client.GetConfigFile(tmgr), nil
 		}, nil)
 		if err != nil {
 			return nil, nil, err
@@ -292,7 +311,6 @@ func NewSession(
 	rootCtx, rootCancel := tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
 	defer rootCancel()
 	if err = tmgr.connectRootDaemon(rootCtx, oi, wg, cr.IsPodDaemon); err != nil {
-		_ = tmgr.managerConnection().Close()
 		return nil, nil, err
 	}
 
@@ -302,6 +320,47 @@ func NewSession(
 	tmgr.AddNamespaceEventHandler(tmgr.updateDaemonNamespaces)
 	ci, err := tmgr.status(rootCtx, true)
 	return tmgr, ci, err
+}
+
+type rootManagerTokenRegistrar interface {
+	RegisterManagerTokenCallback(context.Context, string) ([]byte, func(), error)
+	RegisterNegotiatedManagerTokenCallback(func(context.Context, string, string) (string, error)) ([]byte, func(), error)
+}
+
+func registerRootManagerTokenCallback(
+	ctx context.Context, service userd.Service, config *k8s.Kubeconfig, address netip.AddrPort, managerNamespace string,
+) (*rootdRpc.ManagerTokenCallback, func(), error) {
+	negotiated := config.NegotiatedDevboxManagerTokenProvider(managerNamespace)
+	if !config.ManagerTokenFileSet && negotiated == nil {
+		return nil, nil, nil
+	}
+	registrar, ok := service.(rootManagerTokenRegistrar)
+	if !ok {
+		return nil, nil, errors.New("user daemon cannot provide the traffic-manager credential to the root daemon")
+	}
+	var capability []byte
+	var revoke func()
+	var err error
+	if config.ManagerTokenFileSet {
+		capability, revoke, err = registrar.RegisterManagerTokenCallback(ctx, config.ManagerTokenFile)
+	} else {
+		capability, revoke, err = registrar.RegisterNegotiatedManagerTokenCallback(negotiated)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return &rootdRpc.ManagerTokenCallback{Address: address.String(), Capability: capability, NegotiatedDevboxProxy: !config.ManagerTokenFileSet}, revoke, nil
+}
+
+func rootDaemonCallbackAddress(addr netip.AddrPort) netip.AddrPort {
+	if addr.Addr().IsUnspecified() {
+		loopback := netip.AddrFrom4([4]byte{127, 0, 0, 1})
+		if addr.Addr().Is6() {
+			loopback = netip.IPv6Loopback()
+		}
+		addr = netip.AddrPortFrom(loopback, addr.Port())
+	}
+	return addr
 }
 
 func (s *session) GetService() userd.Service {
@@ -1143,8 +1202,11 @@ func (s *session) CheckStatus(cr *rpc.ConnectRequest) error {
 	// If namespaces are specified in the request, then we must ensure that they are the same as the current ones
 	// because the request takes precedence over namespaces configured in the client configuration or by the traffic-manager.
 	if len(cr.MappedNamespaces) == 0 || slices.Equal(cr.MappedNamespaces, s.MappedNamespaces) {
-		envEQ := true
+		envEQ := s.ManagerTokenFileMatchesRequest(cr.Environment)
 		for k, v := range cr.Environment {
+			if k == k8s.ManagerTokenFileEnv {
+				continue
+			}
 			if k[0] == '-' {
 				if _, ok := os.LookupEnv(k[1:]); ok {
 					envEQ = false
@@ -1362,6 +1424,21 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 			}
 		}()
 		rd = rootdRpc.NewDaemonClient(conn)
+		var expectedCallbackID []byte
+		if nc.ManagerTokenCallback != nil {
+			id := sha256.Sum256(nc.ManagerTokenCallback.Capability)
+			expectedCallbackID = id[:]
+			rootStatus, checkErr := rd.Status(timeoutCtx, &empty.Empty{})
+			if checkErr != nil {
+				return fmt.Errorf("failed to check root daemon traffic-manager credential support: %w", checkErr)
+			}
+			if !rootStatus.GetSupportsManagerTokenCallback() {
+				return errors.New("the root daemon does not support the required traffic-manager credential; restart it with this Telepresence version")
+			}
+			if nc.ManagerTokenCallback.GetNegotiatedDevboxProxy() && !rootStatus.GetSupportsNegotiatedDevboxProxy() {
+				return errors.New("the root daemon does not support negotiated Devbox traffic-manager credentials; restart it with this Telepresence version")
+			}
+		}
 
 		for attempt := 1; ; attempt++ {
 			var rootStatus *rootdRpc.DaemonStatus
@@ -1374,7 +1451,9 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 				// This is an internal error. Something is wrong with the root daemon.
 				return errors.New("root daemon's OutboundConfig has no session")
 			}
-			if oc.Session.SessionId == nc.Session.SessionId {
+			callbackMatches := expectedCallbackID == nil ||
+				(rootStatus.GetManagerTokenCallbackActive() && bytes.Equal(expectedCallbackID, rootStatus.GetManagerTokenCallbackId()))
+			if oc.Session.SessionId == nc.Session.SessionId && callbackMatches {
 				break
 			}
 

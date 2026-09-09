@@ -8,6 +8,7 @@ import (
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/annotation"
@@ -40,6 +41,83 @@ func TestGenerateDoesNotMutateSharedWorkloadTemplate(t *testing.T) {
 	}
 	if namespace := workload.GetPodTemplate().Namespace; namespace != "" {
 		t.Fatalf("Generate() mutated the shared pod template namespace to %q", namespace)
+	}
+}
+
+func TestGenerateAuthoritativeRouteReadinessIsOptIn(t *testing.T) {
+	ctx := k8sapi.WithK8sInterface(context.Background(), fake.NewClientset())
+	for _, test := range []struct {
+		enabled    bool
+		namespaces []string
+		want       bool
+	}{
+		{enabled: false},
+		{enabled: true, want: true},
+		{enabled: true, namespaces: []string{"ambassador"}},
+		{enabled: true, namespaces: []string{"ambassador", "default"}, want: true},
+		{namespaces: []string{"default"}},
+	} {
+		workload := deploymentWithInactivePort("")
+		workload.GetPodTemplate().Labels = map[string]string{"app": "app"}
+		workload.GetPodTemplate().Spec.Containers = []core.Container{{Name: "app"}}
+		config := &GeneratorConfig{AgentPort: 9900, RequireAuthoritativeRoutes: test.enabled, AuthoritativeRouteNamespaces: test.namespaces}
+		sidecar, err := config.Generate(ctx, workload, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sidecar.RequireAuthoritativeRoutes != test.want {
+			t.Fatalf("RequireAuthoritativeRoutes = %t, want %t", sidecar.RequireAuthoritativeRoutes, test.want)
+		}
+		wire, err := agentconfig.MarshalTight(sidecar)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(wire, `"requireAuthoritativeRoutes"`) != test.want {
+			t.Fatalf("new field must only be sent when explicitly enabled: %s", wire)
+		}
+		decoded, err := agentconfig.UnmarshalJSON(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded.RequireAuthoritativeRoutes != test.want {
+			t.Fatalf("decoded RequireAuthoritativeRoutes = %t, want %t", decoded.RequireAuthoritativeRoutes, test.want)
+		}
+	}
+}
+
+func TestGenerateRouteIntentAgentImageIsNamespaceScoped(t *testing.T) {
+	const standard, candidate = "registry.example/tel2:stable", "registry.example/tel2@sha256:abc123"
+	ctx := k8sapi.WithK8sInterface(context.Background(), fake.NewClientset())
+	for _, test := range []struct {
+		name, namespace, candidate, want string
+		scoped                           []string
+	}{
+		{name: "allowed", namespace: "ambassador", candidate: candidate, scoped: []string{"ambassador"}, want: candidate},
+		{name: "not allowed", namespace: "application", candidate: candidate, scoped: []string{"ambassador"}, want: standard},
+		{name: "default image unchanged", namespace: "ambassador", scoped: []string{"ambassador"}, want: standard},
+		{name: "empty namespace list retains feature all", namespace: "application", candidate: candidate, want: candidate},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workload := deploymentWithInactivePort("")
+			workload.SetNamespace(test.namespace)
+			workload.GetPodTemplate().Labels = map[string]string{"app": "app"}
+			workload.GetPodTemplate().Spec.Containers = []core.Container{{Name: "app"}}
+			cfg := &GeneratorConfig{AgentPort: 9900, QualifiedAgentImage: standard, RouteIntentAgentImage: test.candidate, AuthoritativeRouteNamespaces: test.scoped}
+			if got := cfg.AgentImageForNamespace(test.namespace); got != test.want {
+				t.Fatalf("selected image %q, expected %q", got, test.want)
+			}
+			previous := &agentconfig.Sidecar{AgentImage: standard}
+			generated, err := cfg.Generate(ctx, workload, previous)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if generated.AgentImage != test.want {
+				t.Fatalf("generated image %q, expected %q", generated.AgentImage, test.want)
+			}
+			if previous.AgentImage != standard {
+				t.Fatal("generation mutated cached prior-image config")
+			}
+		})
 	}
 }
 

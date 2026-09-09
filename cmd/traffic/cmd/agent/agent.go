@@ -13,10 +13,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/telepresenceio/clog"
 	ftp "github.com/telepresenceio/go-ftpserver"
@@ -35,6 +37,12 @@ import (
 )
 
 var DisplayName = "OSS Traffic Agent" //nolint:gochecknoglobals // extension point
+
+// A container restart can reuse its Pod UID but loses its in-memory guards.
+// All manager reconnects in one process reuse this cryptographically random identity.
+var processRouteGuardInstance = uuid.NewString() //nolint:gochecknoglobals // process-lifetime identity
+
+var processRouteGuardStartedAt = time.Now() //nolint:gochecknoglobals // process-lifetime identity
 
 // AppEnvironment returns the environment visible to this agent together with environment variables
 // explicitly declared for the app container and minus the environment variables provided by this
@@ -299,6 +307,10 @@ func advertisedInterceptTargets(ac *agentconfig.Sidecar) []*rpc.AgentInfo_Interc
 				continue
 			}
 			seenTargets[key] = struct{}{}
+			agentPort := ic.AgentPort
+			if cn.Replace == agentconfig.ReplacePolicyContainer {
+				agentPort = ic.ContainerPort // MakeInterceptStates listens on the original port for a replaced container.
+			}
 			interceptTargets = append(interceptTargets, &rpc.AgentInfo_InterceptTarget{
 				ServiceUid:      string(ic.ServiceUID),
 				ServiceName:     ic.ServiceName,
@@ -307,6 +319,8 @@ func advertisedInterceptTargets(ac *agentconfig.Sidecar) []*rpc.AgentInfo_Interc
 				Protocol:        ic.Protocol.String(),
 				ContainerName:   cn.Name,
 				ContainerPort:   int32(ic.ContainerPort),
+				AppProtocol:     ic.AppProtocol,
+				AgentPort:       int32(agentPort),
 			})
 		}
 	}
@@ -327,6 +341,13 @@ func advertisedInterceptTargets(ac *agentconfig.Sidecar) []*rpc.AgentInfo_Interc
 		return a.ContainerPort < b.ContainerPort
 	})
 	return interceptTargets
+}
+
+func advertisedRouteGuardInstance(ac *agentconfig.Sidecar) string {
+	if ac.RequireAuthoritativeRoutes {
+		return processRouteGuardInstance
+	}
+	return ""
 }
 
 func StartServices(g log.Group, config Config, srv State) (*rpc.AgentInfo, error) {
@@ -410,21 +431,27 @@ func StartServices(g log.Group, config Config, srv State) (*rpc.AgentInfo, error
 		}
 	}
 	interceptTargets := advertisedInterceptTargets(ac)
+	var routeGuardStartedAt *timestamppb.Timestamp
+	if ac.RequireAuthoritativeRoutes {
+		routeGuardStartedAt = timestamppb.New(processRouteGuardStartedAt)
+	}
 
 	return &rpc.AgentInfo{
-		Name:      ac.AgentName,
-		Namespace: ac.Namespace,
-		Kind:      string(ac.WorkloadKind),
-		PodName:   config.PodName(),
-		PodIp:     config.PodIP().String(),
-		PodUid:    string(config.PodUID()),
-		NodeAgent: config.NodeAgent(),
-		ApiPort:   int32(grpcPort),
-		FtpPort:   int32(ftpPort),
-		SftpPort:  int32(sftpPort),
-		QuicPort:  int32(ac.QuicPort),
-		Product:   "telepresence",
-		Version:   version.Version,
+		Name:                ac.AgentName,
+		Namespace:           ac.Namespace,
+		Kind:                string(ac.WorkloadKind),
+		PodName:             config.PodName(),
+		PodIp:               config.PodIP().String(),
+		PodUid:              string(config.PodUID()),
+		NodeAgent:           config.NodeAgent(),
+		ApiPort:             int32(grpcPort),
+		FtpPort:             int32(ftpPort),
+		SftpPort:            int32(sftpPort),
+		QuicPort:            int32(ac.QuicPort),
+		Product:             "telepresence",
+		Version:             version.Version,
+		RouteGuardInstance:  advertisedRouteGuardInstance(ac),
+		RouteGuardStartedAt: routeGuardStartedAt,
 		Mechanisms: []*rpc.AgentInfo_Mechanism{
 			{
 				Name:    "tcp",

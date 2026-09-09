@@ -7,7 +7,6 @@ import (
 	"os"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,16 +40,23 @@ type InterceptFinalizer func(ctx context.Context, interceptInfo *rpc.InterceptIn
 
 type Intercept struct {
 	*rpc.InterceptInfo
-	finalizers   []InterceptFinalizer
-	participants map[string]*interceptParticipant
+	finalizers             []InterceptFinalizer
+	participants           map[string]*interceptParticipant
+	routeActivationAllowed bool
+	routePendingActivation *rpc.InterceptInfo
 }
 
 func (is *Intercept) Clone() *Intercept {
-	return &Intercept{
-		InterceptInfo: proto.Clone(is.InterceptInfo).(*rpc.InterceptInfo),
-		finalizers:    slices.Clone(is.finalizers),
-		participants:  is.cloneParticipants(),
+	cloned := &Intercept{
+		InterceptInfo:          proto.Clone(is.InterceptInfo).(*rpc.InterceptInfo),
+		finalizers:             slices.Clone(is.finalizers),
+		participants:           is.cloneParticipants(),
+		routeActivationAllowed: is.routeActivationAllowed,
 	}
+	if is.routePendingActivation != nil {
+		cloned.routePendingActivation = proto.CloneOf(is.routePendingActivation)
+	}
+	return cloned
 }
 
 func (is *Intercept) addFinalizer(finalizer InterceptFinalizer) {
@@ -79,7 +85,10 @@ type State struct {
 
 	// Registration and removal must finish reconciling intercepts before the
 	// same pod UID can establish another session.
-	agentSessionMu sync.Mutex
+	agentPodLocks     agentLifecycleLocks[types.UID]
+	agentSessionLocks agentLifecycleLocks[tunnel.SessionID]
+	// Agent lifecycle updates for a shared intercept must observe each other.
+	agentInterceptLocks agentLifecycleLocks[string]
 
 	allClientSessionsFinalizer allClientSessionsFinalizer
 	allInterceptsFinalizer     allInterceptsFinalizer
@@ -119,7 +128,8 @@ func (s *State) ManagesNamespace(ctx context.Context, ns string) bool {
 }
 
 func interceptEqual(a, b *Intercept) bool {
-	return proto.Equal(a.InterceptInfo, b.InterceptInfo) && participantsEqual(a.participants, b.participants)
+	return proto.Equal(a.InterceptInfo, b.InterceptInfo) && participantsEqual(a.participants, b.participants) &&
+		a.routeActivationAllowed == b.routeActivationAllowed && proto.Equal(a.routePendingActivation, b.routePendingActivation)
 }
 
 func agentsEqual(a, b *AgentSession) bool {
@@ -348,8 +358,8 @@ func (s *State) RemoveSession(ctx context.Context, id tunnel.SessionID) {
 // RemoveAgentSession removes only the given session, preserving a replacement
 // that has already registered with the same pod UID.
 func (s *State) RemoveAgentSession(agent *AgentSession) {
-	s.agentSessionMu.Lock()
-	defer s.agentSessionMu.Unlock()
+	unlock, _ := s.lockAgentSession(context.Background(), types.UID(agent.PodUid), agent.sessionID())
+	defer unlock()
 
 	if current, ok := s.agents.Load(agent.sessionID()); ok && current == agent {
 		s.removeAgentSessionLocked(agent, true)
@@ -357,8 +367,8 @@ func (s *State) RemoveAgentSession(agent *AgentSession) {
 }
 
 func (s *State) expireAgentSession(agent *AgentSession, moment time.Time) {
-	s.agentSessionMu.Lock()
-	defer s.agentSessionMu.Unlock()
+	unlock, _ := s.lockAgentSession(context.Background(), types.UID(agent.PodUid), agent.sessionID())
+	defer unlock()
 
 	if current, ok := s.agents.Load(agent.sessionID()); ok && current == agent && agent.lastMarked().Before(moment) {
 		s.removeAgentSessionLocked(agent, false)
@@ -395,10 +405,17 @@ func (s *State) removeClientSession(cs *ClientSession) {
 func (s *State) consolidateAgentSessionIntercepts(agent *AgentSession) {
 	clog.Debugf(s.backgroundCtx, "Consolidating intercepts after removal of agent %s(%s)", agent.PodName, agent.PodIp)
 	s.intercepts.Range(func(interceptID string, intercept *Intercept) bool {
+		if !agentAffectsIntercept(agent.AgentInfo, intercept) {
+			return true
+		}
+		unlock := s.agentInterceptLocks.lock(interceptID)
+		defer unlock()
+		intercept, ok := s.intercepts.Load(interceptID)
+		if !ok || !agentAffectsIntercept(agent.AgentInfo, intercept) {
+			return true
+		}
 		serviceScoped := serviceScopedIntercept(intercept.Spec)
-		if intercept.Disposition == rpc.InterceptDispositionType_REMOVED ||
-			(!serviceScoped &&
-				(!AgentMatchesIntercept(agent.AgentInfo, intercept.Spec) || agent.PodIp != intercept.PodIp)) {
+		if !serviceScoped && agent.PodIp != intercept.PodIp {
 			// Not of interest. Continue iteration.
 			return true
 		}
@@ -488,7 +505,8 @@ func (s *State) transferServiceParticipantReview(interceptID, key string, remove
 	updated := s.UpdateIntercept(interceptID, func(intercept *Intercept) {
 		transferred = false
 		participant := intercept.participants[key]
-		if intercept.Disposition != rpc.InterceptDispositionType_ACTIVE || participant == nil ||
+		pending := intercept.hasPendingRouteActivation()
+		if (intercept.Disposition != rpc.InterceptDispositionType_ACTIVE && !pending) || participant == nil ||
 			participant.podName != removed.PodName || participant.review == nil {
 			return
 		}
@@ -542,6 +560,11 @@ func (s *State) transferServiceParticipantReview(interceptID, key string, remove
 			return
 		}
 
+		if pending {
+			// Update the hidden approved snapshot; the common durable barrier
+			// immediately hides it again unless fresh guard evidence is allowed.
+			intercept.InterceptInfo = proto.CloneOf(intercept.routePendingActivation)
+		}
 		published := intercept.publishedServiceParticipant() == participant
 		participant.review = review
 		participant.podName = replacement.PodName
@@ -553,10 +576,14 @@ func (s *State) transferServiceParticipantReview(interceptID, key string, remove
 		transferred = true
 	})
 	if updated != nil && transferred {
-		clog.Debugf(s.backgroundCtx, "Intercept %q transferred workload approval from pod %s(%s) without leaving ACTIVE", interceptID, removed.PodName, removed.PodIp)
+		clog.Debugf(s.backgroundCtx, "Intercept %q preserved workload approval after pod %s(%s) left", interceptID, removed.PodName, removed.PodIp)
 		return true
 	}
 	return false
+}
+
+func (is *Intercept) hasPendingRouteActivation() bool {
+	return is.Disposition == rpc.InterceptDispositionType_WAITING && is.RouteIncarnation != "" && is.routePendingActivation != nil
 }
 
 func serviceInterceptContainerName(agent *rpc.AgentInfo, spec *rpc.InterceptSpec) string {
@@ -671,18 +698,17 @@ func (s *State) RestoreClient(sessionID tunnel.SessionID, client *rpc.ClientInfo
 }
 
 func (s *State) RestoreAgents(agents []*rpc.AgentInfo, now time.Time) {
-	s.agentSessionMu.Lock()
-	defer s.agentSessionMu.Unlock()
-
 	m := mutator.GetMap(s.backgroundCtx)
 	for _, newAgent := range agents {
-		if m.IsInactive(types.UID(newAgent.PodUid)) {
-			continue
-		}
+		uid := types.UID(newAgent.PodUid)
 		id := tunnel.SessionID(AgentSessionIDPrefix + newAgent.PodUid)
-		s.agents.LoadOrCompute(id, func() *AgentSession {
-			return newAgentSessionState(s.backgroundCtx, id, newAgent, now)
-		})
+		unlock, _ := s.lockAgentSession(context.Background(), uid, id)
+		if !m.IsInactive(uid) {
+			s.agents.LoadOrCompute(id, func() *AgentSession {
+				return newAgentSessionState(s.backgroundCtx, id, newAgent, now)
+			})
+		}
+		unlock()
 	}
 }
 
@@ -693,8 +719,9 @@ func (s *State) RestoreIntercepts(ctx context.Context, intercepts []*rpc.Interce
 	for _, intercept := range intercepts {
 		s.intercepts.LoadOrCompute(intercept.Id, func() *Intercept {
 			spec := intercept.Spec
-			is := &Intercept{InterceptInfo: intercept}
+			is := &Intercept{InterceptInfo: proto.CloneOf(intercept)}
 			s.initializeParticipants(is)
+			is.enforceRouteActivationBarrier(nil)
 			if IsChildIntercept(spec) {
 				// Finalizer must be added to the parent intercept, but the parent might be added after
 				// the child intercept is added, so it'll have to wait.
@@ -805,18 +832,32 @@ func (s *State) CountTunnelEgress() uint64 {
 	return atomic.LoadUint64(&s.tunnelEgressCounter)
 }
 
-// IsInterceptedBy reports whether this agent pod is serving an ACTIVE
-// intercept owned by the given client. Every agent pod that matches an
-// intercept needs a dial watcher, regardless of mechanism or filters.
-// Service-scoped intercepts extend matching to agents that advertise the
-// selected Service target and still belong to the current participant set.
+// IsInterceptedBy reports whether this client should maintain a dial watcher
+// for the agent. Matching active intercepts require it regardless of mechanism
+// or filters. An approved durable intercept may also keep this transport while
+// its forwarding is withheld by the route activation barrier. Service-scoped
+// intercepts only match agents still participating in the selected target.
 func (s *State) IsInterceptedBy(agent *AgentSession, client tunnel.SessionID) (found bool) {
-	if agent == nil {
+	if agent == nil || client == "" {
 		return false
 	}
 	clientSessionID := string(client)
 	s.intercepts.Range(func(id string, ii *Intercept) bool {
-		if ii.ClientSession.SessionId != clientSessionID || ii.Disposition != rpc.InterceptDispositionType_ACTIVE {
+		if ii.GetClientSession().GetSessionId() != clientSessionID {
+			return true
+		}
+		if ii.RouteIncarnation != "" {
+			owner := s.GetClient(client)
+			if owner == nil || owner.done() == nil {
+				return true
+			}
+			select {
+			case <-owner.done():
+				return true
+			default:
+			}
+		}
+		if ii.Disposition != rpc.InterceptDispositionType_ACTIVE && !ii.hasApprovedDurableDialWatch(clientSessionID) {
 			return true
 		}
 		if !AgentMatchesInterceptInfo(agent.AgentInfo, ii) {
@@ -828,6 +869,15 @@ func (s *State) IsInterceptedBy(agent *AgentSession, client tunnel.SessionID) (f
 	return found
 }
 
+func (is *Intercept) hasApprovedDurableDialWatch(clientID string) bool {
+	if !is.hasPendingRouteActivation() {
+		return false
+	}
+	approved := is.routePendingActivation
+	return approved.Disposition == rpc.InterceptDispositionType_ACTIVE && approved.Id == is.Id &&
+		approved.RouteIncarnation == is.RouteIncarnation && approved.GetClientSession().GetSessionId() == clientID
+}
+
 // Sessions: Agents ////////////////////////////////////////////////////////////////////////////////
 
 func (s *State) AddAgent(ctx context.Context, agent *rpc.AgentInfo, principal *auth.Principal, now time.Time) (tunnel.SessionID, error) {
@@ -835,8 +885,11 @@ func (s *State) AddAgent(ctx context.Context, agent *rpc.AgentInfo, principal *a
 }
 
 func (s *State) RestoreAgent(ctx context.Context, id tunnel.SessionID, agent *rpc.AgentInfo, principal *auth.Principal, now time.Time) (tunnel.SessionID, error) {
-	s.agentSessionMu.Lock()
-	defer s.agentSessionMu.Unlock()
+	unlock, err := s.lockAgentSession(ctx, types.UID(agent.PodUid), id)
+	if err != nil {
+		return "", status.FromContextError(err).Err()
+	}
+	defer unlock()
 
 	if mutator.GetMap(s.backgroundCtx).IsInactive(types.UID(agent.PodUid)) {
 		return "", status.Error(codes.Aborted, "inactivated pod")
@@ -845,31 +898,33 @@ func (s *State) RestoreAgent(ctx context.Context, id tunnel.SessionID, agent *rp
 	if principal != nil {
 		as.SetPrincipal(principal)
 	}
-	if _, exists := s.agents.LoadOrStore(id, as); exists {
-		as.cancel()
-		// ArriveAsAgent can be retried after the manager committed this session
-		// but the response was lost or timed out. Return the stable pod-UID based
-		// session ID so that the retry remains idempotent.
-		return id, nil
+	if existing, exists := s.agents.LoadOrStore(id, as); exists {
+		if !s.replaceAuthenticatedRouteAgent(id, existing, as, principal) {
+			// ArriveAsAgent can be retried after the manager committed this session
+			// but the response was lost or timed out. Return the stable pod-UID based
+			// session ID so that the retry remains idempotent.
+			return id, nil
+		}
 	}
 
 	s.intercepts.Range(func(interceptID string, intercept *Intercept) bool {
-		if intercept.Disposition == rpc.InterceptDispositionType_REMOVED {
+		if !agentAffectsIntercept(agent, intercept) {
+			return true
+		}
+		unlock := s.agentInterceptLocks.lock(interceptID)
+		defer unlock()
+		intercept, ok := s.intercepts.Load(interceptID)
+		if !ok || !agentAffectsIntercept(agent, intercept) {
 			return true
 		}
 		matches := AgentMatchesIntercept(agent, intercept.Spec)
 		if serviceScopedIntercept(intercept.Spec) {
 			participantKey := agentParticipantKey(agent)
-			wasParticipant := intercept.participants[participantKey] != nil
 			intercept = s.reconcileServiceParticipants(interceptID, intercept)
 			if intercept == nil {
 				return true
 			}
-			if !matches {
-				if !wasParticipant {
-					return true
-				}
-			} else {
+			if matches {
 				// All pods in one workload share a participant key. Avoid entering
 				// UpdateIntercept once the workload is already represented; otherwise a
 				// burst of pods needlessly contends on the same intercept record.
@@ -919,6 +974,33 @@ func (s *State) RestoreAgent(ctx context.Context, id tunnel.SessionID, agent *rp
 	return id, nil
 }
 
+func (s *State) replaceAuthenticatedRouteAgent(id tunnel.SessionID, existing, next *AgentSession, principal *auth.Principal) bool {
+	if principal == nil || existing.PodUid != next.PodUid || next.RouteGuardInstance == "" {
+		next.cancel()
+		return false
+	}
+	nextStarted, previousStarted := next.RouteGuardStartedAt, existing.RouteGuardStartedAt
+	newProcess := nextStarted != nil && nextStarted.CheckValid() == nil &&
+		(previousStarted == nil || (previousStarted.CheckValid() == nil && nextStarted.AsTime().After(previousStarted.AsTime())))
+	if !newProcess && existing.Principal() == nil && next.RouteGuardInstance == existing.RouteGuardInstance {
+		existing.SetPrincipal(principal)
+	}
+	if newProcess && s.agents.CompareAndSwap(id, existing, next) {
+		existing.cancel()
+		return true
+	}
+	next.cancel()
+	return false
+}
+
+func agentAffectsIntercept(agent *rpc.AgentInfo, intercept *Intercept) bool {
+	if intercept.Disposition == rpc.InterceptDispositionType_REMOVED {
+		return false
+	}
+	return AgentMatchesIntercept(agent, intercept.Spec) ||
+		(serviceScopedIntercept(intercept.Spec) && intercept.participants[agentParticipantKey(agent)] != nil)
+}
+
 func (s *State) GetAgent(id tunnel.SessionID) *AgentSession {
 	if ret, ok := s.agents.Load(id); ok {
 		if !mutator.GetMap(s.backgroundCtx).IsInactive(types.UID(ret.PodUid)) {
@@ -936,6 +1018,20 @@ func (s *State) EachAgent(f func(tunnel.SessionID, *AgentSession) bool) {
 		}
 		return true
 	})
+}
+
+// RouteAgentSessionsForPod includes a recorded session even if the injector has
+// made its Pod inactive. Durable proof cannot fall back to an older process when
+// the manager has already recorded a newer session for that same Kubernetes UID.
+func (s *State) RouteAgentSessionsForPod(uid string) []*AgentSession {
+	var result []*AgentSession
+	s.agents.Range(func(_ tunnel.SessionID, agent *AgentSession) bool {
+		if agent.PodUid == uid {
+			result = append(result, agent)
+		}
+		return true
+	})
+	return result
 }
 
 func (s *State) LoadMatchingAgents(f func(tunnel.SessionID, *AgentSession) bool) map[tunnel.SessionID]*AgentSession {
@@ -1000,6 +1096,7 @@ func (s *State) UpdateIntercept(interceptID string, apply func(*Intercept)) *Int
 
 		newInfo := cur.Clone()
 		apply(newInfo)
+		newInfo.enforceRouteActivationBarrier(cur)
 		if interceptEqual(cur, newInfo) {
 			return cur
 		}
@@ -1010,6 +1107,40 @@ func (s *State) UpdateIntercept(interceptID string, apply func(*Intercept)) *Int
 			// Success!
 			return newInfo
 		}
+	}
+}
+
+// SetRouteActivation applies manager-computed, durable proof of guard installation.
+// All paths publishing ACTIVE, including cached client restoration, are fenced here.
+func (s *State) SetRouteActivation(interceptID, incarnation string, allowed bool) *Intercept {
+	return s.UpdateIntercept(interceptID, func(intercept *Intercept) {
+		if intercept.RouteIncarnation == "" || intercept.RouteIncarnation != incarnation {
+			return
+		}
+		intercept.routeActivationAllowed = allowed
+		if allowed && intercept.routePendingActivation != nil && intercept.Disposition == rpc.InterceptDispositionType_WAITING {
+			intercept.InterceptInfo = proto.CloneOf(intercept.routePendingActivation)
+			intercept.routePendingActivation = nil
+		}
+	})
+}
+
+func (is *Intercept) enforceRouteActivationBarrier(previous *Intercept) {
+	if is.RouteIncarnation == "" {
+		return
+	}
+	if is.Disposition == rpc.InterceptDispositionType_ACTIVE {
+		if !is.routeActivationAllowed {
+			is.routePendingActivation = proto.CloneOf(is.InterceptInfo)
+			clearPublishedReview(is)
+			is.Disposition = rpc.InterceptDispositionType_WAITING
+			is.Message = "Waiting for all routable pod route guards and gateway configuration"
+		}
+		return
+	}
+	if is.Disposition != rpc.InterceptDispositionType_WAITING || (previous != nil && previous.routePendingActivation != nil &&
+		(!proto.Equal(previous.InterceptInfo, is.InterceptInfo) || !participantsEqual(previous.participants, is.participants))) {
+		is.routePendingActivation = nil
 	}
 }
 

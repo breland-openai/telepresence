@@ -559,7 +559,7 @@ func dialReject(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.D
 		clog.Errorf(ctx, "!! %s %s, failed to create reject tunnel: %v", tag, id, err)
 		return
 	}
-	s, err := NewClientStream(ctx, tag, mt, id, sessionID, time.Duration(dr.RoundtripLatency), time.Duration(dr.DialTimeout))
+	s, err := newDialResponseStream(ctx, tag, mt, id, sessionID, time.Duration(dr.RoundtripLatency), time.Duration(dr.DialTimeout))
 	if err != nil {
 		clog.Errorf(ctx, "!! %s %s, failed to create reject stream: %v", tag, id, err)
 		return
@@ -600,7 +600,7 @@ func dialRespond(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.
 		clog.Debugf(ctx, "   %s %s, Tunnel stream established in %s", tag, id, tunnelDuration)
 	}
 	streamStart := time.Now()
-	s, err := NewClientStream(ctx, tag, mt, id, sessionID, time.Duration(dr.RoundtripLatency), time.Duration(dr.DialTimeout))
+	s, err := newDialResponseStream(ctx, tag, mt, id, sessionID, time.Duration(dr.RoundtripLatency), time.Duration(dr.DialTimeout))
 	if err != nil {
 		clog.Error(ctx, err)
 		if metrics != nil {

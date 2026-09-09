@@ -84,6 +84,11 @@ type Env struct {
 	AgentWatchRetryInterval    time.Duration `default:"10s"`
 	AgentPreStopDrainTimeout   time.Duration `default:"2m"`
 
+	AgentRequireAuthoritativeRoutes bool
+	// AgentRouteIntentImage is an optional fully-qualified candidate image used only
+	// in RouteIntentNamespaces when durable routes are enabled.
+	AgentRouteIntentImage string
+
 	// GoCoverDir is the manager's own GOCOVERDIR, propagated into generated agent containers.
 	GoCoverDir string `env:"GOCOVERDIR"`
 
@@ -155,10 +160,28 @@ type Env struct {
 
 	InterceptAllowGlobal          bool `default:"true"`
 	InterceptInactiveBlockTimeout time.Duration
+	// RouteIntentEnabled enables authoritative durable guards for exact local HTTP routes.
+	RouteIntentEnabled bool
+	// RouteIntentSkipGatewayAck is an explicit exception for installations without
+	// gateway routing. Durable routes otherwise require acknowledged gateway apply.
+	RouteIntentSkipGatewayAck bool
+	// RouteIntentNamespaces optionally restricts durable routes and authoritative agent
+	// injection to these workload namespaces. Empty preserves all managed namespaces.
+	RouteIntentNamespaces []string `envSeparator:" "`
+	// RouteIntentControllerServiceAccounts are the authenticated Kubernetes service account
+	// usernames permitted to read all managed routing guards. Empty denies global watches.
+	RouteIntentControllerServiceAccounts []string `envSeparator:" "`
 
 	// AuthenticationMode controls how strictly the traffic-manager enforces
 	// caller authentication (disabled, permissive, or enforcing).
 	AuthenticationMode auth.Mode `default:"permissive"`
+	// Optional HTTPS SelfSubjectReview endpoint for externally delegated client identities.
+	AuthDelegatedSelfSubjectReviewURL string `env:"AUTH_DELEGATED_SELF_SUBJECT_REVIEW_URL"`
+	// Optional vetted audience clients may use solely to authenticate to this manager.
+	AuthDelegatedDevboxProxyAudience string `env:"AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE"`
+	// Entra tenant and exact DNS authorities trusted to verify the configured audience.
+	AuthDelegatedDevboxProxyTenantID    string   `env:"AUTH_DELEGATED_DEVBOX_PROXY_TENANT_ID"`
+	AuthDelegatedDevboxProxyAuthorities []string `env:"AUTH_DELEGATED_DEVBOX_PROXY_AUTHORITIES" envSeparator:" "`
 
 	// Anonymous usage reporting. The manager produces reports whose only
 	// identifier is the UUID stored in the traffic-manager-install-id
@@ -191,28 +214,45 @@ func (e *Env) GeneratorConfig(qualifiedAgentImage string) (*agentmap.GeneratorCo
 	if e.TunnelQuicPort != 0 {
 		quicPort = e.TunnelQuicAgentPort
 	}
+	var routeAgentImage string
+	if e.RouteIntentEnabled {
+		routeAgentImage = e.AgentRouteIntentImage
+	}
 	return &agentmap.GeneratorConfig{
-		AgentPort:           e.AgentPort,
-		APIPort:             e.AgentRestApiPort,
-		QuicPort:            quicPort,
-		ClientConnectionTTL: e.ClientConnectionTTL,
-		ManagerPort:         e.ServerPort,
-		QualifiedAgentImage: qualifiedAgentImage,
-		ManagerNamespace:    e.ManagerNamespace,
-		ClusterDomain:       e.clusterDomain(),
-		LogLevel:            e.AgentLogLevel,
-		InitResources:       e.AgentInitResources,
-		Resources:           e.AgentResources,
-		PullPolicy:          e.AgentImagePullPolicy,
-		PullSecrets:         e.AgentImagePullSecrets,
-		SecurityContext:     e.AgentSecurityContext,
-		InitSecurityContext: e.AgentInitSecurityContext,
-		MountPolicies:       e.AgentMountPolicies,
-		MeshDialSubnets:     e.AgentMeshDialSubnets,
-		EnableH2cProbing:    e.AgentEnableH2cProbing,
-		EnableMetrics:       e.AgentConsumptionMetrics && e.PrometheusPort != 0,
-		WatchRetryInterval:  e.AgentWatchRetryInterval,
+		AgentPort:             e.AgentPort,
+		APIPort:               e.AgentRestApiPort,
+		QuicPort:              quicPort,
+		ClientConnectionTTL:   e.ClientConnectionTTL,
+		ManagerPort:           e.ServerPort,
+		QualifiedAgentImage:   qualifiedAgentImage,
+		RouteIntentAgentImage: routeAgentImage,
+		ManagerNamespace:      e.ManagerNamespace,
+		ClusterDomain:         e.clusterDomain(),
+		LogLevel:              e.AgentLogLevel,
+		InitResources:         e.AgentInitResources,
+		Resources:             e.AgentResources,
+		PullPolicy:            e.AgentImagePullPolicy,
+		PullSecrets:           e.AgentImagePullSecrets,
+		SecurityContext:       e.AgentSecurityContext,
+		InitSecurityContext:   e.AgentInitSecurityContext,
+		MountPolicies:         e.AgentMountPolicies,
+		MeshDialSubnets:       e.AgentMeshDialSubnets,
+		EnableH2cProbing:      e.AgentEnableH2cProbing,
+		EnableMetrics:         e.AgentConsumptionMetrics && e.PrometheusPort != 0,
+		WatchRetryInterval:    e.AgentWatchRetryInterval,
+
+		RequireAuthoritativeRoutes:   e.AgentRequireAuthoritativeRoutes,
+		AuthoritativeRouteNamespaces: e.RouteIntentNamespaces,
 	}, nil
+}
+
+// RouteIntentAgentImageForNamespace returns the namespace-specific image override,
+// or empty when this workload uses the standard image and admission behavior.
+func (e *Env) RouteIntentAgentImageForNamespace(namespace string) string {
+	if !e.RouteIntentEnabled {
+		return ""
+	}
+	return agentmap.ScopedAgentImage("", e.AgentRouteIntentImage, e.RouteIntentNamespaces, namespace)
 }
 
 func (e *Env) clusterDomain() string {
@@ -306,6 +346,24 @@ func LoadEnv(ctx context.Context, envMap map[string]string) (context.Context, er
 	}
 	if envStruct.AgentPreStopDrainTimeout < 0 {
 		return ctx, fmt.Errorf("AGENT_PRE_STOP_DRAIN_TIMEOUT must not be negative: %s", envStruct.AgentPreStopDrainTimeout)
+	}
+	if envStruct.AgentRequireAuthoritativeRoutes && !envStruct.RouteIntentEnabled {
+		return ctx, fmt.Errorf("AGENT_REQUIRE_AUTHORITATIVE_ROUTES requires ROUTE_INTENT_ENABLED")
+	}
+	if envStruct.AgentRequireAuthoritativeRoutes && !envStruct.AgentInitContainerEnabled {
+		return ctx, fmt.Errorf("AGENT_REQUIRE_AUTHORITATIVE_ROUTES requires AGENT_INIT_CONTAINER_ENABLED to protect direct application traffic")
+	}
+	initSecurity := &agentconfig.Sidecar{RequireAuthoritativeRoutes: envStruct.AgentRequireAuthoritativeRoutes, InitSecurityContext: envStruct.AgentInitSecurityContext}
+	if err := initSecurity.ValidateRouteIntentInitSecurity(); err != nil {
+		return ctx, fmt.Errorf("AGENT_INIT_SECURITY_CONTEXT: %w", err)
+	}
+	if envStruct.RouteIntentEnabled && envStruct.AuthenticationMode == auth.ModeDisabled {
+		return ctx, fmt.Errorf("ROUTE_INTENT_ENABLED requires authentication mode permissive or enforcing")
+	}
+	if err := auth.ValidateDelegatedDevboxProxyConfig(envStruct.AuthenticationMode,
+		envStruct.AuthDelegatedSelfSubjectReviewURL, envStruct.AuthDelegatedDevboxProxyAudience,
+		envStruct.AuthDelegatedDevboxProxyTenantID, envStruct.AuthDelegatedDevboxProxyAuthorities); err != nil {
+		return ctx, fmt.Errorf("AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE: %w", err)
 	}
 	return WithEnv(ctx, envStruct), nil
 }

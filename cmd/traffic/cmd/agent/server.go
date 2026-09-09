@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -25,11 +26,17 @@ import (
 type awaitingForward struct {
 	streamCh chan tunnel.Stream
 	doneCh   <-chan struct{}
+	mu       sync.Mutex
+	cleanup  *time.Timer
+	removed  bool
 }
 
 const (
 	clientTunnelSlowAfter       = time.Second
 	clientTunnelStillWaitingLog = 5 * time.Second
+	// Old clients cannot mark dial-response tunnels. Briefly keep abandoned
+	// requests so a late legacy reply cannot become an unsolicited cluster dial.
+	clientTunnelLateResponseWindow = time.Minute
 )
 
 func (s *state) Version(context.Context, *emptypb.Empty) (*rpc.VersionInfo2, error) {
@@ -85,10 +92,13 @@ func (s *state) Tunnel(server agent.Agent_TunnelServer) error {
 	}
 	if awc, ok := s.awaitingForwards.Load(stream.SessionID()); ok {
 		if awf, ok := awc.LoadAndDelete(stream.ID()); ok {
-			awf.streamCh <- stream
-			<-awf.doneCh
-			return nil
+			awf.stopCleanup()
+			return awf.serve(ctx, stream)
 		}
+	}
+	if tunnel.IsDialResponse(stream) {
+		clog.Debugf(ctx, "ignoring abandoned client dial response for session %s and id %s", stream.SessionID(), stream.ID())
+		return nil
 	}
 	reporting := s.MetricsEnabled()
 	var ingressBytes, egressBytes *tunnel.CounterProbe
@@ -109,6 +119,41 @@ func (s *state) Tunnel(server agent.Agent_TunnelServer) error {
 		})
 	}
 	return nil
+}
+
+func (awf *awaitingForward) stopCleanup() {
+	awf.mu.Lock()
+	defer awf.mu.Unlock()
+	awf.removed = true
+	if awf.cleanup != nil {
+		awf.cleanup.Stop()
+	}
+}
+
+func (awf *awaitingForward) keepForLateResponse(after time.Duration, remove func()) {
+	awf.mu.Lock()
+	defer awf.mu.Unlock()
+	if !awf.removed {
+		awf.cleanup = time.AfterFunc(after, remove)
+	}
+}
+
+// A request can give up while a client is returning its dial stream. Never leave
+// that Tunnel RPC blocked trying to hand the stream to a waiter that has gone away.
+func (awf *awaitingForward) serve(ctx context.Context, stream tunnel.Stream) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-awf.doneCh:
+		return nil
+	case awf.streamCh <- stream:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-awf.doneCh:
+		return nil
+	}
 }
 
 func (s *state) WatchDial(session *rpc.SessionInfo, server agent.Agent_WatchDialServer) error {
@@ -180,6 +225,7 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 	var awc *xsync.Map[tunnel.ConnID, *awaitingForward]
 	var aw *awaitingForward
 	var stCh <-chan tunnel.Stream
+	var requested, connected bool
 
 	// A retry is needed here because what actually happens is that the dial watcher channel drCh is inserted when the
 	// client calls WatchDial. That call arrives only after the client received confirmation that it is intercepting
@@ -191,12 +237,24 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 			awc, _ = s.awaitingForwards.LoadOrCompute(sessionID, func() (*xsync.Map[tunnel.ConnID, *awaitingForward], bool) {
 				return xsync.NewMap[tunnel.ConnID, *awaitingForward](), false
 			})
-			aw, _ = awc.LoadOrCompute(id, func() (*awaitingForward, bool) {
-				return &awaitingForward{
+			awc.Compute(id, func(current *awaitingForward, loaded bool) (*awaitingForward, xsync.ComputeOp) {
+				if loaded {
+					select {
+					case <-current.doneCh:
+						current.stopCleanup()
+					default:
+						return current, xsync.CancelOp
+					}
+				}
+				aw = &awaitingForward{
 					streamCh: make(chan tunnel.Stream),
 					doneCh:   ctx.Done(),
-				}, false
+				}
+				return aw, xsync.UpdateOp
 			})
+			if aw == nil {
+				return backoff.Permanent(fmt.Errorf("a tunnel to client %s for id %s is already pending", sessionID, id))
+			}
 			stCh = aw.streamCh
 			return nil
 		}
@@ -208,12 +266,19 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 	}
 	defer func() {
 		if awc != nil && aw != nil {
-			awc.Compute(id, func(current *awaitingForward, loaded bool) (*awaitingForward, xsync.ComputeOp) {
-				if loaded && current == aw {
-					return nil, xsync.DeleteOp
-				}
-				return current, xsync.CancelOp
-			})
+			remove := func() {
+				awc.Compute(id, func(current *awaitingForward, loaded bool) (*awaitingForward, xsync.ComputeOp) {
+					if loaded && current == aw {
+						return nil, xsync.DeleteOp
+					}
+					return current, xsync.CancelOp
+				})
+			}
+			if requested && !connected {
+				aw.keepForLateResponse(clientTunnelLateResponseWindow, remove)
+			} else {
+				remove()
+			}
 		}
 	}()
 
@@ -223,6 +288,7 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 		clog.Errorf(ctx, "unable to send DialRequest to client %s for id %s: %v", sessionID, id, ctx.Err())
 		return nil, ctx.Err()
 	case drCh <- &rpc.DialRequest{ConnId: []byte(id), DialTimeout: int64(dialTimeout), RoundtripLatency: int64(roundTripLatency)}:
+		requested = true
 	}
 
 	waitLog := time.NewTimer(clientTunnelSlowAfter)
@@ -233,6 +299,7 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 			clog.Errorf(ctx, "unable to create tunnel to client %s for id %s after %s: %v", sessionID, id, time.Since(requestStart).Round(time.Millisecond), ctx.Err())
 			return nil, ctx.Err()
 		case stream := <-stCh:
+			connected = true
 			if elapsed := time.Since(requestStart); elapsed > clientTunnelSlowAfter {
 				clog.Warnf(ctx, "created tunnel to client %s for id %s slowly in %s", sessionID, id, elapsed.Round(time.Millisecond))
 			} else {

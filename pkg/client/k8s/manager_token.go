@@ -5,16 +5,26 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/transport"
 
 	"github.com/telepresenceio/clog"
+	authrpc "github.com/telepresenceio/telepresence/rpc/v2/authenticator"
 	"github.com/telepresenceio/telepresence/v2/pkg/authenticator"
 )
 
@@ -23,6 +33,16 @@ import (
 type managerTokenSource interface {
 	Token(ctx context.Context) (string, error)
 }
+
+// ManagerTokenFileEnv selects a bearer token used only for traffic-manager RPCs.
+// The Kubernetes API connection always retains the kubeconfig's own credentials.
+const ManagerTokenFileEnv = "TELEPRESENCE_MANAGER_TOKEN_FILE"
+
+const maxManagerTokenFileSize = 16 * 1024
+
+// ManagerTokenCallbackCapabilitySize is the entropy, in bytes, of a user-daemon
+// capability that grants the root daemon access to one connection's credential.
+const ManagerTokenCallbackCapabilitySize = 32
 
 // errNoBearerToken indicates that the kubeconfig's credentials yield a client
 // certificate rather than a bearer token.
@@ -48,6 +68,124 @@ func newManagerTokenSource(kc *Kubeconfig) managerTokenSource {
 	default:
 		return nil
 	}
+}
+
+// managerFileTokenSource reopens the file for every RPC, so atomic token rotation
+// is visible without reconnecting and a missing or bad replacement never reuses
+// the previous credential. Kubernetes projected token symlinks are supported.
+type managerFileTokenSource string
+
+// ReadManagerTokenFile reads the explicit manager credential with the current
+// process's privileges. The user daemon uses this to serve an authorized root
+// daemon callback; the privileged daemon must not read caller-selected paths.
+func ReadManagerTokenFile(ctx context.Context, path string) (string, error) {
+	return managerFileTokenSource(path).Token(ctx)
+}
+
+func (s managerFileTokenSource) Token(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	path := string(s)
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("%s must name an absolute path", ManagerTokenFileEnv)
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s does not name a readable regular token file", ManagerTokenFileEnv)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("%s token file could not be opened", ManagerTokenFileEnv)
+	}
+	defer file.Close()
+	info, err = file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s does not name a readable regular token file", ManagerTokenFileEnv)
+	}
+	if info.Size() > maxManagerTokenFileSize {
+		return "", fmt.Errorf("%s token file is too large", ManagerTokenFileEnv)
+	}
+	content, err := io.ReadAll(io.LimitReader(file, maxManagerTokenFileSize+1))
+	if err != nil {
+		return "", fmt.Errorf("%s token file could not be read", ManagerTokenFileEnv)
+	}
+	if err = ctx.Err(); err != nil {
+		return "", err
+	}
+	if len(content) > maxManagerTokenFileSize {
+		return "", fmt.Errorf("%s token file is too large", ManagerTokenFileEnv)
+	}
+	token := string(content)
+	if strings.HasSuffix(token, "\n") {
+		token = strings.TrimSuffix(strings.TrimSuffix(token, "\n"), "\r")
+	}
+	if !validManagerBearerToken(token) {
+		return "", fmt.Errorf("%s token file is empty or contains an invalid bearer token", ManagerTokenFileEnv)
+	}
+	return token, nil
+}
+
+func validManagerBearerToken(token string) bool {
+	if token == "" {
+		return false
+	}
+	padding := false
+	for index := range len(token) {
+		c := token[index]
+		if c == '=' {
+			if index == 0 {
+				return false
+			}
+			padding = true
+			continue
+		}
+		if padding || !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.ContainsRune("-._~+/", rune(c))) {
+			return false
+		}
+	}
+	return true
+}
+
+// ConfigureRootManagerTokenCallback applies the connection input from the user
+// daemon. Passing no callback explicitly clears any root-process environment
+// override; a supplied callback is required and never falls back to kubeconfig.
+func (kf *Kubeconfig) ConfigureRootManagerTokenCallback(ctx context.Context, supplied bool, address string, capability []byte, negotiated ...bool) error {
+	kf.ManagerTokenFile, kf.ManagerTokenFileSet, kf.managerTokenCallback, kf.managerTokenCallbackNegotiated = "", false, nil, false
+	if !supplied {
+		return nil
+	}
+	addr, err := netip.ParseAddrPort(address)
+	if err != nil || !addr.Addr().IsLoopback() || addr.Port() == 0 || len(capability) != ManagerTokenCallbackCapabilitySize {
+		return errors.New("invalid traffic-manager credential callback")
+	}
+	conn, err := grpc.NewClient("passthrough:///"+addr.String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return errors.New("unable to create traffic-manager credential callback")
+	}
+	context.AfterFunc(ctx, func() { _ = conn.Close() })
+	kf.managerTokenCallback = &managerCallbackTokenSource{
+		client: authrpc.NewAuthenticatorClient(conn), capability: append([]byte(nil), capability...),
+	}
+	kf.managerTokenCallbackNegotiated = len(negotiated) > 0 && negotiated[0]
+	return nil
+}
+
+type managerCallbackTokenSource struct {
+	client     authrpc.AuthenticatorClient
+	capability []byte
+	managerPod string
+	audience   string
+}
+
+func (s *managerCallbackTokenSource) Token(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	response, err := s.client.GetManagerToken(ctx, &authrpc.GetManagerTokenRequest{Capability: s.capability, ManagerPodUid: s.managerPod, DevboxProxyAudience: s.audience})
+	if err != nil || response == nil || len(response.Token) > maxManagerTokenFileSize || !validManagerBearerToken(response.Token) {
+		return "", errors.New("the user daemon could not provide the traffic-manager bearer credential")
+	}
+	return response.Token, nil
 }
 
 // staticTokenSource is a fixed bearer token, e.g. from --token or an
@@ -85,7 +223,8 @@ const (
 // execTokenSource runs a kubeconfig exec credential plugin and caches the
 // resulting bearer token until it is about to expire.
 type execTokenSource struct {
-	execConfig *clientcmdapi.ExecConfig
+	execConfig    *clientcmdapi.ExecConfig
+	requireExpiry bool
 
 	mu     sync.Mutex
 	cached bool
@@ -129,6 +268,10 @@ func (e *execTokenSource) Token(ctx context.Context) (string, error) {
 	if err := json.Unmarshal(out, &cred); err != nil {
 		e.cached = false
 		return "", fmt.Errorf("unable to parse exec credential: %w", err)
+	}
+	if e.requireExpiry && (cred.Status.ExpirationTimestamp == nil || !cred.Status.ExpirationTimestamp.After(time.Now())) {
+		e.cached = false
+		return "", errors.New("exec credential did not provide a usable expiry")
 	}
 
 	if cred.Status.ExpirationTimestamp != nil {
@@ -176,8 +319,9 @@ func (c *managerAuthTokenSource) Token(ctx context.Context) (string, error) {
 // managerTokenCredentials is a credentials.PerRPCCredentials that attaches the
 // kubeconfig's bearer token to every RPC to the traffic-manager.
 type managerTokenCredentials struct {
-	source   managerTokenSource
-	warnOnce sync.Once
+	source     managerTokenSource
+	failClosed bool
+	warnOnce   sync.Once
 }
 
 var _ credentials.PerRPCCredentials = (*managerTokenCredentials)(nil)
@@ -187,6 +331,10 @@ func newManagerTokenCredentials(source managerTokenSource) *managerTokenCredenti
 	return &managerTokenCredentials{source: source}
 }
 
+func newRequiredManagerTokenCredentials(source managerTokenSource) *managerTokenCredentials {
+	return &managerTokenCredentials{source: source, failClosed: true}
+}
+
 // GetRequestMetadata returns the bearer authorization header for the current
 // token. A failure to obtain a token (a plugin error, or a plugin that only
 // yields a client certificate) is logged once and yields empty metadata
@@ -194,6 +342,15 @@ func newManagerTokenCredentials(source managerTokenSource) *managerTokenCredenti
 // tokens. Token contents are never logged.
 func (c *managerTokenCredentials) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
 	token, err := c.source.Token(ctx)
+	if c.failClosed && (err != nil || token == "") {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, status.FromContextError(err).Err()
+		}
+		if err == nil {
+			err = fmt.Errorf("%s token file is empty", ManagerTokenFileEnv)
+		}
+		return nil, status.Errorf(codes.Unauthenticated, "cannot obtain explicitly configured traffic-manager credential: %v", err)
+	}
 	if err != nil {
 		c.warnOnce.Do(func() {
 			clog.Warnf(ctx, "unable to obtain a bearer token for the traffic-manager: %v", err)

@@ -194,6 +194,45 @@ func Test_NftRedirectsActive(t *testing.T) {
 	}
 }
 
+func TestStrictNamedHTTPRedirectPreservesApplicationAndRawRoutes(t *testing.T) {
+	pod := netip.MustParseAddr("192.0.2.12")
+	sc := &Sidecar{
+		RequireAuthoritativeRoutes: true,
+		Containers: []*Container{{Name: "app", Replace: ReplacePolicyIntercept, Intercepts: []*Intercept{
+			{ContainerPort: 8080, AgentPort: 9900, Protocol: types.ProtoTCP, AppProtocol: "kubernetes.io/http"},
+			{ContainerPort: 5432, AgentPort: 9901, Protocol: types.ProtoTCP, AppProtocol: "tcp"},
+			{ContainerPort: 8443, AgentPort: 9902, Protocol: types.ProtoTCP, AppProtocol: "https"},
+			{ContainerPort: 8053, AgentPort: 9903, Protocol: types.ProtoUDP, AppProtocol: "http"},
+		}}},
+	}
+	if !sc.NftRedirectsActive() || !sc.NftRedirectsPort(8080, types.ProtoTCP) {
+		t.Fatal("strict named clear HTTP must program a pod and mesh redirect")
+	}
+	if got, want := sc.PassThroughTarget(pod, 8080, types.ProtoTCP, true), netip.AddrPortFrom(pod, sc.ProxyPort(9900)); got != want {
+		t.Fatalf("application pass-through got %v, want pod-IP proxy %v", got, want)
+	}
+	for _, port := range []uint16{5432, 8443} {
+		if sc.NftRedirectsPort(port, types.ProtoTCP) {
+			t.Fatalf("unsupported named port %d unexpectedly redirected", port)
+		}
+		if got, want := sc.PassThroughTarget(pod, port, types.ProtoTCP, false), netip.AddrPortFrom(pod, port); got != want {
+			t.Fatalf("raw pass-through got %v, want unchanged pod target %v", got, want)
+		}
+	}
+	if sc.NftRedirectsPort(8053, types.ProtoUDP) {
+		t.Fatal("a UDP port must not enter the HTTP redirect")
+	}
+	sc.RequireAuthoritativeRoutes = false
+	if sc.NftRedirectsActive() || sc.InterceptorInactivePort(8080, types.ProtoTCP) != 8080 {
+		t.Fatal("feature-off named ports must keep their original routing")
+	}
+	sc.RequireAuthoritativeRoutes = true
+	sc.Containers[0].Intercepts[1].TargetPortNumeric = true
+	if !sc.NftRedirectsPort(8443, types.ProtoTCP) {
+		t.Fatal("a numeric target must preserve the original all-ports redirect behavior")
+	}
+}
+
 func Test_LoopbackFor(t *testing.T) {
 	if got := LoopbackFor(netip.MustParseAddr("10.1.2.3")); got != netip.AddrFrom4([4]byte{127, 0, 0, 1}) {
 		t.Fatalf("LoopbackFor() = %v, want 127.0.0.1", got)

@@ -6,6 +6,7 @@ option go_package = "github.com/telepresenceio/telepresence/rpc/v2/authenticator
 
 service Authenticator {
   rpc GetContextExecCredentials(GetContextExecCredentialsRequest) returns (GetContextExecCredentialsResponse);
+  rpc GetManagerToken(GetManagerTokenRequest) returns (GetManagerTokenResponse);
 }
 
 message GetContextExecCredentialsRequest {
@@ -16,3 +17,18 @@ message GetContextExecCredentialsResponse {
   bytes raw_credentials = 1;
 }
 
+message GetManagerTokenRequest {
+  // An unguessable connection capability; no caller-supplied filesystem path.
+  bytes capability = 1;
+
+  // The responding manager pod observed by the privileged daemon, required for
+  // a negotiated Devbox callback and not used for an explicit token file.
+  string manager_pod_uid = 2;
+
+  // The vetted manager-only audience advertised by that exact manager pod.
+  string devbox_proxy_audience = 3;
+}
+
+message GetManagerTokenResponse {
+  string token = 1;
+}

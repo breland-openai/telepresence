@@ -99,6 +99,22 @@ message DaemonStatus {
   // agent connection is up; an old root daemon that predates this field is
   // indistinguishable from that case, so callers must treat both as "omit".
   repeated AgentTransport agent_transports = 7;
+
+  // Supported even with no session. The user daemon must check this before
+  // asking an older root daemon to connect with a required manager credential.
+  bool supports_manager_token_callback = 8;
+
+  // True only if the current root session uses the user-daemon credential.
+  // This discloses neither the connection capability nor the credential.
+  bool manager_token_callback_active = 9;
+
+  // SHA-256 of the random callback capability, for rejecting a previous user
+  // daemon's credential when the same manager session ID is reused.
+  bytes manager_token_callback_id = 10;
+
+  // The privileged daemon independently verifies and binds the manager pod and
+  // vetted audience before asking for a negotiated Applied Devbox credential.
+  bool supports_negotiated_devbox_proxy = 11;
   reserved 3;
 }
 
@@ -213,6 +229,21 @@ message NetworkConfig {
   // WatchAgentPods. When non-empty, this daemon must not watch agent pods
   // itself.
   repeated string agent_pod_namespaces = 11;
+
+  // When supplied, obtain the traffic-manager-only bearer from the user daemon.
+  // This capability is private connection input and must not be returned in status.
+  ManagerTokenCallback manager_token_callback = 12;
+}
+
+message ManagerTokenCallback {
+  // The user daemon's loopback listener. The privileged daemon never reads a
+  // token file or changes the Kubernetes API credentials for this callback.
+  string address = 1;
+  bytes capability = 2;
+
+  // The privileged daemon must bind requests to the independently observed
+  // manager pod and the vetted audience advertised by that pod.
+  bool negotiated_devbox_proxy = 3;
 }
 
 // AgentPodsDelta is pushed by the user daemon, carrying the agent-pod

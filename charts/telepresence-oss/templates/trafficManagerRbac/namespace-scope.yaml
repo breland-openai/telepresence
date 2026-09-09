@@ -36,6 +36,16 @@ rules:
   - list
   - get
   - watch
+{{- if $.Values.routeIntent.enabled }}
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
+  - watch
+{{- end }}
 {{- if $interceptEnabled }}
 - apiGroups:
   - ""
@@ -91,6 +101,17 @@ but cannot be tightened further by name.
   - configmaps
   verbs:
   - create
+{{- if $.Values.routeIntent.enabled }}
+{{- /* Durable route guards use generated names and a selector-filtered list. */}}
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - update
+{{- end }}
 {{- end }}
 {{ include "telepresence.managerWorkloadRules" $ }}
 - apiGroups:
@@ -225,6 +246,17 @@ but cannot be tightened further by name.
     - configmaps
   verbs:
     - create
+{{- if .Values.routeIntent.enabled }}
+{{- /* Durable route guards use generated names and a selector-filtered list. */}}
+- apiGroups:
+    - ""
+  resources:
+    - configmaps
+  verbs:
+    - get
+    - list
+    - update
+{{- end }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

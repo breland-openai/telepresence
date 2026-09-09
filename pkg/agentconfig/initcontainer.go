@@ -1,7 +1,9 @@
 package agentconfig
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 
 	core "k8s.io/api/core/v1"
@@ -68,5 +70,53 @@ func InitContainer(config *Sidecar, agentSecurityContext *core.SecurityContext, 
 	if s := config.InitSecurityContext; s != nil {
 		ic.SecurityContext = s
 	}
+	if config.RequireAuthoritativeRoutes {
+		ic.SecurityContext = routeIntentInitSecurityContext(config.InitSecurityContext)
+	}
 	return ic
+}
+
+// ValidateRouteIntentInitSecurity rejects an explicit configuration that would
+// leave protected workloads unable to program the required network redirect.
+func (s *Sidecar) ValidateRouteIntentInitSecurity() error {
+	if !s.RequireAuthoritativeRoutes || s.InitSecurityContext == nil {
+		return nil
+	}
+	configured := s.InitSecurityContext
+	if (configured.RunAsUser != nil && *configured.RunAsUser != 0) || (configured.RunAsNonRoot != nil && *configured.RunAsNonRoot) {
+		return errors.New("authoritative HTTP routing requires the traffic-agent init container to run as UID 0")
+	}
+	if configured.Capabilities != nil && !slices.Contains(configured.Capabilities.Add, core.Capability("NET_ADMIN")) {
+		return errors.New("authoritative HTTP routing requires NET_ADMIN for the traffic-agent init container")
+	}
+	return nil
+}
+
+func routeIntentInitSecurityContext(configured *core.SecurityContext) *core.SecurityContext {
+	s := &core.SecurityContext{}
+	if configured != nil {
+		s = configured.DeepCopy()
+	}
+	// Kubernetes propagates the pod's runAsUser into containers unless it is
+	// overridden. On containerd a non-root exec does not retain this capability
+	// as effective, even when NET_ADMIN is present in its bounding set.
+	if s.RunAsUser == nil {
+		s.RunAsUser = new(int64(0))
+	}
+	if s.RunAsGroup == nil {
+		s.RunAsGroup = new(int64(0))
+	}
+	if s.RunAsNonRoot == nil {
+		s.RunAsNonRoot = new(false)
+	}
+	if s.AllowPrivilegeEscalation == nil {
+		s.AllowPrivilegeEscalation = new(false)
+	}
+	if s.Privileged == nil {
+		s.Privileged = new(false)
+	}
+	if s.Capabilities == nil {
+		s.Capabilities = &core.Capabilities{Add: []core.Capability{"NET_ADMIN"}, Drop: []core.Capability{"ALL"}}
+	}
+	return s
 }

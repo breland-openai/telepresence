@@ -92,9 +92,33 @@ spec:
           {{- end }}
           {{- with .security }}
           {{- with .authentication }}
+          {{- if or .delegatedSelfSubjectReviewURL .delegatedDevboxProxyAudience .delegatedDevboxProxyTenantID .delegatedDevboxProxyAuthorities }}
+          {{- if or (not .delegatedSelfSubjectReviewURL) (not .delegatedDevboxProxyAudience) (not .delegatedDevboxProxyTenantID) (not .delegatedDevboxProxyAuthorities) }}
+          {{- fail "delegated Devbox authentication requires delegatedSelfSubjectReviewURL, delegatedDevboxProxyAudience, delegatedDevboxProxyTenantID, and delegatedDevboxProxyAuthorities together" }}
+          {{- end }}
+          {{- if eq (.mode | default "permissive") "disabled" }}
+          {{- fail "delegated Devbox authentication requires authentication mode permissive or enforcing" }}
+          {{- end }}
+          {{- end }}
           {{- if .mode }}
           - name: AUTHENTICATION_MODE
             value: {{ .mode }}
+          {{- end }}
+          {{- if .delegatedSelfSubjectReviewURL }}
+          - name: AUTH_DELEGATED_SELF_SUBJECT_REVIEW_URL
+            value: {{ .delegatedSelfSubjectReviewURL | quote }}
+          {{- end }}
+          {{- if .delegatedDevboxProxyAudience }}
+          - name: AUTH_DELEGATED_DEVBOX_PROXY_AUDIENCE
+            value: {{ .delegatedDevboxProxyAudience | quote }}
+          {{- end }}
+          {{- if .delegatedDevboxProxyTenantID }}
+          - name: AUTH_DELEGATED_DEVBOX_PROXY_TENANT_ID
+            value: {{ .delegatedDevboxProxyTenantID | quote }}
+          {{- end }}
+          {{- if .delegatedDevboxProxyAuthorities }}
+          - name: AUTH_DELEGATED_DEVBOX_PROXY_AUTHORITIES
+            value: {{ join " " .delegatedDevboxProxyAuthorities | quote }}
           {{- end }}
           {{- with .x509 }}
           {{- if include "telepresence.x509AuthEnabled" $ }}
@@ -132,6 +156,42 @@ spec:
           {{- end }}
           - name: INTERCEPT_INACTIVE_BLOCK_TIMEOUT
             value: {{ .inactiveBlockTimeout }}
+          {{- end }}
+          {{- with .routeIntent }}
+          {{- if .enabled }}
+          {{- with $.Values.security }}
+          {{- with .authentication }}
+          {{- if eq (.mode | default "permissive") "disabled" }}
+          {{- fail "routeIntent.enabled requires authentication mode permissive or enforcing" }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
+          - name: ROUTE_INTENT_ENABLED
+            value: "true"
+          {{- if .skipGatewayAck }}
+          - name: ROUTE_INTENT_SKIP_GATEWAY_ACK
+            value: "true"
+          {{- end }}
+          {{- if .namespaces }}
+          - name: ROUTE_INTENT_NAMESPACES
+            value: {{ join " " .namespaces | quote }}
+          {{- end }}
+          {{- if .agentImage }}
+          - name: AGENT_ROUTE_INTENT_IMAGE
+            value: {{ .agentImage | quote }}
+          {{- end }}
+          {{- if .requireAuthoritativeAgents }}
+          - name: AGENT_REQUIRE_AUTHORITATIVE_ROUTES
+            value: "true"
+          {{- end }}
+          {{- if .controllerServiceAccounts }}
+          - name: ROUTE_INTENT_CONTROLLER_SERVICE_ACCOUNTS
+            value: {{ join " " .controllerServiceAccounts | quote }}
+          {{- end }}
+          {{- end }}
+          {{- if and .requireAuthoritativeAgents (not .enabled) }}
+          {{- fail "routeIntent.requireAuthoritativeAgents requires routeIntent.enabled" }}
+          {{- end }}
           {{- end }}
           {{- with .usage }}
           {{- /*

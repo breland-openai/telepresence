@@ -154,6 +154,65 @@ func TestStream_Connect(t *testing.T) {
 	wg.Wait()
 }
 
+func TestStreamDialResponseMarkerPreservesLegacyHandshake(t *testing.T) {
+	id := NewConnID(types.ProtoTCP, netip.MustParseAddrPort("192.0.2.1:1234"), netip.MustParseAddrPort("127.0.0.1:8080"))
+	legacy := StreamInfoMessage(id, "developer", 100*time.Millisecond, time.Second)
+	marked := streamInfoMessage(id, "developer", 100*time.Millisecond, time.Second, true)
+	require.Equal(t, append(append([]byte(nil), legacy.Payload()...), byte(streamInfoDialResponse)), marked.Payload())
+	for _, tt := range []struct {
+		name string
+		msg  Message
+		want bool
+	}{
+		{name: "legacy client to new peer", msg: legacy},
+		{name: "new dial response to new peer", msg: marked, want: true},
+		// The old peer consumes through the session ID and ignores trailing
+		// bytes, exactly as removing the additive marker reproduces here.
+		{name: "new dial response through old parser boundary", msg: NewMessage(streamInfo, marked.Payload()[:len(legacy.Payload())])},
+		{name: "unknown future flags remain ignored", msg: NewMessage(streamInfo, append(append([]byte(nil), legacy.Payload()...), 2))},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var s stream
+			require.NoError(t, setConnectInfo(tt.msg, &s))
+			assert.Equal(t, id, s.ID())
+			assert.Equal(t, SessionID("developer"), s.SessionID())
+			assert.Equal(t, 100*time.Millisecond, s.RoundtripLatency())
+			assert.Equal(t, time.Second, s.DialTimeout())
+			assert.Equal(t, tt.want, IsDialResponse(&s))
+		})
+	}
+}
+
+func TestStreamConnectIdentifiesDialResponses(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		dial bool
+	}{
+		{name: "ordinary client connection"},
+		{name: "dial request response", dial: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := testContext(t, time.Second)
+			defer cancel()
+			pipe := newBidi(10, ctx)
+			id := NewConnID(types.ProtoTCP, netip.MustParseAddrPort("192.0.2.1:1234"), netip.MustParseAddrPort("127.0.0.1:8080"))
+			clientDone := make(chan error, 1)
+			go func() {
+				create := NewClientStream
+				if tt.dial {
+					create = newDialResponseStream
+				}
+				_, err := create(ctx, AgentToClient, pipe.clientSide(), id, "developer", 0, 0)
+				clientDone <- err
+			}()
+			server, err := NewServerStream(ctx, ClientToAgent, pipe.serverSide())
+			require.NoError(t, err)
+			require.NoError(t, <-clientDone)
+			assert.Equal(t, tt.dial, IsDialResponse(server))
+		})
+	}
+}
+
 func produce(ctx context.Context, s Stream, msg Message, errs chan<- error) {
 	wrCh := make(chan Message)
 	wg := sync.WaitGroup{}

@@ -36,23 +36,39 @@ type GeneratorConfig struct {
 	// the traffic-manager has no QUIC tunnel enabled, so agents get no QUIC
 	// listener; see managerutil.Env.GeneratorConfig, which zeroes it exactly
 	// when TunnelQuicPort == 0.
-	QuicPort            uint16
-	QualifiedAgentImage string
-	ManagerNamespace    string
-	ClusterDomain       string
-	LogLevel            slog.Level
-	InitResources       *core.ResourceRequirements
-	Resources           *core.ResourceRequirements
-	PullPolicy          string
-	PullSecrets         []core.LocalObjectReference
-	SecurityContext     *core.SecurityContext
-	InitSecurityContext *core.SecurityContext
-	MountPolicies       types.MountPolicies
-	MeshDialSubnets     []netip.Prefix
-	ClientConnectionTTL time.Duration
-	WatchRetryInterval  time.Duration
-	EnableH2cProbing    bool
-	EnableMetrics       bool
+	QuicPort                     uint16
+	QualifiedAgentImage          string
+	RouteIntentAgentImage        string
+	ManagerNamespace             string
+	ClusterDomain                string
+	LogLevel                     slog.Level
+	InitResources                *core.ResourceRequirements
+	Resources                    *core.ResourceRequirements
+	PullPolicy                   string
+	PullSecrets                  []core.LocalObjectReference
+	SecurityContext              *core.SecurityContext
+	InitSecurityContext          *core.SecurityContext
+	MountPolicies                types.MountPolicies
+	MeshDialSubnets              []netip.Prefix
+	ClientConnectionTTL          time.Duration
+	WatchRetryInterval           time.Duration
+	RequireAuthoritativeRoutes   bool
+	AuthoritativeRouteNamespaces []string
+	EnableH2cProbing             bool
+	EnableMetrics                bool
+}
+
+// ScopedAgentImage selects the candidate image only inside the route-intent
+// rollout scope. An empty candidate keeps the standard injector image.
+func ScopedAgentImage(standard, candidate string, namespaces []string, namespace string) string {
+	if candidate != "" && (len(namespaces) == 0 || slices.Contains(namespaces, namespace)) {
+		return candidate
+	}
+	return standard
+}
+
+func (cfg *GeneratorConfig) AgentImageForNamespace(namespace string) string {
+	return ScopedAgentImage(cfg.QualifiedAgentImage, cfg.RouteIntentAgentImage, cfg.AuthoritativeRouteNamespaces, namespace)
 }
 
 func portsFromContainerPortsAnnotation(ctx context.Context, wl k8sapi.Workload) (ports []types.PortIdentifier, err error) {
@@ -186,7 +202,7 @@ func (cfg *GeneratorConfig) Generate(
 	}
 
 	return &agentconfig.Sidecar{
-		AgentImage:          cfg.QualifiedAgentImage,
+		AgentImage:          cfg.AgentImageForNamespace(wl.GetNamespace()),
 		AgentName:           wl.GetName(),
 		LogLevel:            cfg.LogLevel,
 		Namespace:           wl.GetNamespace(),
@@ -209,6 +225,8 @@ func (cfg *GeneratorConfig) Generate(
 		EnableH2cProbing:    cfg.EnableH2cProbing,
 		EnableMetrics:       cfg.EnableMetrics,
 		WatchRetryInterval:  cfg.WatchRetryInterval,
+		RequireAuthoritativeRoutes: cfg.RequireAuthoritativeRoutes &&
+			(len(cfg.AuthoritativeRouteNamespaces) == 0 || slices.Contains(cfg.AuthoritativeRouteNamespaces, wl.GetNamespace())),
 	}, nil
 }
 

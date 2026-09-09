@@ -115,7 +115,7 @@ func (c *configWatcher) watchServices(ctx context.Context, ix cache.SharedIndexI
 func (c *configWatcher) updateSvc(ctx context.Context, svc *core.Service, includeSelectorMatches bool) {
 	// Does the snapshot contain workloads that we didn't find using the service's Spec.Selector?
 	// If so, include them, or if workload for the config entry isn't found, delete that entry
-	img := managerutil.GetAgentImage(ctx)
+	img := managerutil.GetAgentImageForNamespace(ctx, svc.Namespace)
 	if img == "" {
 		return
 	}
@@ -154,6 +154,12 @@ func (c *configWatcher) updateSvc(ctx context.Context, svc *core.Service, includ
 		}
 		c.Store(acn)
 		clog.Debugf(ctx, "deleting pods with config mismatch for %s", wl)
+		if handled, catchUpErr := c.catchUpProtectedReplacement(ctx, wl); catchUpErr != nil {
+			clog.Error(ctx, catchUpErr)
+			continue
+		} else if handled {
+			continue
+		}
 		err = c.EvictPodsWithAgentConfigMismatch(ctx, wl, acn)
 		if err != nil {
 			clog.Error(ctx, err)

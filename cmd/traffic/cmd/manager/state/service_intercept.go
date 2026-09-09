@@ -546,6 +546,16 @@ func (is *Intercept) applyServiceReview(agent *rpc.AgentInfo, review *rpc.Review
 		}
 		return
 	}
+	if is.hasPendingRouteActivation() && participant.review != nil && participant.review.Disposition == rpc.InterceptDispositionType_ACTIVE &&
+		participant.podName != "" && (participant.podName != agent.PodName || proto.Equal(participant.review, review)) {
+		// The durable barrier still publishes WAITING, so all replicas may
+		// re-review the same snapshot. Preserve the accepted reviewer instead of
+		// generating a new delta for each sibling response. Its explicit session
+		// removal transfers or clears the approval so a survivor can be elected;
+		// the current reviewer can still update its own review and rejections
+		// remain meaningful regardless of the submitting replica.
+		return
+	}
 
 	participant.review = proto.Clone(review).(*rpc.ReviewInterceptRequest)
 	participant.podName = agent.PodName

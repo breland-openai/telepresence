@@ -490,6 +490,45 @@ func TestEnsureAgent_InjectorDisabled(t *testing.T) {
 	})
 }
 
+func TestGetOrCreateAgentConfigKeepsScopedImageOnCachedStatefulSet(t *testing.T) {
+	const standard, candidate = "registry.example/tel2:stable", "registry.example/tel2@sha256:abc123"
+	env := &managerutil.Env{
+		RouteIntentEnabled: true, RouteIntentNamespaces: []string{"ambassador"}, AgentRouteIntentImage: candidate,
+		AgentRequireAuthoritativeRoutes: true, AgentPort: 9900,
+	}
+	ctx := k8sapi.WithK8sInterface(t.Context(), fake.NewClientset())
+	ctx = managerutil.WithResolvedAgentImageRetriever(managerutil.WithEnv(ctx, env), managerutil.ImageFromEnv(standard))
+	cacheMap := mutator.NewWatcher()
+	ctx = mutator.WithMap(ctx, cacheMap)
+	workload := func(namespace string) k8sapi.Workload {
+		return k8sapi.StatefulSet(&apps.StatefulSet{ObjectMeta: meta.ObjectMeta{Name: "web", Namespace: namespace}, Spec: apps.StatefulSetSpec{
+			Template: core.PodTemplateSpec{
+				ObjectMeta: meta.ObjectMeta{Labels: map[string]string{"app": "web"}},
+				Spec:       core.PodSpec{Containers: []core.Container{{Name: "app"}}},
+			},
+		}})
+	}
+	for _, namespace := range []string{"ambassador", "application"} {
+		cacheMap.Store(&agentconfig.Sidecar{AgentName: "web", Namespace: namespace, WorkloadName: "web", WorkloadKind: k8sapi.StatefulSetKind, AgentImage: standard})
+	}
+	s := &State{}
+	dryRun, err := s.getOrCreateAgentConfig(ctx, workload("ambassador"), false, true, nil, agentconfig.ReplacePolicyInactive)
+	require.NoError(t, err)
+	require.Equal(t, candidate, dryRun.AgentImage)
+	require.True(t, dryRun.RequireAuthoritativeRoutes)
+	require.Equal(t, standard, cacheMap.Get("web", "ambassador").AgentImage, "a dry run must not change stored config")
+	for range 2 {
+		stored, updateErr := s.getOrCreateAgentConfig(ctx, workload("ambassador"), false, false, nil, agentconfig.ReplacePolicyInactive)
+		require.NoError(t, updateErr)
+		require.Equal(t, candidate, stored.AgentImage, "the baseline retriever must not reset staged image")
+		require.True(t, stored.RequireAuthoritativeRoutes)
+	}
+	stored, err := s.getOrCreateAgentConfig(ctx, workload("application"), false, false, nil, agentconfig.ReplacePolicyInactive)
+	require.NoError(t, err)
+	require.Equal(t, standard, stored.AgentImage)
+	require.False(t, stored.RequireAuthoritativeRoutes)
+}
+
 // TestPrepareIntercept_SecondNodeAgentInterceptShared verifies the guard
 // removal: a second concurrent node-agent intercept of the same workload is
 // accepted (and reuses the Job the first one provisioned, rather than

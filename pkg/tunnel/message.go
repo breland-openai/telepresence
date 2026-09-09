@@ -120,6 +120,12 @@ func NewMessage(code MessageCode, payload []byte) Message {
 }
 
 func StreamInfoMessage(id ConnID, sessionID SessionID, callDelay, dialTimeout time.Duration) Message {
+	return streamInfoMessage(id, sessionID, callDelay, dialTimeout, false)
+}
+
+const streamInfoDialResponse uint64 = 1 << 0
+
+func streamInfoMessage(id ConnID, sessionID SessionID, callDelay, dialTimeout time.Duration, dialResponse bool) Message {
 	b := bytes.Buffer{}
 	b.WriteByte(byte(streamInfo))
 
@@ -142,6 +148,12 @@ func StreamInfoMessage(id ConnID, sessionID SessionID, callDelay, dialTimeout ti
 	n = binary.PutUvarint(buf, uint64(len(sb)))
 	b.Write(buf[:n])
 	b.Write(sb)
+	if dialResponse {
+		// Older peers ignore trailing data after the session ID. Ordinary client
+		// streams remain byte-for-byte identical to the original handshake.
+		n = binary.PutUvarint(buf, streamInfoDialResponse)
+		b.Write(buf[:n])
+	}
 	return msg(b.Bytes())
 }
 
@@ -199,18 +211,32 @@ func setConnectInfo(m Message, s *stream) error {
 	pl = pl[n:]
 
 	v, n = binary.Uvarint(pl)
-	if n <= 0 || v > uint64(len(pl)) {
+	if n <= 0 {
 		return errMalformedConnect
 	}
 	pl = pl[n:]
+	if v > uint64(len(pl)) {
+		return errMalformedConnect
+	}
 	s.id = ConnID(pl[:v])
 	pl = pl[v:]
 
 	v, n = binary.Uvarint(pl)
-	if n <= 0 || v > uint64(len(pl)) {
+	if n <= 0 {
 		return errMalformedConnect
 	}
 	pl = pl[n:]
+	if v > uint64(len(pl)) {
+		return errMalformedConnect
+	}
 	s.sessionID = SessionID(pl[:v])
+	pl = pl[v:]
+	if len(pl) > 0 {
+		v, n = binary.Uvarint(pl)
+		if n <= 0 {
+			return errMalformedConnect
+		}
+		s.dialResponse = v&streamInfoDialResponse != 0
+	}
 	return nil
 }

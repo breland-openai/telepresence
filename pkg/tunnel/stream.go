@@ -107,6 +107,13 @@ type Stream interface {
 	SetTag(tag Tag)
 }
 
+// IsDialResponse reports whether the peer explicitly marked this tunnel as a
+// response to a DialRequest. Old clients do not send this optional marker.
+func IsDialResponse(s Stream) bool {
+	marked, ok := s.(interface{ isDialResponse() bool })
+	return ok && marked.isDialResponse()
+}
+
 // StreamCreator is a function that creats a Stream.
 type StreamCreator func(context.Context, ConnID) (Stream, error)
 
@@ -227,6 +234,7 @@ type stream struct {
 	roundtripLatency time.Duration
 	sessionID        SessionID
 	tag              Tag
+	dialResponse     bool
 	syncRatio        uint32 // send and check sync after each syncRatio message
 	ackWindow        uint32 // maximum permitted difference between sent and received ack
 	peerVersion      uint16
@@ -259,6 +267,10 @@ func newStream(tag Tag, grpcStream GRPCStream) stream {
 
 func (s *stream) Tag() Tag {
 	return s.tag
+}
+
+func (s *stream) isDialResponse() bool {
+	return s.dialResponse
 }
 
 func (s *stream) SetTag(tag Tag) {

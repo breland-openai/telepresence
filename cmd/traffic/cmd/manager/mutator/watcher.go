@@ -215,6 +215,7 @@ func (workloadKey WorkloadKey) String() string {
 
 const (
 	serviceWatcher = iota
+	podWatcher
 	deploymentWatcher
 	replicaSetWatcher
 	statefulSetWatcher
@@ -296,6 +297,7 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 
 	ifns := [watcherMax]cache.SharedIndexInformer{}
 	ifns[serviceWatcher] = c.startServices(ctx, ns)
+	ifns[podWatcher] = c.startPods(ctx, ns)
 	for _, wlKind := range managerutil.GetEnv(ctx).EnabledWorkloadKinds {
 		switch wlKind {
 		case k8sapi.DeploymentKind:
@@ -308,7 +310,6 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 			ifns[rolloutWatcher] = workload.StartRollouts(ctx, ns)
 		}
 	}
-	c.startPods(ctx, ns)
 	c.startIngresses(ctx, ns)
 	kf := informer.GetK8sFactory(ctx, ns)
 	kf.Start(ctx.Done())
@@ -328,6 +329,10 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 func (c *configWatcher) startWatchers(ctx context.Context, iwc *informersWithCancel) (err error) {
 	ifns := iwc.informers
 	iwc.eventRegs[serviceWatcher], err = c.watchServices(ctx, ifns[serviceWatcher])
+	if err != nil {
+		return err
+	}
+	iwc.eventRegs[podWatcher], err = c.watchProtectedReplacementPods(ctx, ifns[podWatcher])
 	if err != nil {
 		return err
 	}
@@ -390,11 +395,17 @@ func (c *configWatcher) Get(key, ns string) (ac *agentconfig.Sidecar) {
 // referenced Service together with the workload, so a Service that is missing at admission time may
 // simply not have been created yet and is expected to appear within the retry window.
 func (c *configWatcher) GetOrGenerate(ctx context.Context, wl k8sapi.Workload) (*agentconfig.Sidecar, error) {
-	if ac := c.Get(wl.GetName(), wl.GetNamespace()); ac != nil {
-		return ac, nil
+	env := managerutil.GetEnv(ctx)
+	needsScopedOverride := func(ac *agentconfig.Sidecar) bool {
+		image := env.RouteIntentAgentImageForNamespace(wl.GetNamespace())
+		return image != "" && !ac.Manual && (ac.AgentImage != image || ac.RequireAuthoritativeRoutes != env.AgentRequireAuthoritativeRoutes)
+	}
+	existingConfig := c.Get(wl.GetName(), wl.GetNamespace())
+	if existingConfig != nil && !needsScopedOverride(existingConfig) {
+		return existingConfig, nil
 	}
 
-	gc, err := managerutil.GetEnv(ctx).GeneratorConfig(managerutil.GetAgentImage(ctx))
+	gc, err := env.GeneratorConfig(managerutil.GetAgentImage(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -403,7 +414,7 @@ func (c *configWatcher) GetOrGenerate(ctx context.Context, wl k8sapi.Workload) (
 	var ac *agentconfig.Sidecar
 	err = backoff.Retry(func() error {
 		var genErr error
-		ac, genErr = gc.Generate(ctx, wl, nil)
+		ac, genErr = gc.Generate(ctx, wl, existingConfig)
 		if genErr != nil && errcat.GetCategory(genErr) == errcat.User {
 			return backoff.Permanent(genErr)
 		}
@@ -415,7 +426,7 @@ func (c *configWatcher) GetOrGenerate(ctx context.Context, wl k8sapi.Workload) (
 
 	// Store the generated config, unless another goroutine generated it concurrently.
 	c.namespaceAgentConfigs(wl.GetNamespace()).Compute(wl.GetName(), func(existing *agentconfig.Sidecar, loaded bool) (*agentconfig.Sidecar, xsync.ComputeOp) {
-		if loaded && existing != nil {
+		if loaded && existing != nil && !needsScopedOverride(existing) {
 			ac = existing
 			return existing, xsync.CancelOp
 		}
@@ -487,6 +498,9 @@ func (c *configWatcher) Start(ctx context.Context) {
 	go maps.GC(c.inactivePods, 10*time.Second, ctx.Done(), func(_ types.UID, value inactivation) bool {
 		return time.Since(value.Time) > time.Minute
 	})
+	if managerutil.GetEnv(ctx).AgentRequireAuthoritativeRoutes {
+		go c.retryPendingProtectedReplacements(ctx)
+	}
 
 	for _, ns := range namespaces.GetOrGlobal(ctx) {
 		clog.Debugf(ctx, "Adding watchers for namespace %s", ns)

@@ -87,3 +87,37 @@ func TestConfigForProducesApplicableRuleset(t *testing.T) {
 	require.NotNil(t, rs.Output)
 	require.NotEmpty(t, rs.Rules)
 }
+
+func TestStrictSidecarNamedHTTPProgramsMeshAndPodGatesWithBypass(t *testing.T) {
+	podIP := netip.MustParseAddr("10.129.70.53")
+	owner := OwnerMatch{UseGID: true, ID: 7439}
+	sc := &agentconfig.Sidecar{RequireAuthoritativeRoutes: true, Containers: []*agentconfig.Container{{
+		Name: "app", Replace: agentconfig.ReplacePolicyIntercept, Intercepts: []*agentconfig.Intercept{
+			{Protocol: types.ProtoTCP, AppProtocol: "http", ContainerPort: 8080, AgentPort: 9900},
+			{Protocol: types.ProtoTCP, AppProtocol: "tcp", ContainerPort: 5432, AgentPort: 9901},
+			{Protocol: types.ProtoTCP, AppProtocol: "https", ContainerPort: 8443, AgentPort: 9902},
+		},
+	}}}
+	config := ConfigForSidecar(sc, "lo", podIP, owner)
+	require.Equal(t, []Intercept{{Protocol: types.ProtoTCP, ContainerPort: 8080, AgentPort: 9900, ProxyPort: sc.ProxyPort(9900)}}, config.Intercepts)
+	rules, err := Build(config)
+	require.NoError(t, err)
+	require.Len(t, rules.RedirectMap.Elements, 1)
+	var outputRules, inboundRules int
+	for _, rule := range rules.Rules {
+		switch rule.Chain {
+		case rules.Output:
+			outputRules++
+		case rules.Prerouting:
+			inboundRules++
+		}
+	}
+	require.Equal(t, 5, outputRules, "three inbound-to-agent gates, application proxy bypass, and mesh egress bypass")
+	require.Equal(t, 1, inboundRules)
+	node := ConfigFor(sc, "lo", podIP, owner)
+	require.Len(t, node.Intercepts, 3, "the node agent keeps its existing unconditional redirect")
+	sc.RequireAuthoritativeRoutes = false
+	legacy := ConfigForSidecar(sc, "lo", podIP, owner)
+	require.Len(t, legacy.Intercepts, 3, "manually invoked legacy init keeps its original complete mapping")
+	require.Zero(t, legacy.Intercepts[0].ProxyPort)
+}

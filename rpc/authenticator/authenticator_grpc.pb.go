@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	Authenticator_GetContextExecCredentials_FullMethodName = "/telepresence.authenticator.Authenticator/GetContextExecCredentials"
+	Authenticator_GetManagerToken_FullMethodName           = "/telepresence.authenticator.Authenticator/GetManagerToken"
 )
 
 // AuthenticatorClient is the client API for Authenticator service.
@@ -27,6 +28,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type AuthenticatorClient interface {
 	GetContextExecCredentials(ctx context.Context, in *GetContextExecCredentialsRequest, opts ...grpc.CallOption) (*GetContextExecCredentialsResponse, error)
+	GetManagerToken(ctx context.Context, in *GetManagerTokenRequest, opts ...grpc.CallOption) (*GetManagerTokenResponse, error)
 }
 
 type authenticatorClient struct {
@@ -47,11 +49,22 @@ func (c *authenticatorClient) GetContextExecCredentials(ctx context.Context, in 
 	return out, nil
 }
 
+func (c *authenticatorClient) GetManagerToken(ctx context.Context, in *GetManagerTokenRequest, opts ...grpc.CallOption) (*GetManagerTokenResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetManagerTokenResponse)
+	err := c.cc.Invoke(ctx, Authenticator_GetManagerToken_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AuthenticatorServer is the server API for Authenticator service.
 // All implementations must embed UnimplementedAuthenticatorServer
 // for forward compatibility.
 type AuthenticatorServer interface {
 	GetContextExecCredentials(context.Context, *GetContextExecCredentialsRequest) (*GetContextExecCredentialsResponse, error)
+	GetManagerToken(context.Context, *GetManagerTokenRequest) (*GetManagerTokenResponse, error)
 	mustEmbedUnimplementedAuthenticatorServer()
 }
 
@@ -64,6 +77,9 @@ type UnimplementedAuthenticatorServer struct{}
 
 func (UnimplementedAuthenticatorServer) GetContextExecCredentials(context.Context, *GetContextExecCredentialsRequest) (*GetContextExecCredentialsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetContextExecCredentials not implemented")
+}
+func (UnimplementedAuthenticatorServer) GetManagerToken(context.Context, *GetManagerTokenRequest) (*GetManagerTokenResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetManagerToken not implemented")
 }
 func (UnimplementedAuthenticatorServer) mustEmbedUnimplementedAuthenticatorServer() {}
 func (UnimplementedAuthenticatorServer) testEmbeddedByValue()                       {}
@@ -104,6 +120,24 @@ func _Authenticator_GetContextExecCredentials_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Authenticator_GetManagerToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetManagerTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AuthenticatorServer).GetManagerToken(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Authenticator_GetManagerToken_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AuthenticatorServer).GetManagerToken(ctx, req.(*GetManagerTokenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Authenticator_ServiceDesc is the grpc.ServiceDesc for Authenticator service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -114,6 +148,10 @@ var Authenticator_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetContextExecCredentials",
 			Handler:    _Authenticator_GetContextExecCredentials_Handler,
+		},
+		{
+			MethodName: "GetManagerToken",
+			Handler:    _Authenticator_GetManagerToken_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

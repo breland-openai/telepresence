@@ -22,6 +22,8 @@
   items:
     - title: Code and debug an application locally
       link: howtos/attach
+    - title: Protect requests for a local intercept
+      link: howtos/protected-intercepts
     - title: Choose between the sidecar and the node-agent
       link: howtos/agent-modes
     - title: Use Telepresence with Docker
@@ -272,6 +274,8 @@
           link: reference/attachments/conflicts
         - title: Protocol selection
           link: reference/attachments/protocols
+        - title: Protected local intercepts
+          link: reference/attachments/protected-intercepts
     - title: Telepresence Docker Plugins
       link: reference/plugins
     - title: Volume mounts

@@ -65,6 +65,8 @@ const (
 	Manager_WatchQuicBackends_FullMethodName               = "/telepresence.manager.Manager/WatchQuicBackends"
 	Manager_ReportMetrics_FullMethodName                   = "/telepresence.manager.Manager/ReportMetrics"
 	Manager_UninstallAgents_FullMethodName                 = "/telepresence.manager.Manager/UninstallAgents"
+	Manager_WatchRouteIntents_FullMethodName               = "/telepresence.manager.Manager/WatchRouteIntents"
+	Manager_AcknowledgeRouteIntents_FullMethodName         = "/telepresence.manager.Manager/AcknowledgeRouteIntents"
 )
 
 // ManagerClient is the client API for Manager service.
@@ -214,6 +216,12 @@ type ManagerClient interface {
 	// UninstallAgents will uninstall the traffic-agent from the given workloads (or all
 	// workloads if the list is empty).
 	UninstallAgents(ctx context.Context, in *UninstallAgentsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// WatchRouteIntents sends complete routing guards scoped to the caller.
+	// Agents receive their own workload's guards; an authorized controller can
+	// request all managed routes with an empty session.
+	WatchRouteIntents(ctx context.Context, in *SessionInfo, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RouteIntentSnapshot], error)
+	// AcknowledgeRouteIntents confirms exact revisions after local installation.
+	AcknowledgeRouteIntents(ctx context.Context, in *RouteIntentAckRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 type managerClient struct {
@@ -745,6 +753,35 @@ func (c *managerClient) UninstallAgents(ctx context.Context, in *UninstallAgents
 	return out, nil
 }
 
+func (c *managerClient) WatchRouteIntents(ctx context.Context, in *SessionInfo, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RouteIntentSnapshot], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Manager_ServiceDesc.Streams[13], Manager_WatchRouteIntents_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SessionInfo, RouteIntentSnapshot]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Manager_WatchRouteIntentsClient = grpc.ServerStreamingClient[RouteIntentSnapshot]
+
+func (c *managerClient) AcknowledgeRouteIntents(ctx context.Context, in *RouteIntentAckRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, Manager_AcknowledgeRouteIntents_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ManagerServer is the server API for Manager service.
 // All implementations must embed UnimplementedManagerServer
 // for forward compatibility.
@@ -892,6 +929,12 @@ type ManagerServer interface {
 	// UninstallAgents will uninstall the traffic-agent from the given workloads (or all
 	// workloads if the list is empty).
 	UninstallAgents(context.Context, *UninstallAgentsRequest) (*emptypb.Empty, error)
+	// WatchRouteIntents sends complete routing guards scoped to the caller.
+	// Agents receive their own workload's guards; an authorized controller can
+	// request all managed routes with an empty session.
+	WatchRouteIntents(*SessionInfo, grpc.ServerStreamingServer[RouteIntentSnapshot]) error
+	// AcknowledgeRouteIntents confirms exact revisions after local installation.
+	AcknowledgeRouteIntents(context.Context, *RouteIntentAckRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedManagerServer()
 }
 
@@ -1024,6 +1067,12 @@ func (UnimplementedManagerServer) ReportMetrics(context.Context, *TunnelMetrics)
 }
 func (UnimplementedManagerServer) UninstallAgents(context.Context, *UninstallAgentsRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method UninstallAgents not implemented")
+}
+func (UnimplementedManagerServer) WatchRouteIntents(*SessionInfo, grpc.ServerStreamingServer[RouteIntentSnapshot]) error {
+	return status.Error(codes.Unimplemented, "method WatchRouteIntents not implemented")
+}
+func (UnimplementedManagerServer) AcknowledgeRouteIntents(context.Context, *RouteIntentAckRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcknowledgeRouteIntents not implemented")
 }
 func (UnimplementedManagerServer) mustEmbedUnimplementedManagerServer() {}
 func (UnimplementedManagerServer) testEmbeddedByValue()                 {}
@@ -1689,6 +1738,35 @@ func _Manager_UninstallAgents_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Manager_WatchRouteIntents_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SessionInfo)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ManagerServer).WatchRouteIntents(m, &grpc.GenericServerStream[SessionInfo, RouteIntentSnapshot]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Manager_WatchRouteIntentsServer = grpc.ServerStreamingServer[RouteIntentSnapshot]
+
+func _Manager_AcknowledgeRouteIntents_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RouteIntentAckRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ManagerServer).AcknowledgeRouteIntents(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Manager_AcknowledgeRouteIntents_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ManagerServer).AcknowledgeRouteIntents(ctx, req.(*RouteIntentAckRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Manager_ServiceDesc is the grpc.ServiceDesc for Manager service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1808,6 +1886,10 @@ var Manager_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "UninstallAgents",
 			Handler:    _Manager_UninstallAgents_Handler,
 		},
+		{
+			MethodName: "AcknowledgeRouteIntents",
+			Handler:    _Manager_AcknowledgeRouteIntents_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -1874,6 +1956,11 @@ var Manager_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "WatchQuicBackends",
 			Handler:       _Manager_WatchQuicBackends_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "WatchRouteIntents",
+			Handler:       _Manager_WatchRouteIntents_Handler,
 			ServerStreams: true,
 		},
 	},

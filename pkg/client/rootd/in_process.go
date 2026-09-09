@@ -30,9 +30,13 @@ func (rd *InProcSession) Version(ctx context.Context, _ *empty.Empty, _ ...grpc.
 
 func (rd *InProcSession) Status(ctx context.Context, _ *empty.Empty, _ ...grpc.CallOption) (*rpc.DaemonStatus, error) {
 	return &rpc.DaemonStatus{
-		Version:         client.VersionInfo(ctx),
-		OutboundConfig:  rd.getNetworkConfig(),
-		TunnelTransport: rd.tunnelTransportRPC(),
+		Version:                       client.VersionInfo(ctx),
+		OutboundConfig:                rd.getNetworkConfig(),
+		TunnelTransport:               rd.tunnelTransportRPC(),
+		SupportsManagerTokenCallback:  true,
+		SupportsNegotiatedDevboxProxy: true,
+		ManagerTokenCallbackActive:    rd.managerTokenCallbackActive,
+		ManagerTokenCallbackId:        rd.managerTokenCallbackID,
 	}, nil
 }
 

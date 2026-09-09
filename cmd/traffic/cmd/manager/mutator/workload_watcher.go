@@ -107,7 +107,7 @@ func (c *configWatcher) updateWorkload(ctx context.Context, wl, oldWl k8sapi.Wor
 		if !env.EnabledWorkloadKinds.Contains(wl.GetKind()) {
 			return
 		}
-		img := managerutil.GetAgentImage(ctx)
+		img := managerutil.GetAgentImageForNamespace(ctx, wl.GetNamespace())
 		if img == "" {
 			return
 		}

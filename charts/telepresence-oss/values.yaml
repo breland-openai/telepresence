@@ -82,6 +82,15 @@ security:
     #
     # Default: permissive
     mode: permissive
+    # Optional HTTPS Kubernetes SelfSubjectReview endpoint for delegated bearer identities.
+    # Set all four delegated values together; otherwise leave them all unset.
+    delegatedSelfSubjectReviewURL: ""
+    # Canonical Entra application audience UUID, advertised for manager-only authentication.
+    delegatedDevboxProxyAudience: ""
+    # Canonical Entra tenant UUID whose service principals the delegate verifies.
+    delegatedDevboxProxyTenantID: ""
+    # Exact, lowercase, fully qualified DNS names authorized to receive this audience. No wildcard or port.
+    delegatedDevboxProxyAuthorities: []
 
     # x509 configures client-certificate authentication: an additional,
     # opt-in mechanism for identifying clients whose kubeconfig credentials
@@ -124,6 +133,25 @@ maxNamespaceSpecificWatchers: 10
 managerRbac:
   # Default: true
   create: true
+
+# Durable guards for exact X-Local-Routing-Key intercepts. Keep disabled until
+# clients, agents, and the gateway have been upgraded to the authoritative protocol.
+routeIntent:
+  enabled: false
+  # Explicit exception for installations with no local-routing gateway. With
+  # the default, the controller must acknowledge Kubernetes accepted its config.
+  skipGatewayAck: false
+  # Optional workload namespace allowlist for a staged rollout. Empty enables
+  # durable routing in every manager-managed namespace when enabled above.
+  namespaces: []
+  # Optional fully-qualified candidate traffic-agent image (prefer an immutable
+  # digest) used only in the namespace allowlist. Empty keeps the standard image.
+  agentImage: ""
+  # Turn on after every manager serving agent connections supports the new protocol.
+  requireAuthoritativeAgents: false
+  # Full authenticated Kubernetes identities. An empty list denies global reads.
+  # Example: ["system:serviceaccount:gateway-system:gateway-reconciler"]
+  controllerServiceAccounts: []
 
 timeouts:
   # The duration the traffic manager should wait for an agent to arrive (i.e., to be registered in the traffic manager's state)

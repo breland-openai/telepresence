@@ -137,6 +137,10 @@ Compared to the replace command, intercept is less invasive because it: a) enabl
 traffic using HTTP headers or paths, and b) allows the original service to continue running, handling all other traffic
 and tasks not directly related to the intercepted traffic.
 
+If your administrator enables protected local routing, see
+[Protect requests for a local intercept](protected-intercepts.md) to prevent requests
+for a specific local routing key from falling back to the cluster application during recovery.
+
 1. Connect to your cluster with `telepresence connect`.
 
 2. Intercept all traffic going to the application's http port in your cluster and redirect to port 8080 on your workstation.

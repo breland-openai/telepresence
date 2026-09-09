@@ -1,11 +1,16 @@
 package fwd
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -19,6 +24,7 @@ import (
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/pkg/matcher"
 	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
+	"github.com/telepresenceio/telepresence/v2/pkg/types"
 )
 
 func TestEnsureGRPCTrailersHeaderForReverseProxy(t *testing.T) {
@@ -228,6 +234,532 @@ func TestObservedResponseWriterTracksStatusAndBytes(t *testing.T) {
 	require.Same(t, rec, writer.Unwrap())
 }
 
+func TestHandleHTTPRequest_SelectedInterceptTunnelUnavailable(t *testing.T) {
+	const routingHeader = "x-local-routing-key"
+	for _, tt := range []struct {
+		name       string
+		method     string
+		path       string
+		routingKey string
+		websocket  bool
+		selected   bool
+	}{
+		{name: "selected header", method: http.MethodGet, path: "/", routingKey: "developer", selected: true},
+		{name: "selected post", method: http.MethodPost, path: "/submit", routingKey: "developer", selected: true},
+		{name: "selected websocket", method: http.MethodGet, path: "/hmr", routingKey: "developer", websocket: true, selected: true},
+		{name: "selected path", method: http.MethodGet, path: "/path-only/test", selected: true},
+		{name: "unkeyed traffic", method: http.MethodGet, path: "/"},
+		{name: "unkeyed post", method: http.MethodPost, path: "/submit"},
+		{name: "other routing key", method: http.MethodGet, path: "/", routingKey: "other-developer"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := NewTCPInterceptor(t.Context(), types.PortAndProto{Proto: types.ProtoTCP}, tunnel.AgentToClient, nil,
+				netip.MustParseAddrPort("127.0.0.1:3000")).(*tcp)
+			provider := &fakeStreamProvider{err: io.ErrClosedPipe}
+			f.SetStreamProvider(provider)
+			f.SetIntercepting([]*manager.InterceptInfo{
+				{
+					Id: "by-header", ClientSession: &manager.SessionInfo{SessionId: "session"},
+					Spec: &manager.InterceptSpec{
+						TargetHost: "127.0.0.1", TargetPort: 8080,
+						HeaderFilters: map[string]string{routingHeader: "developer"},
+					},
+				},
+				{
+					Id: "by-path", ClientSession: &manager.SessionInfo{SessionId: "session"},
+					Spec: &manager.InterceptSpec{
+						TargetHost: "127.0.0.1", TargetPort: 8080,
+						PathFilters: []string{":path-prefix:/path-only/"},
+					},
+				},
+			})
+			t.Cleanup(func() { f.SetIntercepting(nil) })
+
+			var appCalls int
+			var appBody string
+			app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				appCalls++
+				if !tt.selected {
+					body, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					appBody = string(body)
+				}
+				w.WriteHeader(http.StatusAccepted)
+			})
+			var reqBody io.Reader
+			var wantAppBody string
+			if tt.method == http.MethodPost {
+				wantAppBody = "request-body"
+				reqBody = strings.NewReader(wantAppBody)
+			}
+			req := httptest.NewRequest(tt.method, "http://web.example"+tt.path, reqBody)
+			if tt.routingKey != "" {
+				req.Header.Set(routingHeader, tt.routingKey)
+			}
+			if tt.websocket {
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "websocket")
+			}
+			rec := httptest.NewRecorder()
+			f.handleHTTPRequest(rec, req, app)
+			if tt.selected {
+				assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+				assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+				assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+				assert.JSONEq(t, `{"error":"telepresence intercept is temporarily unavailable"}`, rec.Body.String())
+				assert.Zero(t, appCalls)
+				assert.EqualValues(t, 1, provider.calls.Load())
+			} else {
+				assert.Equal(t, http.StatusAccepted, rec.Code)
+				assert.Empty(t, rec.Header().Get("Retry-After"))
+				assert.Equal(t, 1, appCalls)
+				assert.Equal(t, wantAppBody, appBody)
+				assert.Zero(t, provider.calls.Load())
+			}
+		})
+	}
+}
+
+func TestHandleHTTPRequest_SelectedInterceptNonTunnelError(t *testing.T) {
+	f := NewTCPInterceptor(t.Context(), types.PortAndProto{Proto: types.ProtoTCP}, tunnel.AgentToClient, nil,
+		netip.MustParseAddrPort("127.0.0.1:3000")).(*tcp)
+	provider := &fakeStreamProvider{err: io.ErrClosedPipe}
+	f.SetStreamProvider(provider)
+	f.SetIntercepting([]*manager.InterceptInfo{{
+		Id: "invalid-target", ClientSession: &manager.SessionInfo{SessionId: "session"},
+		Spec: &manager.InterceptSpec{
+			TargetHost: "invalid", TargetPort: 8080, HeaderFilters: map[string]string{"x-local-routing-key": "developer"},
+		},
+	}})
+	t.Cleanup(func() { f.SetIntercepting(nil) })
+
+	var appCalls int
+	app := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { appCalls++ })
+	req := httptest.NewRequest(http.MethodGet, "http://web.example/", nil)
+	req.Header.Set("x-local-routing-key", "developer")
+	rec := httptest.NewRecorder()
+	f.handleHTTPRequest(rec, req, app)
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+	assert.Empty(t, rec.Header().Get("Retry-After"))
+	assert.Contains(t, rec.Body.String(), "failed to parse intercept target address")
+	assert.Zero(t, appCalls)
+	assert.Zero(t, provider.calls.Load())
+}
+
+func TestHandleHTTPRequest_SelectedInterceptBoundsBlockedTunnelSetup(t *testing.T) {
+	f := NewTCPInterceptor(t.Context(), types.PortAndProto{Proto: types.ProtoTCP}, tunnel.AgentToClient, nil,
+		netip.MustParseAddrPort("127.0.0.1:3000")).(*tcp)
+	providerCanceled := make(chan struct{})
+	f.SetStreamProvider(&fakeStreamProvider{create: func(ctx context.Context) (tunnel.Stream, error) {
+		<-ctx.Done()
+		close(providerCanceled)
+		return nil, ctx.Err()
+	}})
+	f.SetIntercepting([]*manager.InterceptInfo{{
+		Id: "selected", ClientSession: &manager.SessionInfo{SessionId: "session"},
+		Spec: &manager.InterceptSpec{
+			TargetHost: "127.0.0.1", TargetPort: 8080, HeaderFilters: map[string]string{"x-local-routing-key": "developer"},
+		},
+	}})
+	t.Cleanup(func() { f.SetIntercepting(nil) })
+	var appCalls atomic.Int32
+	app := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { appCalls.Add(1) })
+	req := httptest.NewRequest(http.MethodGet, "http://web.example/", nil)
+	req.Header.Set("x-local-routing-key", "developer")
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	f.handleHTTPRequest(rec, req, app)
+	assert.Less(t, time.Since(start), 3*httpInterceptConnectionTimeout)
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+	assert.Zero(t, appCalls.Load())
+	select {
+	case <-providerCanceled:
+	case <-time.After(httpInterceptConnectionTimeout):
+		t.Fatal("detached transport dial did not cancel its stream provider")
+	}
+}
+
+type httpSetupStream struct {
+	fakeTapStream
+	setup  chan tunnel.Message
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (s *httpSetupStream) Receive(ctx context.Context) (tunnel.Message, error) {
+	select {
+	case m := <-s.setup:
+		return m, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *httpSetupStream) CloseSend(context.Context) error {
+	s.once.Do(func() { close(s.closed) })
+	return nil
+}
+
+func TestHTTPInterceptDialIncludesDeveloperTCPAcknowledgmentInSetupBudget(t *testing.T) {
+	const timeout = 50 * time.Millisecond
+	stream := &httpSetupStream{setup: make(chan tunnel.Message, 1), closed: make(chan struct{})}
+	got, _, _, err := dialHTTPInterceptStream(t.Context(), timeout, func(ctx context.Context) (tunnel.Stream, error) {
+		return stream, awaitHTTPInterceptDial(ctx, stream)
+	})
+	require.Nil(t, got)
+	require.ErrorIs(t, err, errHTTPInterceptConnectionTimeout)
+	select {
+	case <-stream.closed:
+	case <-time.After(time.Second):
+		t.Fatal("stream with a late developer TCP acknowledgment was not closed")
+	}
+	stream.setup <- tunnel.NewMessage(tunnel.DialOK, nil)
+
+	for _, code := range []tunnel.MessageCode{tunnel.DialReject, tunnel.Normal} {
+		rejected := &httpSetupStream{setup: make(chan tunnel.Message, 1)}
+		rejected.setup <- tunnel.NewMessage(code, nil)
+		assert.ErrorIs(t, awaitHTTPInterceptDial(t.Context(), rejected), errClientStream)
+	}
+	accepted := &httpSetupStream{setup: make(chan tunnel.Message, 1)}
+	accepted.setup <- tunnel.NewMessage(tunnel.DialOK, nil)
+	assert.NoError(t, awaitHTTPInterceptDial(t.Context(), accepted))
+}
+
+func TestHandleHTTPRequest_HTTPRetryGetsUniqueTunnelIDForSameIncomingSocket(t *testing.T) {
+	f := NewTCPInterceptor(t.Context(), types.PortAndProto{Proto: types.ProtoTCP}, tunnel.AgentToClient, nil,
+		netip.MustParseAddrPort("127.0.0.1:3000")).(*tcp)
+	ids := make(chan tunnel.ConnID, 2)
+	f.SetStreamProvider(&fakeStreamProvider{createFor: func(_ context.Context, id tunnel.ConnID) (tunnel.Stream, error) {
+		ids <- id
+		return nil, io.ErrClosedPipe
+	}})
+	f.SetIntercepting([]*manager.InterceptInfo{{
+		Id: "selected", ClientSession: &manager.SessionInfo{SessionId: "session"},
+		Spec: &manager.InterceptSpec{
+			TargetHost: "127.0.0.1", TargetPort: 8080, HeaderFilters: map[string]string{"x-local-routing-key": "developer"},
+		},
+	}})
+	t.Cleanup(func() { f.SetIntercepting(nil) })
+	const original = "198.51.100.34:43210"
+	for range 2 {
+		req := httptest.NewRequest(http.MethodGet, "http://web.example/", nil)
+		req.RemoteAddr = original
+		req.Header.Set("x-local-routing-key", "developer")
+		rec := httptest.NewRecorder()
+		f.handleHTTPRequest(rec, req, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("selected request reached staging") }))
+		require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		assert.Equal(t, original, req.RemoteAddr)
+	}
+	first, second := <-ids, <-ids
+	assert.NotEqual(t, first, second, "a late response must not satisfy the next request on the same incoming socket")
+	for _, id := range []tunnel.ConnID{first, second} {
+		assert.Equal(t, netip.MustParseAddrPort("127.0.0.1:8080"), id.Destination())
+		assert.Equal(t, types.ProtoTCP, id.Protocol())
+		assert.EqualValues(t, 43210, id.Source().Port())
+		assert.True(t, id.Source().Addr().IsPrivate())
+	}
+}
+
+type httpSocketStream struct {
+	fakeTapStream
+	conn net.Conn
+	id   tunnel.ConnID
+	ack  bool
+}
+
+func (s *httpSocketStream) ID() tunnel.ConnID { return s.id }
+
+func (s *httpSocketStream) Receive(context.Context) (tunnel.Message, error) {
+	if !s.ack {
+		s.ack = true
+		return tunnel.NewMessage(tunnel.DialOK, nil), nil
+	}
+	b := make([]byte, 4096)
+	n, err := s.conn.Read(b)
+	if n > 0 {
+		return tunnel.NewMessage(tunnel.Normal, b[:n]), nil
+	}
+	return nil, err
+}
+
+func (s *httpSocketStream) Send(_ context.Context, msg tunnel.Message) error {
+	_, err := s.conn.Write(msg.Payload())
+	return err
+}
+
+func (s *httpSocketStream) CloseSend(context.Context) error { return s.conn.Close() }
+
+func TestHandleHTTPRequest_UniqueTunnelSourcePreservesOriginalHTTPForwardedAddress(t *testing.T) {
+	forwarded := make(chan string, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		forwarded <- req.Header.Get("X-Forwarded-For")
+		_, _ = io.WriteString(w, "local")
+	}))
+	defer backend.Close()
+	backendAddr := backend.Listener.Addr().(*net.TCPAddr).AddrPort()
+	f := NewTCPInterceptor(t.Context(), types.PortAndProto{Proto: types.ProtoTCP}, tunnel.AgentToClient, nil,
+		netip.MustParseAddrPort("127.0.0.1:3000")).(*tcp)
+	f.SetStreamProvider(&fakeStreamProvider{createFor: func(ctx context.Context, id tunnel.ConnID) (tunnel.Stream, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", id.Destination().String())
+		if err != nil {
+			return nil, err
+		}
+		return &httpSocketStream{conn: conn, id: id}, nil
+	}})
+	f.SetIntercepting([]*manager.InterceptInfo{{
+		Id: "selected", ClientSession: &manager.SessionInfo{SessionId: "session"},
+		Spec: &manager.InterceptSpec{
+			TargetHost: backendAddr.Addr().String(), TargetPort: int32(backendAddr.Port()), HeaderFilters: map[string]string{"x-local-routing-key": "developer"},
+		},
+	}})
+	t.Cleanup(func() { f.SetIntercepting(nil) })
+	req := httptest.NewRequest(http.MethodGet, "http://web.example/", nil)
+	req.RemoteAddr = "198.51.100.34:43210"
+	req.Header.Set("x-local-routing-key", "developer")
+	rec := httptest.NewRecorder()
+	f.handleHTTPRequest(rec, req, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("selected request reached staging") }))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "local", rec.Body.String())
+	assert.Equal(t, "198.51.100.34", <-forwarded)
+	assert.Equal(t, "198.51.100.34:43210", req.RemoteAddr)
+}
+
+func TestHTTPConnectionAcquisitionBoundsPoolQueueButNotSlowResponse(t *testing.T) {
+	const timeout = 75 * time.Millisecond
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		_, _ = io.WriteString(w, "local")
+	}))
+	defer backend.Close()
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxConnsPerHost = 1
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: httpConnectionAcquisitionTransport{transport: tr, timeout: timeout}}
+	firstDone := make(chan error, 1)
+	go func() {
+		resp, err := client.Get(backend.URL)
+		if err == nil {
+			_, err = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+		}
+		firstDone <- err
+	}()
+	<-firstStarted
+	started := time.Now()
+	resp, err := client.Get(backend.URL)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	require.Nil(t, resp)
+	require.ErrorIs(t, err, errHTTPInterceptConnectionTimeout)
+	assert.GreaterOrEqual(t, time.Since(started), timeout/2)
+	assert.Less(t, time.Since(started), 2*time.Second)
+	assert.EqualValues(t, 1, calls.Load(), "pooled request must not reach the local server")
+	select {
+	case err = <-firstDone:
+		t.Errorf("healthy request ended before its slow response was ready: %v", err)
+	default:
+	}
+	close(releaseFirst)
+	require.NoError(t, <-firstDone)
+	resp, err = client.Get(backend.URL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.EqualValues(t, 2, calls.Load(), "the healthy connection should remain usable")
+}
+
+func TestHTTPConnectionAcquisitionPreservesStreamingBody(t *testing.T) {
+	const timeout = 50 * time.Millisecond
+	releaseBody := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.(http.Flusher).Flush()
+		<-releaseBody
+		_, _ = io.WriteString(w, "data: local\n\n")
+	}))
+	defer backend.Close()
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: httpConnectionAcquisitionTransport{transport: tr, timeout: timeout}}
+	resp, err := client.Get(backend.URL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	<-time.After(3 * timeout)
+	close(releaseBody)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "data: local\n\n", string(body))
+}
+
+type httpAcquisitionTestRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f httpAcquisitionTestRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestHTTPConnectionAcquisitionBoundsRetryAfterPreviouslyAcquiredConnection(t *testing.T) {
+	const timeout = 50 * time.Millisecond
+	tr := httpConnectionAcquisitionTransport{
+		timeout: timeout,
+		transport: httpAcquisitionTestRoundTripper(func(req *http.Request) (*http.Response, error) {
+			trace := httptrace.ContextClientTrace(req.Context())
+			trace.GetConn("local")
+			trace.GotConn(httptrace.GotConnInfo{Reused: true})
+			<-time.After(3 * timeout)
+			assert.NoError(t, req.Context().Err(), "acquired connection must remove the first setup deadline")
+			trace.GetConn("local") // transport retries when the previously pooled connection is stale
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}),
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://web.example/", nil)
+	started := time.Now()
+	resp, err := tr.RoundTrip(req)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	require.Nil(t, resp)
+	require.ErrorIs(t, err, errHTTPInterceptConnectionTimeout)
+	assert.GreaterOrEqual(t, time.Since(started), 3*timeout)
+}
+
+func TestHTTPConnectionAcquisitionPreservesWebSocketUpgrade(t *testing.T) {
+	const timeout = 50 * time.Millisecond
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.WriteString(rw, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+		_ = rw.Flush()
+		msg, err := rw.ReadString('\n')
+		if err == nil {
+			_, _ = fmt.Fprintf(rw, "local:%s", msg)
+			_ = rw.Flush()
+		}
+	}))
+	defer backend.Close()
+	target, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	defer tr.CloseIdleConnections()
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = httpConnectionAcquisitionTransport{transport: tr, timeout: timeout}
+	frontend := httptest.NewServer(proxy)
+	defer frontend.Close()
+	conn, err := net.Dial("tcp", frontend.Listener.Addr().String())
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(3*time.Second)))
+	_, err = io.WriteString(conn, "GET /hmr HTTP/1.1\r\nHost: frontend\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	require.NoError(t, err)
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	<-time.After(3 * timeout)
+	_, err = io.WriteString(conn, "alive\n")
+	require.NoError(t, err)
+	msg, err := reader.ReadString('\n')
+	require.NoError(t, err)
+	assert.Equal(t, "local:alive\n", msg)
+}
+
+func TestHTTPConnectionAcquisitionPreservesDownstreamCancellation(t *testing.T) {
+	const timeout = time.Second
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	tr.DialContext = func(context.Context, string, string) (net.Conn, error) {
+		close(started)
+		<-unblock
+		return nil, io.ErrClosedPipe
+	}
+	defer tr.CloseIdleConnections()
+	req := httptest.NewRequest(http.MethodGet, "http://web.example/", nil).WithContext(ctx)
+	req.RequestURI = ""
+	done := make(chan error, 1)
+	go func() {
+		resp, err := (httpConnectionAcquisitionTransport{transport: tr, timeout: timeout}).RoundTrip(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		done <- err
+	}()
+	<-started
+	cancel()
+	err := <-done
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.NotErrorIs(t, err, errClientStream)
+	close(unblock)
+}
+
+type httpProbeStream struct {
+	fakeTapStream
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (s *httpProbeStream) CloseSend(context.Context) error {
+	s.once.Do(func() { close(s.closed) })
+	return nil
+}
+
+func TestDialHTTPInterceptStreamCleansLateStream(t *testing.T) {
+	const timeout = 50 * time.Millisecond
+	release := make(chan struct{})
+	entered := make(chan context.Context, 1)
+	stream := &httpProbeStream{closed: make(chan struct{})}
+	start := time.Now()
+	got, _, _, err := dialHTTPInterceptStream(t.Context(), timeout, func(ctx context.Context) (tunnel.Stream, error) {
+		entered <- ctx
+		<-release // deliberately simulate a provider that is slow to process cancellation
+		return stream, nil
+	})
+	require.ErrorIs(t, err, errHTTPInterceptConnectionTimeout)
+	require.Nil(t, got)
+	assert.Less(t, time.Since(start), time.Second)
+	assert.ErrorIs(t, context.Cause(<-entered), errHTTPInterceptConnectionTimeout)
+	close(release)
+	select {
+	case <-stream.closed:
+	case <-time.After(time.Second):
+		t.Fatal("the detached dial leaked a stream that arrived after its setup deadline")
+	}
+}
+
+func TestDialHTTPInterceptStreamKeepsEstablishedStreamUntilConnectionClose(t *testing.T) {
+	const timeout = 50 * time.Millisecond
+	stream := &httpProbeStream{closed: make(chan struct{})}
+	got, streamCtx, cancel, err := dialHTTPInterceptStream(t.Context(), timeout, func(context.Context) (tunnel.Stream, error) {
+		return stream, nil
+	})
+	require.NoError(t, err)
+	require.Same(t, stream, got)
+	local, remote := net.Pipe()
+	defer remote.Close()
+	conn := &httpInterceptStreamConn{Conn: local, cancel: cancel}
+	defer conn.Close()
+	<-time.After(3 * timeout)
+	assert.NoError(t, streamCtx.Err(), "the setup timer must not become the established stream's lifetime")
+	require.NoError(t, conn.Close())
+	assert.ErrorIs(t, streamCtx.Err(), context.Canceled)
+	_, err = remote.Read(make([]byte, 1))
+	assert.ErrorIs(t, err, io.EOF)
+}
+
 // fakeTapStream is a minimal tunnel.Stream that records everything sent to it.
 type fakeTapStream struct {
 	mu   sync.Mutex
@@ -264,15 +796,26 @@ func (s *fakeTapStream) bytes() []byte {
 	return all
 }
 
-// fakeStreamProvider always hands out the same stream, regardless of the requested intercept.
+// fakeStreamProvider returns the same result for every intercept.
 type fakeStreamProvider struct {
-	stream tunnel.Stream
+	stream    tunnel.Stream
+	err       error
+	create    func(context.Context) (tunnel.Stream, error)
+	createFor func(context.Context, tunnel.ConnID) (tunnel.Stream, error)
+	calls     atomic.Int32
 }
 
 func (p *fakeStreamProvider) CreateClientStream(
-	context.Context, tunnel.Tag, tunnel.SessionID, tunnel.ConnID, time.Duration, time.Duration,
+	ctx context.Context, _ tunnel.Tag, _ tunnel.SessionID, id tunnel.ConnID, _, _ time.Duration,
 ) (tunnel.Stream, error) {
-	return p.stream, nil
+	p.calls.Add(1)
+	if p.createFor != nil {
+		return p.createFor(ctx, id)
+	}
+	if p.create != nil {
+		return p.create(ctx)
+	}
+	return p.stream, p.err
 }
 
 func (p *fakeStreamProvider) ReportMetrics(context.Context, *manager.TunnelMetrics) {}

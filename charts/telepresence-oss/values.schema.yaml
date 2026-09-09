@@ -772,6 +772,38 @@ properties:
         items:
           type: string
 
+  routeIntent:
+    description: Authoritative durable routing guards for exact local HTTP intercepts.
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: Enable durable guards; authentication must be permissive or enforcing.
+        type: boolean
+      skipGatewayAck:
+        description: Explicit exception for installations with no local-routing gateway; otherwise gateway acknowledgement is required.
+        type: boolean
+      namespaces:
+        description: Workload namespaces in scope; empty includes every manager-managed namespace when the feature is enabled.
+        type: array
+        uniqueItems: true
+        items:
+          $ref: "#/$defs/rfc1123Label"
+      agentImage:
+        description: Optional fully qualified candidate agent image for the scoped namespaces; prefer an immutable digest.
+        type: string
+      requireAuthoritativeAgents:
+        description: Require initial route synchronization before agents can serve; requires routeIntent.enabled and the agent init container.
+        type: boolean
+      controllerServiceAccounts:
+        description: Full authenticated Kubernetes service-account usernames allowed to read global routing guards; empty denies global reads.
+        type: array
+        uniqueItems: true
+        items:
+          type: string
+          maxLength: 340
+          pattern: '^system:serviceaccount:[a-z0-9]([a-z0-9-]*[a-z0-9])?:[a-z0-9]([a-z0-9.-]*[a-z0-9])?$'
+
   resources:
     description: Define resource requests and limits for the Traffic Manger
     $ref: "#/$defs/resourceRequirements"
@@ -797,6 +829,28 @@ properties:
               enforcing rejects unauthenticated or unauthorized calls.
             type: string
             enum: ["disabled", "permissive", "enforcing"]
+          delegatedSelfSubjectReviewURL:
+            description: Optional HTTPS Kubernetes SelfSubjectReview endpoint, configured together with the delegated audience, tenant, and exact DNS authorities.
+            type: string
+          delegatedDevboxProxyAudience:
+            description: >-
+              Optional canonical Entra application audience UUID advertised for manager-only
+              authentication when paired with its delegated endpoint, tenant, and exact DNS authorities.
+            type: string
+            pattern: '^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          delegatedDevboxProxyTenantID:
+            description: Optional canonical Entra tenant UUID whose service principals the delegate verifies.
+            type: string
+            pattern: '^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          delegatedDevboxProxyAuthorities:
+            description: Optional exact lowercase fully qualified DNS names authorized to receive the configured audience; no wildcard or port.
+            type: array
+            maxItems: 32
+            uniqueItems: true
+            items:
+              type: string
+              maxLength: 253
+              pattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
           x509:
             description: >-
               Client-certificate authentication: an additional, opt-in mechanism for

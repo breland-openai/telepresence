@@ -2,16 +2,76 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
 	"net/netip"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 
+	agenttls "github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/agent/tls"
 	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/forwarder"
 	"github.com/telepresenceio/telepresence/v2/pkg/types"
 )
+
+type testMediationTLS struct {
+	agenttls.Manager
+	port uint16
+}
+
+func (m testMediationTLS) GetDownstreamCertificate(port uint16) *tls.Certificate {
+	if port == m.port {
+		return new(tls.Certificate)
+	}
+	return nil
+}
+
+func TestPermanentHTTPMediationOnlyOnDeclaredCompatibleStrictPorts(t *testing.T) {
+	for _, tt := range []struct {
+		protocol string
+		secure   bool
+		want     bool
+	}{
+		{"http", false, true},
+		{"kubernetes.io/http", false, true},
+		{"HTTP/1.1", false, true},
+		{"ws", false, true},
+		{"kubernetes.io/ws", false, true},
+		{"h2c", false, true},
+		{"kubernetes.io/h2c", false, true},
+		{"https", false, false},
+		{"https", true, true},
+		{"http2", true, true},
+		{"kubernetes.io/wss", true, true},
+		{"grpc", false, false},
+		{"grpc", true, true},
+		{"tcp", true, false},
+		{"postgres", true, false},
+		{"", true, false},
+	} {
+		t.Run(fmt.Sprintf("%s/secure=%t", tt.protocol, tt.secure), func(t *testing.T) {
+			var tm agenttls.Manager
+			if tt.secure {
+				tm = testMediationTLS{port: 8080}
+			}
+			require.Equal(t, tt.want, permanentHTTPMediation(tt.protocol, tm, 8080))
+		})
+	}
+	require.False(t, permanentHTTPMediation("https", testMediationTLS{port: 8081}, 8080), "the cert must belong to this port")
+	for _, strict := range []bool{false, true} {
+		for _, protocol := range []string{"http", "h2c", "tcp", "", "https"} {
+			c := newTestContainerState(t, netip.MustParseAddr("127.0.0.1"), false)
+			c.AgentConfig().RequireAuthoritativeRoutes = strict
+			c.container.Intercepts[0].AppProtocol = protocol
+			forwarder := c.newPortHandler(t.Context(), types.PortAndProto{Proto: types.ProtoTCP, Port: 8080}, c.container.Intercepts)
+			want := strict && (protocol == "http" || protocol == "h2c")
+			require.Equal(t, want, forwarder.IsHTTP(), "strict=%t protocol=%s", strict, protocol)
+			require.Equal(t, want, forwarder.SupportsHTTPRouteGuards())
+		}
+	}
+}
 
 // fakeConfig is a minimal Config that lets newPortHandler run without a real
 // pod, procfs, or CRI environment. podIP is configurable per test so both

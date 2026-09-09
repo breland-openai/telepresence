@@ -2,13 +2,16 @@ package fwd
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
@@ -18,6 +21,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
@@ -30,9 +35,25 @@ const (
 	httpInterceptMaxIdleConns        = 512
 	httpInterceptMaxIdleConnsPerHost = 128
 	httpInterceptMaxConnsPerHost     = 128
+	httpInterceptMaxH1Retries        = 1
+	httpInterceptConnectionTimeout   = time.Second
 	httpInterceptSlowAfter           = 2 * time.Second
 	httpInterceptVerySlow            = 10 * time.Second
+	localRoutingKeyHeader            = "X-Local-Routing-Key"
 )
+
+var errHTTPInterceptConnectionTimeout = fmt.Errorf("%w: timed out waiting for a connection to the developer tunnel", errClientStream)
+
+var errHTTPInterceptRetryLimit = fmt.Errorf("%w: developer connection closed repeatedly before responding", errClientStream)
+
+var httpInterceptTunnelSourcePrefix = func() [8]byte { //nolint:gochecknoglobals // every forwarder in the process shares the tunnel-correlation identity
+	var prefix [8]byte
+	_, _ = rand.Read(prefix[:])
+	prefix[0] = 0xfd // private IPv6 label used only for tunnel correlation; it is never dialed
+	return prefix
+}()
+
+var httpInterceptTunnelSourceSequence atomic.Uint64 //nolint:gochecknoglobals // distinct forwarders must never issue the same tunnel-correlation address
 
 type httpInterceptDialContextKey struct{}
 
@@ -44,6 +65,309 @@ type httpInterceptDialContext struct {
 type httpInterceptTransport struct {
 	targetURL *url.URL
 	transport *http.Transport
+}
+
+// HTTP keep-alive and HTTP/2 can start multiple transport dials from the same
+// incoming socket. Give each dial its own correlation ID so an old client reply
+// cannot be delivered to a later attempt. The destination and the original HTTP
+// request (including RemoteAddr/X-Forwarded-For) are unchanged; the client dialer
+// connects only to the destination encoded in the tunnel ID.
+func uniqueHTTPInterceptTunnelSource(original netip.AddrPort) netip.AddrPort {
+	var addr [16]byte
+	copy(addr[:], httpInterceptTunnelSourcePrefix[:])
+	binary.BigEndian.PutUint64(addr[8:], httpInterceptTunnelSourceSequence.Add(1))
+	return netip.AddrPortFrom(netip.AddrFrom16(addr), original.Port())
+}
+
+// httpConnectionAcquisition bounds only the time spent waiting for a transport
+// connection, including its pool queue and an internal retry on a stale connection.
+// It stops its timer when a connection has been acquired; response headers, body and
+// upgraded streams keep the original request lifetime. Protected HTTP/1 also limits
+// retries that the standard transport itself permits to one per incoming request.
+type httpConnectionAcquisition struct {
+	mu             sync.Mutex
+	timeout        time.Duration
+	timer          *time.Timer
+	cancel         context.CancelCauseFunc
+	closed         bool
+	limitH1Retries bool
+	waiting        bool
+	retries        int
+	retryExhausted bool
+}
+
+func (a *httpConnectionAcquisition) start() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.startLocked()
+}
+
+func (a *httpConnectionAcquisition) startLocked() {
+	if a.timer == nil && !a.closed {
+		var timer *time.Timer
+		timer = time.AfterFunc(a.timeout, func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if a.timer == timer && !a.closed {
+				a.closed = true
+				a.cancel(errHTTPInterceptConnectionTimeout)
+			}
+		})
+		a.timer = timer
+	}
+}
+
+func (a *httpConnectionAcquisition) stop(closeAcquisition bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopLocked(closeAcquisition)
+}
+
+func (a *httpConnectionAcquisition) stopLocked(closeAcquisition bool) {
+	if a.timer != nil {
+		a.timer.Stop()
+		a.timer = nil
+	}
+	a.closed = a.closed || closeAcquisition
+}
+
+func (a *httpConnectionAcquisition) getConnection() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return
+	}
+	if a.limitH1Retries && !a.waiting {
+		a.waiting = true
+		a.retries++
+		if a.retries > httpInterceptMaxH1Retries {
+			a.retryExhausted = true
+			a.stopLocked(true)
+			a.cancel(errHTTPInterceptRetryLimit)
+			return
+		}
+	}
+	a.startLocked()
+}
+
+func (a *httpConnectionAcquisition) gotConnection(info httptrace.GotConnInfo) {
+	a.mu.Lock()
+	a.waiting = false
+	a.stopLocked(false)
+	exhausted := a.retryExhausted
+	a.mu.Unlock()
+	if exhausted {
+		abortHTTPInterceptH1RetryConnection(info.Conn)
+	}
+}
+
+// The standard HTTP/1 transport can return another idle connection after its
+// GetConn trace canceled the request, because both select cases are ready. That
+// connection is exclusively assigned to this request: fence it before net/http
+// can send a third copy. A negotiated HTTP/2 connection is shared and stays open.
+func abortHTTPInterceptH1RetryConnection(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	original := conn
+	if secured, ok := conn.(interface {
+		ConnectionState() tls.ConnectionState
+		NetConn() net.Conn
+	}); ok {
+		if secured.ConnectionState().NegotiatedProtocol == "h2" {
+			return
+		}
+		conn = secured.NetConn()
+	}
+	if measured, ok := conn.(*metricsReportingConn); ok {
+		conn = measured.Conn
+	}
+	if intercepted, ok := conn.(*httpInterceptStreamConn); ok {
+		intercepted.retryWriteBlocked.Store(true)
+		intercepted.cancel(errHTTPInterceptRetryLimit)
+		// Cancellation already fences writes; network close must not delay the protected response.
+		go func() { _ = original.Close() }()
+		return
+	}
+	_ = original.Close()
+}
+
+type httpConnectionAcquisitionTransport struct {
+	transport http.RoundTripper
+	timeout   time.Duration
+	protected bool
+}
+
+func (t httpConnectionAcquisitionTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, cancel := context.WithCancelCause(req.Context())
+	a := &httpConnectionAcquisition{timeout: t.timeout, cancel: cancel, limitH1Retries: t.protected && req.ProtoMajor == 1, waiting: true}
+	a.start()
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GetConn: func(string) { a.getConnection() },
+		GotConn: a.gotConnection,
+	})
+	resp, err := t.transport.RoundTrip(req.WithContext(ctx))
+	a.stop(true)
+	cause := context.Cause(ctx)
+	if req.Context().Err() == nil && (errors.Is(cause, errHTTPInterceptConnectionTimeout) || errors.Is(cause, errHTTPInterceptRetryLimit)) {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		cancel(nil)
+		return nil, cause
+	}
+	if err != nil {
+		cancel(nil)
+		// Once a developer socket has been acquired, its process can still exit
+		// before returning HTTP headers, including while beginning a WebSocket
+		// upgrade. This is the same protected-route unavailability as a failed
+		// dial. A real HTTP response (including a developer's 502) is untouched.
+		if t.protected && req.Context().Err() == nil && !errors.Is(err, errClientStream) && httpInterceptConnectionLost(err) {
+			return nil, fmt.Errorf("%w: developer connection closed before responding: %w", errClientStream, err)
+		}
+		return nil, err
+	}
+	if resp.Body == nil {
+		cancel(nil)
+	} else {
+		body := &httpConnectionAcquisitionBody{ReadCloser: resp.Body, cancel: cancel}
+		if writable, ok := resp.Body.(io.ReadWriteCloser); ok {
+			resp.Body = &httpConnectionAcquisitionReadWriteBody{httpConnectionAcquisitionBody: body, writer: writable}
+		} else {
+			resp.Body = body
+		}
+	}
+	return resp, nil
+}
+
+func httpInterceptConnectionLost(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) ||
+		httpInterceptSocketConnectionLost(err) {
+		return true
+	}
+	// A healthy incoming HTTP request can outlive the inner gRPC tunnel. These
+	// statuses mean that connection was interrupted, not that the developer
+	// returned an HTTP/gRPC application response, which RoundTrip would return
+	// separately as an http.Response. Other gRPC errors retain their diagnostics.
+	switch status.Code(err) {
+	case codes.Canceled, codes.Unavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+type httpConnectionAcquisitionBody struct {
+	io.ReadCloser
+	cancel context.CancelCauseFunc
+}
+
+func (b *httpConnectionAcquisitionBody) Close() error {
+	defer b.cancel(nil)
+	return b.ReadCloser.Close()
+}
+
+// ReverseProxy requires a writable body for a 101 WebSocket response.
+type httpConnectionAcquisitionReadWriteBody struct {
+	*httpConnectionAcquisitionBody
+	writer io.Writer
+}
+
+func (b *httpConnectionAcquisitionReadWriteBody) Write(p []byte) (int, error) {
+	return b.writer.Write(p)
+}
+
+// A transport detaches DialContext from its initiating request so it can reuse the
+// result. Bound that detached setup separately and retain the stream context until
+// the returned connection closes, even for pooled connections and WebSockets.
+func dialHTTPInterceptStream(
+	ctx context.Context,
+	timeout time.Duration,
+	create func(context.Context) (tunnel.Stream, error),
+) (tunnel.Stream, context.Context, context.CancelCauseFunc, error) {
+	streamCtx, cancel := context.WithCancelCause(ctx)
+	a := &httpConnectionAcquisition{timeout: timeout, cancel: cancel}
+	a.start()
+	type result struct {
+		stream tunnel.Stream
+		err    error
+	}
+	ch := make(chan result)
+	go func() {
+		stream, err := create(streamCtx)
+		select {
+		case ch <- result{stream, err}:
+		case <-streamCtx.Done():
+			closeUnusedHTTPInterceptStream(streamCtx, stream)
+		}
+	}()
+	select {
+	case <-streamCtx.Done():
+		a.stop(true)
+		return nil, nil, nil, context.Cause(streamCtx)
+	case r := <-ch:
+		a.stop(true)
+		if cause := context.Cause(streamCtx); cause != nil {
+			go closeUnusedHTTPInterceptStream(streamCtx, r.stream)
+			return nil, nil, nil, cause
+		}
+		if r.err != nil {
+			cancel(nil)
+			go closeUnusedHTTPInterceptStream(streamCtx, r.stream)
+			return nil, nil, nil, r.err
+		}
+		return r.stream, streamCtx, cancel, nil
+	}
+}
+
+func closeUnusedHTTPInterceptStream(ctx context.Context, stream tunnel.Stream) {
+	if stream != nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), httpInterceptConnectionTimeout)
+		defer cancel()
+		_ = stream.CloseSend(ctx)
+	}
+}
+
+// The gRPC stream can be established before the developer has connected its local
+// TCP target. That final acknowledgment is also setup, not application response
+// time, and must complete before net/http announces GotConn and drops the budget.
+func awaitHTTPInterceptDial(ctx context.Context, stream tunnel.Stream) error {
+	m, err := stream.Receive(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: waiting for the developer connection: %w", errClientStream, err)
+	}
+	switch m.Code() {
+	case tunnel.DialOK:
+		return nil
+	case tunnel.DialReject:
+		return fmt.Errorf("%w: developer connection was rejected", errClientStream)
+	default:
+		return fmt.Errorf("%w: unexpected developer connection setup message %s", errClientStream, m.Code())
+	}
+}
+
+type httpInterceptStreamConn struct {
+	net.Conn
+	cancel            context.CancelCauseFunc
+	once              sync.Once
+	err               error
+	retryWriteBlocked atomic.Bool
+}
+
+func (c *httpInterceptStreamConn) Write(p []byte) (int, error) {
+	if c.retryWriteBlocked.Load() {
+		return 0, errHTTPInterceptRetryLimit
+	}
+	return c.Conn.Write(p)
+}
+
+func (c *httpInterceptStreamConn) Close() error {
+	c.once.Do(func() {
+		defer c.cancel(nil)
+		c.err = c.Conn.Close()
+	})
+	return c.err
 }
 
 type metricsReportingConn struct {
@@ -152,9 +476,43 @@ func (f *tcp) acceptHTTPLoop(ctx context.Context, listener net.Listener) {
 	if f.targetUsesTLS(ctx) {
 		scheme = "https"
 	}
-	defaultHandler := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: scheme, Host: f.Target().String()})
+	targetURL := &url.URL{Scheme: scheme, Host: f.Target().String()}
+	defaultHandler := httputil.NewSingleHostReverseProxy(targetURL)
 	defaultHandler.ErrorHandler = proxyErrorHandler
 	defaultHandler.Transport = f.configureTransport(ctx, false)
+	if f.permanentHTTP && scheme == "https" {
+		// Permanent mediation also proxies non-intercepted TLS traffic. Preserve
+		// the original downstream SNI when verifying the real application's
+		// certificate and keep connection pools separate for different SNI names;
+		// the actual socket destination remains pinned to the configured app.
+		trn := f.configureUpstreamTransport(ctx, false)
+		trn.Proxy = nil // the virtual SNI name must never turn the pinned app dial into an HTTP CONNECT proxy request
+		dial := trn.DialContext
+		trn.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dial(ctx, network, f.Target().String())
+		}
+		defaultHandler = &httputil.ReverseProxy{
+			Transport:    trn,
+			ErrorHandler: proxyErrorHandler,
+			Rewrite: func(r *httputil.ProxyRequest) {
+				host := r.In.Host
+				if r.In.TLS != nil && r.In.TLS.ServerName != "" {
+					host = r.In.TLS.ServerName
+				} else if name, _, err := net.SplitHostPort(host); err == nil {
+					host = name
+				} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+					host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+				}
+				r.SetURL(targetURL)
+				r.Out.Host = r.In.Host
+				r.Out.URL.RawQuery = r.In.URL.RawQuery
+				preserveStagingForwardedHeaders(r.In, r.Out)
+				if host != "" {
+					r.Out.URL.Host = net.JoinHostPort(host, "443")
+				}
+			},
+		}
+	}
 
 	server := &http.Server{
 		BaseContext: func(_ net.Listener) context.Context {
@@ -187,64 +545,112 @@ func (f *tcp) acceptHTTPLoop(ctx context.Context, listener net.Listener) {
 	}
 }
 
+// Preserve the forwarding headers and original Host sent by the plain staging
+// proxy when a TLS request requires per-request upstream SNI rewriting.
+func preserveStagingForwardedHeaders(in, out *http.Request) {
+	for _, key := range []string{"Forwarded", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+		if values, ok := in.Header[key]; ok && !stagingConnectionHeader(in, key) {
+			out.Header[key] = append([]string(nil), values...)
+		}
+	}
+	const forwardedFor = "X-Forwarded-For"
+	prior, present := in.Header[forwardedFor]
+	if stagingConnectionHeader(in, forwardedFor) {
+		prior, present = nil, false
+	} else if present {
+		out.Header[forwardedFor] = append([]string(nil), prior...)
+	}
+	if clientIP, _, err := net.SplitHostPort(in.RemoteAddr); err == nil {
+		if present && prior == nil {
+			return
+		}
+		if len(prior) > 0 {
+			clientIP = strings.Join(prior, ", ") + ", " + clientIP
+		}
+		out.Header.Set(forwardedFor, clientIP)
+	}
+}
+
+func stagingConnectionHeader(req *http.Request, header string) bool {
+	for _, value := range req.Header.Values("Connection") {
+		for token := range strings.SplitSeq(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), header) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (f *tcp) handleHTTPRequest(writer http.ResponseWriter, req *http.Request, defaultHandler http.Handler) {
 	// Copy wiretaps and intercepts to avoid holding a lock during request processing
 	f.mu.Lock()
 	wtIntercepts := f.wiretaps.sorted()
 	intercepts := f.intercepts.sorted()
+	routingKey := req.Header.Get(localRoutingKeyHeader)
+	guards := f.routeGuards[routingKey]
+	guardRoutes := f.guardRoutes
+	unknownStartupKey := f.permanentHTTP && !f.routeSnapshotInstalled && routingKey != ""
+	pendingRoute := false
+	if routingKey != "" {
+		for _, pending := range f.pendingGuards {
+			if pending.RoutingKey == routingKey {
+				pendingRoute = true
+				break
+			}
+		}
+	}
 	f.mu.Unlock()
 
 	clog.Debugf(f.lCtx, "Handling %s %s %s", req.Proto, req.Method, req.URL.Path)
+	if unknownStartupKey {
+		// A new process cannot distinguish a developer key from an unrelated key
+		// before its first authoritative snapshot. Cached mesh endpoints can still
+		// reach this not-yet-Ready Pod; never send a keyed request on to staging.
+		writeHTTPInterceptUnavailable(writer)
+		return
+	}
 	src, err := netip.ParseAddrPort(req.RemoteAddr)
 	if err != nil {
 		src = netip.AddrPortFrom(netip.IPv4Unspecified(), 0)
 	}
 
-	// Check each intercept to see if it matches this request
-	// No precedence here because taps are not conflicting.
-	if len(wtIntercepts) > 0 {
-		wts := make([]*interceptController, 0, len(wtIntercepts))
-		for _, ic := range wtIntercepts {
-			spec := ic.Spec
-			if shouldInterceptRequest(req, spec.HeaderFilters, spec.PathFilters) {
-				wts = append(wts, ic)
-			}
-		}
-		if tapCount := len(wts); tapCount > 0 {
-			taps, tapReader, err := addRequestTaps(f.lCtx, req, tapCount, wiretapCacheSize)
-			if err != nil {
-				clog.Errorf(f.lCtx, "Failed to add request taps: %v", err)
-			} else {
-				// A wiretap is lossy and best-effort and must never block or
-				// delay the real request. Nothing guarantees the request body
-				// is ever read (a bodyless GET is never read by
-				// httputil.ReverseProxy), so closeTaps is called unconditionally
-				// once the request has been served, regardless of which return
-				// path was taken and regardless of whether the body was read.
-				// It is idempotent, so it is harmless if the body was already
-				// read to completion (which independently sends the taps a
-				// terminal EOF) or the server itself later closes the body.
-				// The tap goroutines below are intentionally not awaited: they
-				// finish shortly after the handler returns, bounded by the
-				// per-intercept context and the pipe closing.
-				defer tapReader.closeTaps()
-				for i, ii := range wts {
-					go func(tap io.Reader, ii *interceptController) {
-						f.serveTap(ii.ctx, src, tap, ii.InterceptInfo)
-					}(taps[i], ii)
+	if closeTaps := f.tapHTTPRequest(req, src, wtIntercepts); closeTaps != nil {
+		defer closeTaps()
+	}
+
+	// A durable exact route takes priority over every other intercept and staging.
+	// Its owner/incarnation must still match the live route; otherwise the local
+	// target is recovering and forwarding to any other destination is incorrect.
+	if len(guards) > 0 {
+		for _, guard := range guards {
+			for _, ic := range intercepts {
+				if ic.Id == guard.InterceptID && ic.RouteIncarnation == guard.Incarnation &&
+					shouldInterceptRequest(req, ic.Spec.HeaderFilters, ic.Spec.PathFilters) {
+					f.serveHTTPIntercept(ic.ctx, src, writer, req, ic.InterceptInfo, true)
+					return
 				}
 			}
 		}
+		writeHTTPInterceptUnavailable(writer)
+		return
+	}
+	if pendingRoute {
+		writeHTTPInterceptUnavailable(writer)
+		return
 	}
 
 	// Pass 1: Check intercepts with headers (high-priority tier)
 	for _, ic := range intercepts {
+		if guardRoutes && ic.RouteIncarnation != "" {
+			continue // this route was removed or was not in the authoritative list
+		}
 		spec := ic.Spec
 		if len(spec.HeaderFilters) > 0 {
 			if shouldInterceptRequest(req, spec.HeaderFilters, spec.PathFilters) {
 				clog.Debugf(f.lCtx, "Intercepting HTTP request %s %s with header-based intercept %s",
 					req.Method, req.URL.Path, ic.Id)
-				f.serveHTTPIntercept(ic.ctx, src, writer, req, ic.InterceptInfo, defaultHandler)
+				f.serveHTTPIntercept(ic.ctx, src, writer, req, ic.InterceptInfo, false)
 				return
 			}
 		}
@@ -252,17 +658,61 @@ func (f *tcp) handleHTTPRequest(writer http.ResponseWriter, req *http.Request, d
 
 	// Pass 2: Check intercepts with only paths (low-priority tier)
 	for _, ic := range intercepts {
+		if guardRoutes && ic.RouteIncarnation != "" {
+			continue
+		}
 		spec := ic.Spec
 		if len(spec.HeaderFilters) == 0 && len(spec.PathFilters) > 0 {
 			if shouldInterceptRequest(req, spec.HeaderFilters, spec.PathFilters) {
 				clog.Debugf(f.lCtx, "Intercepting HTTP request %s %s with path-based intercept %s",
 					req.Method, req.URL.Path, ic.Id)
-				f.serveHTTPIntercept(ic.ctx, src, writer, req, ic.InterceptInfo, defaultHandler)
+				f.serveHTTPIntercept(ic.ctx, src, writer, req, ic.InterceptInfo, false)
+				return
+			}
+		}
+	}
+	// A permanently HTTP-mediated port also accepts the historical full-port
+	// intercepts. Its connections can no longer be diverted through raw TCP, so
+	// apply an unfiltered intercept to every remaining HTTP request here.
+	if f.permanentHTTP {
+		for _, ic := range intercepts {
+			if !ic.isHTTP() && (!guardRoutes || ic.RouteIncarnation == "") {
+				f.serveHTTPIntercept(ic.ctx, src, writer, req, ic.InterceptInfo, false)
 				return
 			}
 		}
 	}
 	defaultHandler.ServeHTTP(writer, req)
+}
+
+func (f *tcp) tapHTTPRequest(req *http.Request, src netip.AddrPort, wtIntercepts []*interceptController) func() {
+	// Taps have no precedence because they are not conflicting.
+	var matching []*interceptController
+	for _, ic := range wtIntercepts {
+		spec := ic.Spec
+		if shouldInterceptRequest(req, spec.HeaderFilters, spec.PathFilters) {
+			matching = append(matching, ic)
+		}
+	}
+	if len(matching) == 0 {
+		return nil
+	}
+	taps, tapReader, err := addRequestTaps(f.lCtx, req, len(matching), wiretapCacheSize)
+	if err != nil {
+		clog.Errorf(f.lCtx, "Failed to add request taps: %v", err)
+		return nil
+	}
+	// Wiretaps must never delay the real request. The caller unconditionally
+	// closes them after serving the request, even when the body is never read;
+	// completing the body or closing it later independently is also harmless.
+	// The goroutines finish after the handler returns and are bounded by the
+	// intercept context and the pipe closing.
+	for i, ii := range matching {
+		go func(tap io.Reader, ii *interceptController) {
+			f.serveTap(ii.ctx, src, tap, ii.InterceptInfo)
+		}(taps[i], ii)
+	}
+	return tapReader.closeTaps
 }
 
 func shouldInterceptRequest(req *http.Request, headerFilters map[string]string, pathFilters []string) bool {
@@ -375,12 +825,20 @@ func (f *tcp) getHTTPInterceptTransport(
 			egressBytes = tunnel.NewCounterProbe("ToClientBytes")
 		}
 
-		s, err := f.createStream(dialCtx, di.src, di.ii)
+		tunnelSource := uniqueHTTPInterceptTunnelSource(di.src)
+		clog.Debugf(dialCtx, "HTTP selected intercept tunnel for request source %s uses correlation source %s", di.src, tunnelSource)
+		s, streamCtx, cancel, err := dialHTTPInterceptStream(dialCtx, httpInterceptConnectionTimeout, func(ctx context.Context) (tunnel.Stream, error) {
+			stream, err := f.createStream(ctx, tunnelSource, di.ii)
+			if err == nil {
+				err = awaitHTTPInterceptDial(ctx, stream)
+			}
+			return stream, err
+		})
 		if err != nil {
 			return nil, err
 		}
 		// Ingress and egress swap places here because this is a connection where the stream is attached to a connection *to* the client, not *from* the client.
-		conn := tunnel.NewStreamConn(dialCtx, s, egressBytes, ingressBytes)
+		conn := &httpInterceptStreamConn{Conn: tunnel.NewStreamConn(streamCtx, s, egressBytes, ingressBytes), cancel: cancel}
 		if !metricsEnabled {
 			return conn, nil
 		}
@@ -397,7 +855,7 @@ func (f *tcp) getHTTPInterceptTransport(
 	}
 
 	scheme := "http"
-	if trn.Protocols.HTTP2() {
+	if trn.Protocols.HTTP2() || (f.permanentHTTP && !spec.Plaintext && f.targetUsesTLS(ctx)) {
 		scheme = "https"
 	}
 	hit := &httpInterceptTransport{
@@ -450,7 +908,7 @@ func (f *tcp) serveHTTPIntercept(
 	writer http.ResponseWriter,
 	request *http.Request,
 	ii *manager.InterceptInfo,
-	defaultHandler http.Handler,
+	protected bool,
 ) {
 	hit := f.getHTTPInterceptTransport(ctx, ii, request.ProtoMajor)
 	spec := ii.Spec
@@ -496,15 +954,19 @@ func (f *tcp) serveHTTPIntercept(
 	}
 	targetProxy := httputil.NewSingleHostReverseProxy(hit.targetURL)
 	targetProxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		if req.Context().Err() != nil {
+			clog.Debugf(ctx, "HTTP selected intercept request canceled downstream for request=%d %s %s: %v", requestID, req.Method, req.URL.Path, err)
+			return
+		}
 		if errors.Is(err, errClientStream) {
-			clog.Warnf(ctx, "HTTP selected intercept tunnel unavailable for request=%d %s %s; failing open to app container: %v", requestID, req.Method, req.URL.Path, err)
-			defaultHandler.ServeHTTP(rw, req)
+			clog.Warnf(ctx, "HTTP selected intercept tunnel unavailable for request=%d %s %s: %v", requestID, req.Method, req.URL.Path, err)
+			writeHTTPInterceptUnavailable(rw)
 			return
 		}
 		clog.Warnf(ctx, "HTTP selected intercept proxy error for request=%d %s %s: %v", requestID, req.Method, req.URL.Path, err)
 		proxyErrorHandler(rw, req, err)
 	}
-	targetProxy.Transport = hit.transport
+	targetProxy.Transport = httpConnectionAcquisitionTransport{transport: hit.transport, timeout: httpInterceptConnectionTimeout, protected: protected}
 	request = ensureGRPCTrailersHeader(request)
 	request = request.WithContext(context.WithValue(request.Context(), httpInterceptDialContextKey{}, &httpInterceptDialContext{
 		src: src,
@@ -518,9 +980,10 @@ func (f *tcp) serveHTTPIntercept(
 	if statusCode == 0 {
 		statusCode = -1
 	}
-	if slowLogged.Load() || duration > httpInterceptSlowAfter || statusCode == -1 {
+	missingResponse := statusCode == -1 && request.Context().Err() == nil
+	if slowLogged.Load() || duration > httpInterceptSlowAfter || missingResponse {
 		logFn := clog.Infof
-		if duration > httpInterceptVerySlow || statusCode == -1 {
+		if duration > httpInterceptVerySlow || missingResponse {
 			logFn = clog.Warnf
 		}
 		logFn(
@@ -544,6 +1007,16 @@ func (f *tcp) serveHTTPIntercept(
 }
 
 func proxyErrorHandler(rw http.ResponseWriter, _ *http.Request, err error) {
+	writeHTTPProxyError(rw, http.StatusBadGateway, err)
+}
+
+func writeHTTPInterceptUnavailable(rw http.ResponseWriter) {
+	rw.Header().Set("Retry-After", "1")
+	rw.Header().Set("Cache-Control", "no-store")
+	writeHTTPProxyError(rw, http.StatusServiceUnavailable, errors.New("telepresence intercept is temporarily unavailable"))
+}
+
+func writeHTTPProxyError(rw http.ResponseWriter, status int, err error) {
 	type httpError struct {
 		Error string `json:"error"`
 	}
@@ -551,7 +1024,7 @@ func proxyErrorHandler(rw http.ResponseWriter, _ *http.Request, err error) {
 	b, _ := json.Marshal(h)
 	rw.Header().Set("Content-Type", "application/json")
 	rw.Header().Set("Content-Length", fmt.Sprintf("%d", len(b)))
-	rw.WriteHeader(http.StatusBadGateway)
+	rw.WriteHeader(status)
 	_, _ = rw.Write(b)
 }
 

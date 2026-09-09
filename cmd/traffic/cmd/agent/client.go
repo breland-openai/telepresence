@@ -61,11 +61,12 @@ const (
 )
 
 type interceptReadiness struct {
-	mu           sync.Mutex
-	synchronized bool
-	generation   uint64
-	initialSync  chan struct{}
-	initialOnce  sync.Once
+	mu            sync.Mutex
+	synchronized  bool
+	authoritative bool
+	generation    uint64
+	initialSync   chan struct{}
+	initialOnce   sync.Once
 }
 
 type interceptSnapshot struct {
@@ -91,6 +92,10 @@ func (s *interceptReadinessStream[T]) Recv() (*T, error) {
 
 func newInterceptReadiness() *interceptReadiness {
 	return &interceptReadiness{initialSync: make(chan struct{})}
+}
+
+func newAuthoritativeRouteReadiness() *interceptReadiness {
+	return &interceptReadiness{initialSync: make(chan struct{}), authoritative: true}
 }
 
 func (r *interceptReadiness) currentGeneration() uint64 {
@@ -133,8 +138,13 @@ func (r *interceptReadiness) setUnsynchronized(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.synchronized = false
 	r.generation++
+	if r.authoritative && r.synchronized {
+		// The process still has its last complete set of route guards. Unrelated
+		// staging traffic can continue and unavailable local routes fail closed.
+		return nil
+	}
+	r.synchronized = false
 	if err := dos.Remove(ctx, readyFile); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -151,7 +161,11 @@ func (r *interceptReadiness) awaitInitialSync(ctx context.Context, timeout time.
 	case <-ctx.Done():
 		return nil
 	case <-timer.C:
-		clog.Warnf(ctx, "traffic-agent has not synchronized its initial intercept snapshot within %s; continuing to wait", timeout)
+		if r.authoritative {
+			clog.Warnf(ctx, "traffic-agent has not received authoritative initial route intent within %s; remaining unready", timeout)
+		} else {
+			clog.Warnf(ctx, "traffic-agent has not synchronized its initial intercept snapshot within %s; continuing to wait", timeout)
+		}
 	}
 
 	select {
@@ -180,6 +194,9 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	readiness := newInterceptReadiness()
+	if state != nil && state.AgentConfig().RequireAuthoritativeRoutes {
+		readiness = state.RouteReadiness()
+	}
 	if err := readiness.setUnsynchronized(ctx); err != nil {
 		return fmt.Errorf("clear traffic-agent readiness: %w", err)
 	}
@@ -255,10 +272,10 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 			clog.Errorf(ctx, "clear traffic-agent readiness: %v", err)
 		}
 
-		// Reset state by processing an empty snapshot
-		// - clear out any intercepts
-		// - set forwarding to the app
-		state.HandleIntercepts(ctx, nil)
+		if !readiness.authoritative {
+			// Legacy managers have no durable route list to retain.
+			state.HandleIntercepts(ctx, nil)
+		}
 
 		// Depart session
 		if sessionLost == nil {
@@ -281,6 +298,11 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 	wg.Go("handleIntercept", func(ctx context.Context) error {
 		return handleInterceptLoop(ctx, manager, session, snapshots, state, readiness)
 	})
+	if readiness.authoritative {
+		wg.Go("routeIntentWatch", func(ctx context.Context) error {
+			return routeIntentWatchLoop(ctx, manager, session, state, retryInterval, readiness)
+		})
+	}
 	wg.Go("remain", func(ctx context.Context) error {
 		err := remainLoop(ctx, manager, session)
 		if status.Code(err) == codes.NotFound {
@@ -340,8 +362,10 @@ func interceptWatchLoop(
 	// Call WatchIntercepts and publish the snapshots on the channel
 	snapMap := make(map[string]*rpc.InterceptInfo)
 	reconnectAgent := func() error {
-		if err := readiness.setUnsynchronized(ctx); err != nil {
-			return err
+		if !readiness.authoritative {
+			if err := readiness.setUnsynchronized(ctx); err != nil {
+				return err
+			}
 		}
 		clear(snapMap)
 		_, err := manager.ReconnectAgent(ctx, &rpc.ReconnectAgentRequest{
@@ -355,6 +379,9 @@ func interceptWatchLoop(
 			stream, err := manager.WatchInterceptsDelta(ctx, session)
 			if err != nil {
 				return nil, err
+			}
+			if readiness.authoritative {
+				return stream, nil
 			}
 			return &interceptReadinessStream[rpc.InterceptInfoDelta]{
 				ServerStreamingClient: stream,
@@ -377,6 +404,9 @@ func interceptWatchLoop(
 				stream, err := manager.WatchIntercepts(ctx, session)
 				if err != nil {
 					return nil, err
+				}
+				if readiness.authoritative {
+					return stream, nil
 				}
 				return &interceptReadinessStream[rpc.InterceptInfoSnapshot]{
 					ServerStreamingClient: stream,
@@ -441,8 +471,10 @@ func handleInterceptLoop(
 		case snapshot := <-snapshots:
 			clog.Debugf(ctx, "HandleIntercepts %s", interceptsStringer(snapshot.intercepts))
 			reviews := state.HandleIntercepts(ctx, snapshot.intercepts)
-			if err := readiness.setSynchronized(ctx, snapshot.generation); err != nil {
-				return err
+			if !readiness.authoritative {
+				if err := readiness.setSynchronized(ctx, snapshot.generation); err != nil {
+					return err
+				}
 			}
 			for _, review := range reviews {
 				review.Session = session

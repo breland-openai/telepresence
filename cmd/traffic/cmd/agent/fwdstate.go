@@ -33,6 +33,9 @@ func generateMechanismDescription(spec *manager.InterceptSpec) string {
 // NewInterceptState creates an InterceptState that performs intercepts by using an Interceptor which indiscriminately
 // intercepts all traffic to the port that it forwards.
 func (s *state) NewInterceptState(forwarder fwd.Interceptor, intercept agentconfig.InterceptTarget, container string) InterceptState {
+	if s.AgentConfig().RequireAuthoritativeRoutes {
+		forwarder.SetRouteGuards(nil, nil)
+	}
 	return &fwdState{
 		state:     s,
 		intercept: intercept,
@@ -40,6 +43,14 @@ func (s *state) NewInterceptState(forwarder fwd.Interceptor, intercept agentconf
 		forwarder: forwarder,
 	}
 }
+
+func (fs *fwdState) setRouteGuards(desired, removed []fwd.RouteGuard) {
+	fs.forwarder.SetRouteGuards(desired, removed)
+}
+
+func (fs *fwdState) supportsRouteGuards() bool { return fs.forwarder.SupportsHTTPRouteGuards() }
+
+func (fs *fwdState) markRouteSnapshotInstalled() { fs.forwarder.MarkRouteSnapshotInstalled() }
 
 func (fs *fwdState) Target() agentconfig.InterceptTarget {
 	return fs.intercept
@@ -207,10 +218,23 @@ func (fs *fwdState) HandlePort(ctx context.Context, cepts []*manager.InterceptIn
 		}
 	}
 
-	fwd := fs.forwarder
+	portForwarder := fs.forwarder
 	if fs.SessionInfo() != nil {
 		// Update forwarding.
-		fwd.SetStreamProvider(fs)
+		portForwarder.SetStreamProvider(fs)
+	}
+	if fs.AgentConfig().RequireAuthoritativeRoutes && fs.forwarder.SupportsHTTPRouteGuards() {
+		// Installing these provisional guards before reviews prevents the separate
+		// durable route stream from lagging behind this agent's ACTIVE approval.
+		var pending []fwd.RouteGuard
+		for _, runtime := range cepts {
+			if runtime.Disposition == manager.InterceptDispositionType_WAITING || runtime.Disposition == manager.InterceptDispositionType_ACTIVE {
+				if guard, ok := provisionalRouteGuard(runtime); ok {
+					pending = append(pending, guard)
+				}
+			}
+		}
+		portForwarder.SetPendingRouteGuards(pending)
 	}
 
 	// Check if we have HTTP intercepts (any with HeaderFilters or PathFilters)
@@ -222,8 +246,8 @@ func (fs *fwdState) HandlePort(ctx context.Context, cepts []*manager.InterceptIn
 			intercepts = append(intercepts, is)
 		}
 	}
-	fwd.SetWiretapping(wiretaps)
-	fwd.SetIntercepting(intercepts)
+	portForwarder.SetWiretapping(wiretaps)
+	portForwarder.SetIntercepting(intercepts)
 
 	// Review waiting intercepts
 	reviews := make([]*manager.ReviewInterceptRequest, 0, len(waiting))

@@ -75,15 +75,28 @@ type Config struct {
 // that pass-through dials use, and the mesh dial subnets are carried
 // over.
 func ConfigFor(sc *agentconfig.Sidecar, loopback string, podIP netip.Addr, owner OwnerMatch) Config {
+	return configFor(sc, loopback, podIP, owner, false)
+}
+
+// ConfigForSidecar leaves named non-HTTP ports alone when only strict HTTP
+// protection required the pod's ruleset.
+func ConfigForSidecar(sc *agentconfig.Sidecar, loopback string, podIP netip.Addr, owner OwnerMatch) Config {
+	return configFor(sc, loopback, podIP, owner, true)
+}
+
+func configFor(sc *agentconfig.Sidecar, loopback string, podIP netip.Addr, owner OwnerMatch, sidecar bool) Config {
 	var intercepts []Intercept
 	for _, cn := range sc.Containers {
 		for _, ic := range agentconfig.PortUniqueIntercepts(cn) {
+			if sidecar && sc.RequireAuthoritativeRoutes && !sc.NftRedirectsPort(ic.ContainerPort, ic.Protocol) {
+				continue
+			}
 			nic := Intercept{
 				Protocol:      ic.Protocol,
 				ContainerPort: ic.ContainerPort,
 				AgentPort:     ic.AgentPort,
 			}
-			if ic.TargetPortNumeric {
+			if ic.TargetPortNumeric || sc.RouteIntentPortRedirect(ic.ContainerPort, ic.Protocol) {
 				nic.ProxyPort = sc.ProxyPort(ic.AgentPort)
 			}
 			intercepts = append(intercepts, nic)
