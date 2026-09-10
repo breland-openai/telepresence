@@ -12,6 +12,7 @@ permissions:
 # experiment; without it `go list -deps` excludes those files and fails.
 env:
   GOEXPERIMENT: jsonv2
+  GOTOOLCHAIN: local
 
 jobs:
   go-action-detection:
@@ -23,7 +24,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
-          go-version: stable
+          go-version: '1.26.3'
       # generates the embedded dc-cli.json that the build target imports
       - name: "Build dependencies"
         run: make build-deps

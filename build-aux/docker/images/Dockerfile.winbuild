@@ -1,6 +1,7 @@
 FROM golang:1.26.3
 
 ENV GOEXPERIMENT=jsonv2
+ENV GOTOOLCHAIN=local
 
 RUN apt-get update && \
     apt-get install -y \

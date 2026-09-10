@@ -5,10 +5,12 @@ runs:
   steps:
     - uses: actions/setup-go@v6
       with:
-        go-version: stable
+        go-version: '1.26.3'
     - name: enable JSON v2
       shell: bash
-      run: echo "GOEXPERIMENT=jsonv2" >> "$GITHUB_ENV"
+      run: |
+        echo "GOEXPERIMENT=jsonv2" >> "$GITHUB_ENV"
+        echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
     - if: runner.os == 'Linux'
       name: install Linux dependencies
       shell: bash
