@@ -407,7 +407,6 @@ func serveMutatingFunc(ctx context.Context, r *http.Request, mf mutatorFunc) ([]
 		applyMutatorError(&response, err)
 	} else if patchOps != nil {
 		// Otherwise, encode the patch operations to JSON and return a positive response.
-		//nolint:govet // This JSON v2 option is available with GOEXPERIMENT=jsonv2 in Go 1.26.
 		patchBytes, err := json.Marshal(patchOps, jsonv1.OmitEmptyWithLegacySemantics(true), json.FormatNilSliceAsNull(true))
 		if err != nil {
 			return nil, http.StatusInternalServerError, fmt.Errorf("could not marshal JSON patch: %v", err)

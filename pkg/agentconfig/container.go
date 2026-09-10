@@ -177,7 +177,10 @@ func (a *ContainerBuilder) AgentContainer(ctx context.Context) (*core.Container,
 		}
 	})
 
-	cfg, _ := MarshalTight(a.Config)
+	cfg, err := MarshalTight(a.Config)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to marshal agent config for %s.%s: %w", a.Config.WorkloadName, a.Config.Namespace, err)
+	}
 	anns[annotation.Config] = cfg
 
 	if len(ports) == 0 {

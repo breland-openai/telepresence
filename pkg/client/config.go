@@ -347,21 +347,21 @@ type Timeouts struct {
 	// These all nave names starting with "Private" because we "want" them to be unexported to force you to
 	// use .TimeoutContext(), but we dont' want them to be hidden from the JSON/YAML engines.
 
-	PrivateClusterConnect        time.Duration `json:"clusterConnect,format:units"`
-	PrivateConnectivityCheck     time.Duration `json:"connectivityCheck,format:units"`
-	PrivateEndpointDial          time.Duration `json:"endpointDial,format:units"`
-	PrivateHelm                  time.Duration `json:"helm,format:units"`
-	PrivateIntercept             time.Duration `json:"intercept,format:units"`
-	PrivateInterceptEndpointDial time.Duration `json:"interceptEndpointDial,format:units"`
-	PrivateRoundtripLatency      time.Duration `json:"roundtripLatency,format:units"`
-	PrivateProxyDial             time.Duration `json:"proxyDial,format:units"`
-	PrivateTrafficAgentConnect   time.Duration `json:"trafficAgentConnect,format:units"`
-	PrivateTrafficManagerAPI     time.Duration `json:"trafficManagerAPI,format:units"`
-	PrivateTrafficManagerConnect time.Duration `json:"trafficManagerConnect,format:units"`
-	PrivateTrafficAgentArrival   time.Duration `json:"trafficAgentArrival,format:units"` // Deprecated.
-	PrivateFtpReadWrite          time.Duration `json:"ftpReadWrite,format:units"`
-	PrivateFtpShutdown           time.Duration `json:"ftpShutdown,format:units"`
-	PrivateContainerShutdown     time.Duration `json:"containerShutdown,format:units"`
+	PrivateClusterConnect        time.Duration `json:"clusterConnect"`
+	PrivateConnectivityCheck     time.Duration `json:"connectivityCheck"`
+	PrivateEndpointDial          time.Duration `json:"endpointDial"`
+	PrivateHelm                  time.Duration `json:"helm"`
+	PrivateIntercept             time.Duration `json:"intercept"`
+	PrivateInterceptEndpointDial time.Duration `json:"interceptEndpointDial"`
+	PrivateRoundtripLatency      time.Duration `json:"roundtripLatency"`
+	PrivateProxyDial             time.Duration `json:"proxyDial"`
+	PrivateTrafficAgentConnect   time.Duration `json:"trafficAgentConnect"`
+	PrivateTrafficManagerAPI     time.Duration `json:"trafficManagerAPI"`
+	PrivateTrafficManagerConnect time.Duration `json:"trafficManagerConnect"`
+	PrivateTrafficAgentArrival   time.Duration `json:"trafficAgentArrival"` // Deprecated.
+	PrivateFtpReadWrite          time.Duration `json:"ftpReadWrite"`
+	PrivateFtpShutdown           time.Duration `json:"ftpShutdown"`
+	PrivateContainerShutdown     time.Duration `json:"containerShutdown"`
 }
 
 type TimeoutID int
@@ -787,13 +787,13 @@ type Grpc struct {
 
 	// SimulateDisconnect can be set to a duration to simulate a disconnect some time after connecting.
 	// Intended for debugging purposes only.
-	SimulateDisconnect time.Duration `json:"simulateDisconnect,format:units"`
+	SimulateDisconnect time.Duration `json:"simulateDisconnect"`
 
 	// PingInterval is the interval between "remain" pings that the client makes to the traffic-manager.
-	PingInterval time.Duration `json:"pingInterval,format:units"`
+	PingInterval time.Duration `json:"pingInterval"`
 
 	// WatchRetryInterval is the interval between retries that a watcher uses when the gRPC connection to the traffic-manager is lost.
-	WatchRetryInterval time.Duration `json:"watchRetryInterval,format:units"`
+	WatchRetryInterval time.Duration `json:"watchRetryInterval"`
 }
 
 var defaultGrpc = Grpc{ //nolint:gochecknoglobals // constant
@@ -859,7 +859,7 @@ type Intercept struct {
 	LocalShortcut         bool          `json:"localShortcut"`
 	LocalShortcutIsGlobal bool          `json:"localShortcutIsGlobal"`
 	MountsRoot            string        `json:"mountsRoot"`
-	MountCompletionDelay  time.Duration `json:"mountCompletionDelay,format:units"`
+	MountCompletionDelay  time.Duration `json:"mountCompletionDelay"`
 }
 
 func (ic *Intercept) defaults() DefaultsAware {
@@ -1138,7 +1138,7 @@ type Routing struct {
 	OldAllowConflicting []netip.Prefix `json:"allowConflicting,omitempty"`
 
 	// Deprecated: no longer used. Use the route-controller DaemonSet instead.
-	RecursionBlockDuration time.Duration `json:"recursionBlockDuration,omitempty,format:units"`
+	RecursionBlockDuration time.Duration `json:"recursionBlockDuration,omitempty"`
 	// Deprecated: no longer used. Use the route-controller DaemonSet instead.
 	RecursionBlockTreads int `json:"recursionBlockTreads,omitempty"`
 }
@@ -1465,7 +1465,7 @@ type DNS struct {
 	ExcludeSuffixes              []string         `json:"excludeSuffixes"`
 	Excludes                     []string         `json:"excludes"`
 	Mappings                     DNSMappings      `json:"mappings"`
-	LookupTimeout                time.Duration    `json:"lookupTimeout,format:units"`
+	LookupTimeout                time.Duration    `json:"lookupTimeout"`
 	RecursionCheck               bool             `json:"recursionCheck"`
 	UseComplexLookup             bool             `json:"useComplexLookup"`
 	PreserveLocalClusterDNS      bool             `json:"preserveLocalClusterDNS"`
@@ -1481,7 +1481,7 @@ type DNSSnake struct {
 	ExcludeSuffixes              []string         `json:"exclude_suffixes"`
 	Excludes                     []string         `json:"excludes"`
 	Mappings                     DNSMappings      `json:"mappings"`
-	LookupTimeout                time.Duration    `json:"lookup_timeout,format:units"`
+	LookupTimeout                time.Duration    `json:"lookup_timeout"`
 	RecursionCheck               bool             `json:"recursion_check"`
 	UseComplexLookup             bool             `json:"use_complex_lookup"`
 	PreserveLocalClusterDNS      bool             `json:"preserve_local_cluster_dns"`

@@ -2127,7 +2127,6 @@ matchExpressions:
 				if expectedPatch != "null\n" {
 					expectedPatch = fmt.Sprintf(expectedPatch, cfgJSON)
 				}
-				//nolint:govet // This JSON v2 option is available with GOEXPERIMENT=jsonv2 in Go 1.26.
 				patchBytes, err := json.Marshal(actualPatch, json.Deterministic(true), jsonv1.OmitEmptyWithLegacySemantics(true), json.FormatNilSliceAsNull(true))
 				require.NoError(t, err)
 				patchBytes, err = yaml.JSONToYAML(patchBytes)
