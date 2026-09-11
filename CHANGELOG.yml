@@ -28,6 +28,14 @@ items:
     date: (TBD)
     notes:
       - type: bugfix
+        title: Reject intercepts without a reverse connection to the traffic-agent
+        body: >-
+          The client now refuses to create an intercept or replacement if the
+          session does not watch traffic-agents in the target namespace.
+          It explains how to check Kubernetes port-forward permission and
+          reconnect, instead of redirecting requests that cannot reach the
+          local service.
+      - type: bugfix
         title: Recover DNS after interrupted root daemon sessions
         body: >-
           On Linux, root daemon startup removes recognized stale DNS redirects
