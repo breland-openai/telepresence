@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -499,6 +500,22 @@ func requireAgentPortForward(ctx context.Context, kind string) error {
 	return nil
 }
 
+// requireInterceptAgentWatch verifies that the root daemon will receive the target
+// agents and start their reverse dial watchers. The traffic-manager may accept an
+// intercept without enforcing authorization; accepting it here would then redirect
+// traffic before this client has any way to receive it.
+func (s *session) requireInterceptAgentWatch(kind, namespace string) error {
+	if slices.Contains(s.agentPodWatchNamespaces(), namespace) {
+		return nil
+	}
+	return errcat.User.Newf(
+		"%s cannot receive traffic from namespace %q: this session does not watch its traffic-agents. "+
+			"Verify your Kubernetes permission with `kubectl auth can-i create pods/portforward --namespace %s` "+
+			"using the same kubeconfig context, then reconnect with --mapped-namespaces including %q. "+
+			"No intercept was created.",
+		kind, namespace, namespace, namespace)
+}
+
 func (s *session) CanIntercept(ctx context.Context, ir *rpc.CreateInterceptRequest) (userd.InterceptInfo, error) {
 	spec := ir.Spec
 	kind := "intercept"
@@ -518,6 +535,9 @@ func (s *session) CanIntercept(ctx context.Context, ir *rpc.CreateInterceptReque
 		)
 	} else {
 		spec.Namespace = ns
+	}
+	if err := s.requireInterceptAgentWatch(kind, spec.Namespace); err != nil {
+		return nil, err
 	}
 
 	if er := s.ensureNoInterceptConflict(ir); er != nil {

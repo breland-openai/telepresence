@@ -9,6 +9,12 @@ import { Note, Title, Body } from '@site/src/components/ReleaseNotes'
 # Telepresence Release Notes
 ## Version 2.32.0
 <Note>
+	<Title type="bugfix">Reject intercepts without a reverse connection to the traffic-agent</Title>
+	<Body>
+The client now refuses to create an intercept or replacement if the session does not watch traffic-agents in the target namespace. It explains how to check Kubernetes port-forward permission and reconnect, instead of redirecting requests that cannot reach the local service.
+  </Body>
+</Note>
+<Note>
 	<Title type="bugfix">Recover DNS after interrupted root daemon sessions</Title>
 	<Body>
 On Linux, root daemon startup removes recognized stale DNS redirects to unused local UDP endpoints before cluster authentication needs DNS. Reconnecting also waits for the previous session's workers and routing cleanup to finish, including when session initialization fails.
