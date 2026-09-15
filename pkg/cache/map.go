@@ -4,7 +4,6 @@ import (
 	"maps"
 	"math"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,7 +45,6 @@ type subscription[K comparable, V any] struct {
 	channel     chan Delta[K, V]
 	include     func(K, V) bool
 	initialized bool
-	mark        atomic.Bool
 	doneCh      <-chan struct{}
 	closed      bool
 }
@@ -62,6 +60,7 @@ func (sb *subscription[K, V]) close() {
 
 type Map[K comparable, V any] struct {
 	*xsync.Map[K, V]
+	notifyLock  sync.Mutex
 	snapLock    sync.Mutex
 	snapshot    map[K]V
 	equal       func(V, V) bool
@@ -102,12 +101,12 @@ func (m *Map[K, V]) Subscribe(done <-chan struct{}, includeFilter func(K, V) boo
 	default:
 		id := uuid.New()
 		sb := &subscription[K, V]{include: includeFilter, channel: ch, doneCh: done}
-		// Publish before snapshotting; hold the subscriber lock until its initial
-		// state is queued so concurrent updates are delivered afterward.
+		// Registration and the initial snapshot must precede every notifier
+		// snapshot that can deliver to this subscription.
 		sb.Lock()
+		m.snapLock.Lock()
 		m.subscribers.Store(id, sb)
 		snapshot := m.LoadAll()
-		m.snapLock.Lock()
 		if m.snapshot == nil {
 			m.snapshot = snapshot
 		}
@@ -145,11 +144,9 @@ func (m *Map[K, V]) Compute(key K, f func(V, bool) (V, xsync.ComputeOp)) (V, boo
 				op = xsync.CancelOp
 			} else {
 				modified = true
-				m.markSubscribers(key, fv)
 			}
 		case xsync.DeleteOp:
 			modified = true
-			m.markSubscribers(key, v)
 		}
 		return fv, op
 	})
@@ -268,30 +265,25 @@ func (m *Map[K, V]) Store(key K, value V) {
 	m.Compute(key, func(oldValue V, wasLoaded bool) (V, xsync.ComputeOp) { return value, xsync.UpdateOp })
 }
 
-// markSubscribers marks all subscribers interested in the given key and value binding.
-func (m *Map[K, V]) markSubscribers(key K, value V) {
-	m.subscribers.Range(func(_ uuid.UUID, sb *subscription[K, V]) bool {
-		// Don't run the filter if the subscriber is marked already.
-		if !sb.mark.Load() && (sb.include == nil || sb.include(key, value)) {
-			sb.mark.Store(true)
-		}
-		return true
-	})
-}
-
-// notify will send a snapshot to all subscribers that have been marked.
+// notify delivers each delta in snapshot order to its captured subscriptions.
 func (m *Map[K, V]) notify() {
-	// We need to loop until all marked snapshots have been sent, because new marks may be added during sending.
-	delta := m.makeDelta()
-	for didSend := true; didSend; {
-		didSend = false
+	m.notifyLock.Lock()
+	defer m.notifyLock.Unlock()
+
+	m.snapLock.Lock()
+	delta := m.makeDeltaLocked()
+	var recipients []*subscription[K, V]
+	if len(delta.upserts) > 0 || len(delta.removals) > 0 {
+		recipients = make([]*subscription[K, V], 0, m.subscribers.Size())
 		m.subscribers.Range(func(_ uuid.UUID, sb *subscription[K, V]) bool {
-			if sb.mark.CompareAndSwap(true, false) {
-				delta.send(sb)
-				didSend = true
-			}
+			recipients = append(recipients, sb)
 			return true
 		})
+	}
+	m.snapLock.Unlock()
+
+	for _, sb := range recipients {
+		delta.send(sb)
 	}
 }
 
@@ -305,9 +297,12 @@ func filteredMap[K comparable, V any](m map[K]V, include func(K, V) bool) map[K]
 	if include == nil {
 		return m
 	}
-	fm := make(map[K]V)
+	var fm map[K]V
 	for k, v := range m {
 		if include(k, v) {
+			if fm == nil {
+				fm = make(map[K]V)
+			}
 			fm[k] = v
 		}
 	}
@@ -324,7 +319,16 @@ func (ad *allDelta[K, V]) filteredDelta(initialized bool, include func(K, V) boo
 		upserts = ad.snapshot
 		removals = nil
 	}
-	return Delta[K, V]{Upserts: filteredMap(upserts, include), Removals: filteredMap(removals, include)}
+	filtered := Delta[K, V]{Upserts: filteredMap(upserts, include), Removals: filteredMap(removals, include)}
+	if include != nil && (!initialized || len(filtered.Upserts) > 0 || len(filtered.Removals) > 0) {
+		if filtered.Upserts == nil {
+			filtered.Upserts = make(map[K]V)
+		}
+		if filtered.Removals == nil {
+			filtered.Removals = make(map[K]V)
+		}
+	}
+	return filtered
 }
 
 func (ad *allDelta[K, V]) send(sb *subscription[K, V]) {
@@ -357,8 +361,8 @@ func (ad *allDelta[K, V]) sendLocked(sb *subscription[K, V]) {
 	}
 }
 
-func (m *Map[K, V]) makeDelta() allDelta[K, V] {
-	m.snapLock.Lock()
+// makeDeltaLocked requires snapLock.
+func (m *Map[K, V]) makeDeltaLocked() allDelta[K, V] {
 	previous := m.snapshot
 	current := m.LoadAll()
 	m.snapshot = current
@@ -380,7 +384,6 @@ func (m *Map[K, V]) makeDelta() allDelta[K, V] {
 			removals[k] = v
 		}
 	}
-	m.snapLock.Unlock()
 	return allDelta[K, V]{
 		snapshot: current,
 		upserts:  upserts,
