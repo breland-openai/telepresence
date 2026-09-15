@@ -1154,9 +1154,7 @@ func (s *session) CheckStatus(cr *rpc.ConnectRequest) error {
 		// connect that doesn't define a kubeconfig at all.
 		config = s.Kubeconfig
 	}
-	if len(cr.MappedNamespaces) == 1 && cr.MappedNamespaces[0] == "all" {
-		cr.MappedNamespaces = nil
-	}
+	cr.MappedNamespaces, _ = normalizeMappedNamespaces(cr.MappedNamespaces)
 	// If namespaces are specified in the request, then we must ensure that they are the same as the current ones
 	// because the request takes precedence over namespaces configured in the client configuration or by the traffic-manager.
 	if len(cr.MappedNamespaces) == 0 || slices.Equal(cr.MappedNamespaces, s.MappedNamespaces) {

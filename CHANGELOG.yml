@@ -41,6 +41,13 @@ items:
           physical network also advertises the Kubernetes DNS domain. This keeps
           pod names reachable when virtual network address translation is enabled.
       - type: bugfix
+        title: Reuse connections with the same mapped namespaces
+        body: >-
+          Repeating <code>telepresence connect</code> with the same mapped
+          namespaces now reuses the existing connection regardless of their order
+          or duplicates. Previously, a non-alphabetical list could be mistaken
+          for a configuration change and ask the user to reconnect.
+      - type: bugfix
         title: Recover promptly from stalled manager sessions
         body: >-
           Manager keepalive failures now use the existing session repair path

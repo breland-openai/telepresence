@@ -14,6 +14,12 @@ On Linux, root daemon startup removes recognized stale DNS redirects to unused l
 Kubernetes pod addresses now use Telepresence DNS when the machine's physical network also advertises the Kubernetes DNS domain. This keeps pod names reachable when virtual network address translation is enabled.
 </div>
 
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Reuse connections with the same mapped namespaces</div></div>
+<div style="margin-left: 15px">
+
+Repeating <code>telepresence connect</code> with the same mapped namespaces now reuses the existing connection regardless of their order or duplicates. Previously, a non-alphabetical list could be mistaken for a configuration change and ask the user to reconnect.
+</div>
+
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Recover promptly from stalled manager sessions</div></div>
 <div style="margin-left: 15px">
 
