@@ -269,6 +269,7 @@ func connectionTestService(t *testing.T) *service {
 	ctx = filelocation.WithAppUserConfigDir(ctx, t.TempDir())
 	ctx = filelocation.WithAppUserCacheDir(ctx, t.TempDir())
 	ctx = filelocation.WithAppSystemConfigDir(ctx, t.TempDir())
+	ctx = client.WithEnv(ctx, &client.Env{ManagerNamespace: "ambassador"})
 	ctx, cancel := context.WithCancel(ctx)
 	t.Cleanup(cancel)
 	cfg := client.GetDefaultConfig()

@@ -77,10 +77,10 @@ func TestSessionStatusForwardsCallerDeadlineToRootDaemon(t *testing.T) {
 }
 
 func TestSessionStatusFallbackKubernetesHonorsCallerCancellation(t *testing.T) {
-	started := make(chan struct{})
+	started := make(chan string, 1)
 	canceled := make(chan struct{})
 	api := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		close(started)
+		started <- r.Method + " " + r.URL.Path
 		<-r.Context().Done()
 		close(canceled)
 	}))
@@ -99,7 +99,10 @@ func TestSessionStatusFallbackKubernetesHonorsCallerCancellation(t *testing.T) {
 		result <- callErr
 	}()
 	select {
-	case <-started:
+	case request := <-started:
+		require.Equal(t, "GET /api/v1/namespaces/ambassador", request)
+	case err = <-result:
+		t.Fatalf("status returned before requesting its manager namespace ID: %v", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("the older session did not request its manager namespace ID")
 	}
@@ -119,7 +122,9 @@ func TestSessionStatusFallbackKubernetesHonorsCallerCancellation(t *testing.T) {
 }
 
 func rootStatusTestSession(ctx context.Context, conn *grpc.ClientConn, managerInstallID string) *session {
-	ctx = client.WithConfig(ctx, client.GetDefaultConfig())
+	cfg := client.GetDefaultConfig()
+	cfg.Cluster().DefaultManagerNamespace = "ambassador"
+	ctx = client.WithConfig(ctx, cfg)
 	return &session{
 		Cluster: &k8s.Cluster{Kubeconfig: &k8s.Kubeconfig{
 			Context: ctx, Namespace: "default", KubeContext: "test", Server: "https://cluster.example",

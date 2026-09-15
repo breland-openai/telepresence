@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	grpcStatus "google.golang.org/grpc/status"
 	empty "google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/telepresenceio/telepresence/rpc/v2/connector"
@@ -283,6 +285,10 @@ func setUserDaemonStatus(ctx context.Context, userD daemon.UserClient, di *daemo
 
 	status, err := userD.Status(ctx, &empty.Empty{})
 	if err != nil {
+		if st, ok := grpcStatus.FromError(err); ok && st.Code() == codes.FailedPrecondition && st.Message() == "connection in progress" {
+			us.Status = "Connecting"
+			return &connector.ConnectInfo{}, nil
+		}
 		err = grpc.FromGRPC(err)
 		us.Status = "Not connected"
 		us.Error = err.Error()
