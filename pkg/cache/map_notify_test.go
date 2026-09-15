@@ -133,6 +133,191 @@ func TestNotifyDoesNotSendUnrelatedChanges(t *testing.T) {
 	require.Equal(t, map[string]string{"keep": "included"}, (<-incoming).Upserts)
 }
 
+func TestNotifyReconcilesSubscriptionBetweenCoalescedMutations(t *testing.T) {
+	tests := []struct {
+		name    string
+		initial string
+		middle  string
+		final   string
+	}{
+		{name: "appears_then_disappears", middle: "WAITING"},
+		{name: "disappears_then_appears", initial: "ACTIVE", final: "ACTIVE"},
+		{name: "changes_then_returns", initial: "ACTIVE", middle: "WAITING", final: "ACTIVE"},
+		{name: "changes_again", initial: "OLD", middle: "WAITING", final: "ACTIVE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewMap[string, string](func(a, b string) bool { return a == b }, time.Hour)
+			done := make(chan struct{})
+			t.Cleanup(func() { close(done); m.notifier.Stop() })
+			set := func(value string) {
+				if value == "" {
+					m.Delete("intercept")
+				} else {
+					m.Store("intercept", value)
+				}
+			}
+			set(tt.initial)
+			early := m.Subscribe(done, nil)
+			earlyState := map[string]string{}
+			applyNotifyDelta(earlyState, <-early)
+			set(tt.middle)
+			late := m.Subscribe(done, func(key, _ string) bool { return key == "intercept" })
+			lateState := map[string]string{}
+			applyNotifyDelta(lateState, <-late)
+			require.Equal(t, tt.middle, lateState["intercept"])
+			set(tt.final)
+			m.notify()
+			drainNotifyDeltas(earlyState, early)
+			drainNotifyDeltas(lateState, late)
+			require.Equal(t, tt.final, earlyState["intercept"])
+			require.Equal(t, tt.final, lateState["intercept"])
+			m.Store("unrelated", "control")
+			m.notify()
+			drainNotifyDeltas(lateState, late)
+			require.NotContains(t, lateState, "unrelated")
+			if tt.final == "" {
+				require.NotContains(t, lateState, "intercept")
+			}
+		})
+	}
+}
+
+func TestNotifyTimerReschedulesMutationDuringDelivery(t *testing.T) {
+	m := NewMap[string, string](func(a, b string) bool { return a == b }, 5*time.Millisecond)
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done); m.notifier.Stop() })
+	var armed atomic.Bool
+	entered, unblock := notifyBarrier(t)
+	incoming := m.Subscribe(done, func(key, _ string) bool {
+		if key == "sentinel" && armed.CompareAndSwap(true, false) {
+			entered()
+		}
+		return true
+	})
+	state := map[string]string{}
+	applyNotifyDelta(state, <-incoming)
+	armed.Store(true)
+	m.Store("sentinel", "first")
+	unblock.wait()
+	m.Store("intercept", "ACTIVE")
+	unblock.release()
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+	for state["intercept"] != "ACTIVE" {
+		select {
+		case delta := <-incoming:
+			applyNotifyDelta(state, delta)
+		case <-timeout.C:
+			t.Fatal("rescheduled timer failed to deliver the concurrent mutation")
+		}
+	}
+}
+
+func TestNotifyReconcilesDistinctSubscriptionsAndCancellation(t *testing.T) {
+	m := NewMap[string, string](func(a, b string) bool { return a == b }, time.Hour)
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done); m.notifier.Stop() })
+	early := m.Subscribe(done, nil)
+	<-early
+	m.Store("intercept", "WAITING")
+	middle := m.Subscribe(done, nil)
+	middleState := map[string]string{}
+	applyNotifyDelta(middleState, <-middle)
+	m.Store("intercept", "ACTIVE")
+	late := m.Subscribe(done, nil)
+	lateState := map[string]string{}
+	applyNotifyDelta(lateState, <-late)
+	closed := make(chan struct{})
+	canceled := m.Subscribe(closed, nil)
+	<-canceled
+	require.EqualValues(t, 3, m.catchUps.Load())
+	close(closed)
+	waitNotify(t, closedNotify(canceled))
+	require.EqualValues(t, 2, m.catchUps.Load())
+	m.Delete("intercept")
+	m.notify()
+	drainNotifyDeltas(middleState, middle)
+	drainNotifyDeltas(lateState, late)
+	require.Empty(t, middleState)
+	require.Empty(t, lateState)
+	require.Zero(t, m.catchUps.Load())
+}
+
+func closedNotify(ch <-chan Delta[string, string]) <-chan struct{} {
+	closed := make(chan struct{})
+	go func() {
+		for range ch {
+		}
+		close(closed)
+	}()
+	return closed
+}
+
+func TestNotifyTracksValueFilterMembership(t *testing.T) {
+	tests := []struct {
+		name    string
+		initial string
+		middle  string
+		final   string
+		late    bool
+	}{
+		{name: "existing_becomes_invisible", initial: "WAITING", final: "ACTIVE"},
+		{name: "existing_becomes_visible", initial: "ACTIVE", final: "WAITING"},
+		{name: "late_becomes_invisible", initial: "ACTIVE", middle: "WAITING", final: "ACTIVE", late: true},
+		{name: "late_becomes_visible", initial: "WAITING", middle: "ACTIVE", final: "WAITING", late: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewMap[string, string](func(a, b string) bool { return a == b }, time.Hour)
+			done := make(chan struct{})
+			t.Cleanup(func() { close(done); m.notifier.Stop() })
+			m.Store("intercept", tt.initial)
+			if tt.late {
+				early := m.Subscribe(done, nil)
+				<-early
+				m.Store("intercept", tt.middle)
+			}
+			incoming := m.Subscribe(done, func(_, value string) bool { return value == "WAITING" })
+			state := map[string]string{}
+			applyNotifyDelta(state, <-incoming)
+			m.Store("intercept", tt.final)
+			m.notify()
+			drainNotifyDeltas(state, incoming)
+			if tt.final == "WAITING" {
+				require.Equal(t, map[string]string{"intercept": "WAITING"}, state)
+			} else {
+				require.Empty(t, state)
+			}
+		})
+	}
+}
+
+func TestNotifyNewSubscriptionsDoNotPostponeExistingWatcher(t *testing.T) {
+	m := NewMap[string, string](func(a, b string) bool { return a == b }, 40*time.Millisecond)
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done); m.notifier.Stop() })
+	incoming := m.Subscribe(done, nil)
+	<-incoming
+	m.Store("intercept", "ACTIVE")
+	join := time.NewTicker(2 * time.Millisecond)
+	defer join.Stop()
+	timeout := time.NewTimer(250 * time.Millisecond)
+	defer timeout.Stop()
+	for {
+		select {
+		case delta := <-incoming:
+			require.Equal(t, "ACTIVE", delta.Upserts["intercept"])
+			return
+		case <-join.C:
+			late := m.Subscribe(done, nil)
+			<-late
+		case <-timeout.C:
+			t.Fatal("read-only subscriptions postponed an already scheduled update")
+		}
+	}
+}
+
 type notifyBlock struct {
 	t       *testing.T
 	entered chan struct{}
