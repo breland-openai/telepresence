@@ -12,6 +12,7 @@ import (
 	"os/user"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,8 +100,16 @@ type session struct {
 	installID string // telepresence's install ID
 	clientID  string // "laptop-username@laptop-hostname"
 
-	// manager client connection
-	managerConn *grpc.ClientConn
+	// manager client connection and metadata. A failed watcher and Remain can
+	// both notice the same broken transport, so keep replacements serialized
+	// and let later repairs observe that an earlier one already won.
+	managerLock          sync.RWMutex
+	managerReconnectLock sync.Mutex
+	managerConn          *grpc.ClientConn
+	managerGeneration    uint64
+
+	consecutiveRemainFailures int
+	remainFailureGeneration   uint64
 
 	// name reported by the manager
 	managerName string
@@ -257,19 +266,21 @@ func NewSession(
 	}
 	cfg := client.GetConfig(cluster)
 	tos := cfg.Timeouts()
-	ctx, cancel := tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
-	defer cancel()
+	managerCtx, managerCancel := tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
 
-	tmgr, err := connectMgr(ctx, service, cluster, installID, cr)
+	tmgr, err := connectMgr(managerCtx, service, cluster, installID, cr)
+	managerCancel()
 	if err != nil {
 		clog.Errorf(config, "Unable to connect to session: %s", err)
 		return nil, nil, err
 	}
 	if tmgr.compareFinalizedManagerVersion(2, 21, 0) < 0 {
 		return nil, nil,
-			fmt.Errorf("traffic manager version %s is too old. Minimum supported version is 2.21.0, please upgrade", tmgr.managerVersion)
+			fmt.Errorf("traffic manager version %s is too old. Minimum supported version is 2.21.0, please upgrade", tmgr.ManagerVersion())
 	}
-	tmgr.updateClientConfig(ctx, cr.MappedNamespaces)
+	configCtx, configCancel := tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
+	tmgr.updateClientConfig(configCtx, cr.MappedNamespaces)
+	configCancel()
 
 	oi := tmgr.getNetworkInfo(cr)
 	if !service.RootSessionInProcess() {
@@ -293,8 +304,12 @@ func NewSession(
 
 	tmgr.Context = tunnel.WithSyntheticIPResolver(tmgr.Context, tmgr)
 
-	if err = tmgr.connectRootDaemon(ctx, oi, wg, cr.IsPodDaemon); err != nil {
-		tmgr.managerConn.Close()
+	// The root daemon establishes its own manager connection, so give that phase
+	// a fresh timeout instead of reusing the budget spent by the user daemon.
+	rootCtx, rootCancel := tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
+	defer rootCancel()
+	if err = tmgr.connectRootDaemon(rootCtx, oi, wg, cr.IsPodDaemon); err != nil {
+		_ = tmgr.managerConnection().Close()
 		return nil, nil, err
 	}
 
@@ -302,7 +317,7 @@ func NewSession(
 	clog.Debug(tmgr, "Finished connecting to traffic manager")
 
 	tmgr.AddNamespaceEventHandler(tmgr.updateDaemonNamespaces)
-	ci, err := tmgr.status(ctx, true)
+	ci, err := tmgr.status(rootCtx, true)
 	return tmgr, ci, err
 }
 
@@ -318,6 +333,7 @@ func (s *session) GetService() userd.Service {
 //     Services, and
 //   - (4) mount the appropriate remote volumes.
 func (s *session) Run() {
+	started := time.Now()
 	g := log.NewGroup(s)
 	defer func() {
 		_ = s.WithRootClient(context.WithoutCancel(s), func(ctx context.Context, rd rootdRpc.DaemonClient) error {
@@ -329,8 +345,14 @@ func (s *session) Run() {
 	}()
 	s.startServices(g)
 	err := g.Wait()
-	if err != nil {
-		clog.Errorf(s, "session ended with error: %v", err)
+	elapsed := time.Since(started).Round(time.Millisecond)
+	switch {
+	case err != nil:
+		clog.Errorf(s, "session ended after %s with error: %v context=%v cause=%v", elapsed, err, s.Err(), context.Cause(s))
+	case s.Err() != nil:
+		clog.Infof(s, "session context ended after %s: context=%v cause=%v", elapsed, s.Err(), context.Cause(s))
+	default:
+		clog.Infof(s, "session services stopped cleanly after %s", elapsed)
 	}
 }
 
@@ -342,15 +364,51 @@ func (s *session) WithRootClient(ctx context.Context, f func(context.Context, ro
 	return f(ctx, rd)
 }
 
+func (s *session) managerSnapshot() (*grpc.ClientConn, string, semver.Version, uint64) {
+	s.managerLock.RLock()
+	defer s.managerLock.RUnlock()
+	return s.managerConn, s.managerName, s.managerVersion, s.managerGeneration
+}
+
+func (s *session) managerConnection() *grpc.ClientConn {
+	s.managerLock.RLock()
+	defer s.managerLock.RUnlock()
+	return s.managerConn
+}
+
+func (s *session) currentManagerGeneration() uint64 {
+	s.managerLock.RLock()
+	defer s.managerLock.RUnlock()
+	return s.managerGeneration
+}
+
+func (s *session) invalidateManagerConnection() *grpc.ClientConn {
+	s.managerLock.Lock()
+	defer s.managerLock.Unlock()
+	s.managerGeneration++
+	return s.managerConn
+}
+
+func (s *session) managerClient() (manager.ManagerClient, uint64) {
+	s.managerLock.RLock()
+	defer s.managerLock.RUnlock()
+	return manager.NewManagerClient(s.managerConn), s.managerGeneration
+}
+
 func (s *session) ManagerClient() manager.ManagerClient {
-	return manager.NewManagerClient(s.managerConn)
+	mClient, _ := s.managerClient()
+	return mClient
 }
 
 func (s *session) ManagerName() string {
+	s.managerLock.RLock()
+	defer s.managerLock.RUnlock()
 	return s.managerName
 }
 
 func (s *session) ManagerVersion() semver.Version {
+	s.managerLock.RLock()
+	defer s.managerLock.RUnlock()
 	return s.managerVersion
 }
 
@@ -417,11 +475,12 @@ func connectMgr(
 	if si == nil {
 		clog.Debugf(cluster, "traffic-manager port-forward established, making client known to the traffic-manager as %q", clientID)
 		si, err = mClient.ArriveAsClient(timeoutCtx, &manager.ClientInfo{
-			Name:      clientID,
-			Namespace: cluster.Namespace,
-			InstallId: installID,
-			Product:   "telepresence",
-			Version:   client.Version(),
+			Name:                     clientID,
+			Namespace:                cluster.Namespace,
+			InstallId:                installID,
+			Product:                  "telepresence",
+			Version:                  client.Version(),
+			SupportsCompactAgentInfo: true,
 		})
 		if err != nil {
 			if st, ok := status.FromError(err); ok && st.Code() == codes.FailedPrecondition {
@@ -456,13 +515,30 @@ func connectMgr(
 	return sess, nil
 }
 
-func (s *session) reconnectManager() (returnedErr error) {
+func (s *session) reconnectManager(failedGeneration uint64) error {
+	return s.reconnectManagerWith(failedGeneration, func(ctx context.Context) (*grpc.ClientConn, string, semver.Version, error) {
+		return s.ConnectToManager(ctx, k8s.GetManagerNamespace(s))
+	})
+}
+
+func (s *session) reconnectManagerWith(
+	failedGeneration uint64,
+	connect func(context.Context) (*grpc.ClientConn, string, semver.Version, error),
+) (returnedErr error) {
+	s.managerReconnectLock.Lock()
+	defer s.managerReconnectLock.Unlock()
+
+	generation := s.currentManagerGeneration()
+	if generation != failedGeneration {
+		return nil
+	}
+
 	cfg := client.GetConfig(s)
 	tos := cfg.Timeouts()
 	tc, cancel := tos.TimeoutContext(s, client.TimeoutTrafficManagerConnect)
 	defer cancel()
 
-	conn, managerName, managerVersion, err := s.ConnectToManager(tc, k8s.GetManagerNamespace(s))
+	conn, managerName, managerVersion, err := connect(tc)
 	if err != nil {
 		return err
 	}
@@ -478,11 +554,12 @@ func (s *session) reconnectManager() (returnedErr error) {
 	_, err = manager.NewManagerClient(conn).ReconnectClient(tc, &manager.ReconnectClientRequest{
 		Session: s.sessionInfo,
 		Client: &manager.ClientInfo{
-			Name:      s.clientID,
-			Namespace: s.Namespace,
-			InstallId: s.installID,
-			Product:   "telepresence",
-			Version:   client.Version(),
+			Name:                     s.clientID,
+			Namespace:                s.Namespace,
+			InstallId:                s.installID,
+			Product:                  "telepresence",
+			Version:                  client.Version(),
+			SupportsCompactAgentInfo: true,
 		},
 		Intercepts: s.getCurrentInterceptInfos(),
 	})
@@ -490,18 +567,33 @@ func (s *session) reconnectManager() (returnedErr error) {
 		return fmt.Errorf("unable to reconnect client: %w", err)
 	}
 
+	s.managerLock.Lock()
+	if s.managerGeneration != failedGeneration {
+		s.managerLock.Unlock()
+		_ = conn.Close()
+		return nil
+	}
 	// The replaced connection is pinned to a manager pod that is gone or no
 	// longer accepts this client; close it so its transport stops redialing.
-	if old := s.managerConn; old != nil {
-		_ = old.Close()
-	}
+	old := s.managerConn
 	s.managerConn = conn
 	s.managerName = managerName
 	s.managerVersion = managerVersion
+	s.managerGeneration++
+	s.managerLock.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
 	return nil
 }
 
+const remainReconnectFailureThreshold = 3
+
 func (s *session) remain() error {
+	return s.remainWith(s.reconnectManager)
+}
+
+func (s *session) remainWith(reconnect func(uint64) error) error {
 	ctx, cancel := client.GetConfig(s).Timeouts().TimeoutContext(s, client.TimeoutTrafficManagerAPI)
 	defer cancel()
 	var lastActivity *timestamppb.Timestamp
@@ -509,13 +601,49 @@ func (s *session) remain() error {
 	if ln != 0 {
 		lastActivity = timestamppb.New(time.Unix(0, ln))
 	}
-	_, err := s.ManagerClient().Remain(ctx, &manager.RemainRequest{
+	mClient, managerGeneration := s.managerClient()
+	if s.remainFailureGeneration != managerGeneration {
+		s.consecutiveRemainFailures = 0
+		s.remainFailureGeneration = managerGeneration
+	}
+	_, err := mClient.Remain(ctx, &manager.RemainRequest{
 		Session:      s.SessionInfo(),
 		LastActivity: lastActivity,
 	})
-	if err != nil {
-		clog.Errorf(ctx, "error calling Remain: %v", client.CheckTimeout(ctx, err))
+	if err == nil {
+		s.consecutiveRemainFailures = 0
+		return nil
 	}
+
+	checkedErr := client.CheckTimeout(ctx, err)
+	clog.Errorf(ctx, "error calling Remain: %v", checkedErr)
+
+	code := status.Code(err)
+	if code == codes.Unknown && errors.Is(err, context.DeadlineExceeded) {
+		code = codes.DeadlineExceeded
+	}
+	switch code {
+	case codes.NotFound:
+		s.consecutiveRemainFailures = 0
+	case codes.DeadlineExceeded, codes.Unavailable:
+		s.consecutiveRemainFailures++
+		if s.consecutiveRemainFailures < remainReconnectFailureThreshold {
+			return nil
+		}
+	default:
+		s.consecutiveRemainFailures = 0
+		return nil
+	}
+
+	clog.Warnf(ctx, "reconnecting after Remain failed: %v", checkedErr)
+	if err = reconnect(managerGeneration); err != nil {
+		// A reconnect can fail while the laptop is waking, the network is
+		// returning, or the manager is still restarting. Keep the session and
+		// its intercepts alive so the next Remain tick gets another chance.
+		clog.Errorf(ctx, "unable to reconnect after Remain failed: %v", err)
+		return nil
+	}
+	s.consecutiveRemainFailures = 0
 	return nil
 }
 
@@ -837,8 +965,6 @@ func (s *session) WorkloadInfoSnapshot(
 	namespaces []string,
 	filter rpc.ListRequest_Filter,
 ) (*rpc.WorkloadInfoSnapshot, error) {
-	is := s.getCurrentIntercepts()
-
 	var nss []string
 	var sMap map[string]string
 	nss = make([]string, 0, len(namespaces))
@@ -853,6 +979,11 @@ func (s *session) WorkloadInfoSnapshot(
 		clog.Debug(s, "No namespaces are mapped")
 		return &rpc.WorkloadInfoSnapshot{}, nil
 	}
+	if filter == rpc.ListRequest_INTERCEPTS {
+		return s.interceptInfoSnapshot(nss), nil
+	}
+
+	is := s.getCurrentIntercepts()
 	if len(nss) == 1 && nss[0] == s.Namespace {
 		cas := s.getCurrentAgentPods()
 		sMap = make(map[string]string, len(cas))
@@ -883,6 +1014,104 @@ nextIs:
 	return &rpc.WorkloadInfoSnapshot{Workloads: workloadInfos}, nil
 }
 
+// interceptInfoSnapshot returns the current normal intercepts without waiting
+// for the workload watchers. The watcher snapshot is useful when listing all
+// workloads, but an intercept-only list can get the workload identity from the
+// intercept spec itself.
+func (s *session) interceptInfoSnapshot(namespaces []string) *rpc.WorkloadInfoSnapshot {
+	namespaceSet := make(map[string]struct{}, len(namespaces))
+	for _, namespace := range namespaces {
+		namespaceSet[namespace] = struct{}{}
+	}
+
+	type key struct {
+		kind      string
+		name      string
+		namespace string
+	}
+	type agentKey struct {
+		name      string
+		namespace string
+	}
+
+	cachedWorkloads := make(map[key]workloadInfo)
+	s.eachWorkload(namespaces, func(kind manager.WorkloadInfo_Kind, name, namespace string, info workloadInfo) {
+		cachedWorkloads[key{kind: kind.String(), name: name, namespace: namespace}] = info
+	})
+	agentVersions := make(map[agentKey]string)
+	for _, agent := range s.getCurrentAgentPods() {
+		if _, ok := namespaceSet[agent.namespace]; ok {
+			agentVersions[agentKey{name: agent.workload, namespace: agent.namespace}] = agent.version
+		}
+	}
+
+	workloadInfos := make(map[key]*rpc.WorkloadInfo)
+	for _, intercept := range s.getCurrentIntercepts() {
+		if intercept == nil || intercept.InterceptInfo == nil {
+			continue
+		}
+		spec := intercept.Spec
+		if spec == nil || spec.NoDefaultPort || spec.Wiretap {
+			continue
+		}
+		if _, ok := namespaceSet[spec.Namespace]; !ok {
+			continue
+		}
+
+		kind := normalizedWorkloadResourceType(spec.WorkloadKind)
+		k := key{
+			kind:      kind,
+			name:      spec.Agent,
+			namespace: spec.Namespace,
+		}
+		workloadInfo, ok := workloadInfos[k]
+		if !ok {
+			workloadInfo = &rpc.WorkloadInfo{
+				Name:                 spec.Agent,
+				Namespace:            spec.Namespace,
+				WorkloadResourceType: kind,
+				AgentVersion:         agentVersions[agentKey{name: spec.Agent, namespace: spec.Namespace}],
+			}
+			if cached, ok := cachedWorkloads[k]; ok {
+				workloadInfo.Uid = string(cached.uid)
+				workloadInfo.DesiredReplicas = cached.desiredReplicas
+				workloadInfo.ReadyReplicas = cached.readyReplicas
+				workloadInfo.Services = cloneServiceAssociations(cached.services)
+				if cached.state != workload.StateAvailable {
+					workloadInfo.NotInterceptableReason = cached.state.String()
+				}
+			}
+			workloadInfos[k] = workloadInfo
+		}
+		workloadInfo.InterceptInfo = append(workloadInfo.InterceptInfo, intercept.InterceptInfo)
+	}
+
+	snapshot := &rpc.WorkloadInfoSnapshot{
+		Workloads: make([]*rpc.WorkloadInfo, 0, len(workloadInfos)),
+	}
+	for _, workloadInfo := range workloadInfos {
+		snapshot.Workloads = append(snapshot.Workloads, workloadInfo)
+	}
+	sort.Slice(snapshot.Workloads, func(i, j int) bool {
+		left, right := snapshot.Workloads[i], snapshot.Workloads[j]
+		if left.Name != right.Name {
+			return left.Name < right.Name
+		}
+		if left.Namespace != right.Namespace {
+			return left.Namespace < right.Namespace
+		}
+		return left.WorkloadResourceType < right.WorkloadResourceType
+	})
+	return snapshot
+}
+
+func normalizedWorkloadResourceType(kind string) string {
+	if value, ok := manager.WorkloadInfo_Kind_value[strings.ToUpper(kind)]; ok {
+		return manager.WorkloadInfo_Kind(value).String()
+	}
+	return kind
+}
+
 func (s *session) remainLoop(_ context.Context) error {
 	ticker := time.NewTicker(client.GetConfig(s).Grpc().PingInterval)
 	defer func() {
@@ -898,7 +1127,9 @@ func (s *session) remainLoop(_ context.Context) error {
 			}
 		}
 		// Call Close() in separate go-routine because it might block.
-		go s.managerConn.Close()
+		if managerConn := s.invalidateManagerConnection(); managerConn != nil {
+			go managerConn.Close()
+		}
 	}()
 
 	for {
@@ -1053,6 +1284,7 @@ func (s *session) updateClientConfig(ctx context.Context, namespaces []string) {
 
 func (s *session) status(ctx context.Context, initial bool) (*rpc.ConnectInfo, error) {
 	cfg := s.Kubeconfig
+	_, managerName, managerVersion, _ := s.managerSnapshot()
 	ret := &rpc.ConnectInfo{
 		Initial:          initial,
 		ClusterContext:   cfg.KubeContext,
@@ -1065,8 +1297,8 @@ func (s *session) status(ctx context.Context, initial bool) (*rpc.ConnectInfo, e
 		Ingests:          s.getCurrentIngests(),
 		Intercepts:       &manager.InterceptInfoSnapshot{Intercepts: s.getCurrentInterceptInfos()},
 		ManagerVersion: &manager.VersionInfo2{
-			Name:    s.managerName,
-			Version: "v" + s.managerVersion.String(),
+			Name:    managerName,
+			Version: "v" + managerVersion.String(),
 		},
 		ManagerNamespace:   k8s.GetManagerNamespace(s),
 		SubnetViaWorkloads: s.subnetViaWorkloads,
@@ -1122,7 +1354,8 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 	if svc.RootSessionInProcess() {
 		// Just run the root session in-process.
 		activity := make(chan time.Time)
-		rootSession, err := rootd.NewInProcSession(s.Cluster, nc, s.managerConn, s.managerVersion, activity, isPodDaemon)
+		managerConn, _, managerVersion, _ := s.managerSnapshot()
+		rootSession, err := rootd.NewInProcSession(s.Cluster, nc, managerConn, managerVersion, activity, isPodDaemon)
 		if err != nil {
 			close(activity)
 			return err

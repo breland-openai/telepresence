@@ -18,6 +18,7 @@ import (
 func main() {
 	cmds := map[string]func(ctx context.Context, args ...string) error{
 		"agent":          agent.Main,
+		"agent-drain":    agent.DrainMain,
 		"agent-init":     agentinit.Main,
 		"agent-ready":    agent.ReadyMain,
 		"manager":        manager.Main,

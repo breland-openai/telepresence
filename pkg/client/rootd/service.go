@@ -21,6 +21,7 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/daemon"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/logging"
+	"github.com/telepresenceio/telepresence/v2/pkg/client/rootd/dns"
 	"github.com/telepresenceio/telepresence/v2/pkg/filelocation"
 	"github.com/telepresenceio/telepresence/v2/pkg/grpc/server"
 	"github.com/telepresenceio/telepresence/v2/pkg/ioutil"
@@ -53,7 +54,7 @@ type service struct {
 	// sessionLock protects the session, sessionCancel, and sessionRunning fields.
 	sessionLock   sync.RWMutex
 	session       *session
-	sessionCancel context.CancelFunc
+	sessionCancel func(error)
 
 	// sessionRunning is closed when the session is done running.
 	sessionRunning chan struct{}
@@ -216,6 +217,10 @@ func internalRun(c context.Context, flags *pflag.FlagSet) error {
 	daemonAddress := grpcListener.Addr().(interface{ AddrPort() netip.AddrPort }).AddrPort()
 	clog.Debugf(c, "Listener opened on %s", grpcListener.Addr())
 
+	if err = dns.CleanupStaleRouting(c); err != nil {
+		clog.Warnf(c, "Unable to clean stale DNS routing: %v", err)
+	}
+
 	d := newService(cfg, managed)
 	if err = logging.LoadTimedLevelFromCache(c, d.timedLogLevel, client.RootDaemonName); err != nil {
 		clog.Error(c, err)
@@ -256,7 +261,7 @@ func runAliveAndCancellation(g log.Group, daemonPort uint16, cancel context.Canc
 		return il.WatchInfos(func(ctx context.Context) error {
 			ok, err := il.InfoExists(daemon.InfoFileName)
 			if err == nil && !ok {
-				clog.Debugf(ctx, "info-watcher cancels everything because daemon info %s does not exist", daemon.InfoFileName)
+				clog.Warnf(ctx, "info-watcher cancels everything because daemon info %s does not exist", daemon.InfoFileName)
 				cancel()
 			}
 			return err

@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -127,6 +128,9 @@ type session struct {
 	// The local dns server
 	dnsServer *dns.Server
 
+	// localClusterDNSMappings is immutable after session construction.
+	localClusterDNSMappings client.DNSMappings
+
 	// vifDNS is the address and port of the DNS server attached to the TUN device. This is currently only
 	// used in conjunction with systemd-resolved. The current macOS and the overriding solution
 	// will dispatch directly to the local DNS Service without going through the TUN device, but
@@ -239,6 +243,9 @@ type session struct {
 	// Cluster-side destinations that are connected directly to local intercept
 	// handlers instead of being tunneled to the cluster. Nil when there are none.
 	interceptShortcuts atomic.Pointer[shortcutTable]
+
+	// Redirects a remote UDP or TCP AddrPort to a local host port.
+	localClientRedirects *xsync.Map[types.AddrPortProto, netip.AddrPort]
 
 	lookupSequencer *xsync.Map[string, clusterLookupResult]
 
@@ -407,6 +414,7 @@ func newSession(
 		sessionStart:          time.Now(),
 		quicReprobeTrigger:    make(chan struct{}, 1),
 		quicSessionCache:      tls.NewLRUClientSessionCache(16),
+		localClientRedirects:  xsync.NewMap[types.AddrPortProto, netip.AddrPort](),
 	}
 	cfg := client.GetConfig(s)
 
@@ -437,7 +445,9 @@ func newSession(
 	}
 	clog.Infof(s, "allow-conflicting subnets %v", s.allowConflictingSubnets)
 
-	s.dnsServer = dns.NewServer(cfg.DNS(), s.Namespace, s.clusterLookup)
+	dnsConfig := cfg.DNS()
+	s.localClusterDNSMappings = discoverLocalClusterDNSMappings(s, dnsConfig, rt.VirtualSubnet)
+	s.initializeDNSServer(dnsConfig)
 	s.SetTopLevelDomains(nil)
 
 	// Set ourselves as the default dialer for the session.
@@ -449,6 +459,17 @@ func newSession(
 		close(s.routesCh)
 	}()
 	return s, nil
+}
+
+func (s *session) initializeDNSServer(config *client.DNS) {
+	dnsConfig := config
+	if len(s.localClusterDNSMappings) > 0 {
+		effectiveDNS := *dnsConfig
+		effectiveDNS.Mappings = mergeLocalClusterDNSMappings(dnsConfig.Mappings, s.localClusterDNSMappings)
+		dnsConfig = &effectiveDNS
+	}
+	s.dnsServer = dns.NewServer(dnsConfig, s.Namespace, s.clusterLookup)
+	config.LookupTimeout = dnsConfig.LookupTimeout
 }
 
 // lookupSequencerTTL is the maximum time to keep a lookup result cached with the purpose of avoiding
@@ -521,8 +542,45 @@ func (s *session) rerouteRemotePort(ap types.AddrPortProto, newPort uint16) {
 		// Swap ports so that the port map reroutes requests for the new port to the original port.
 		toPort := ap.Port()
 		ap.AddrPort = netip.AddrPortFrom(ap.Addr(), newPort)
+		if s.l4PortMap == nil {
+			s.l4PortMap = xsync.NewMap[types.AddrPortProto, uint16]()
+		}
 		s.l4PortMap.Store(ap, toPort)
 	}
+}
+
+func (s *session) addLocalClientRedirect(ap types.AddrPortProto, localPort uint16) {
+	target := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), localPort)
+	clog.Debugf(s, "Redirecting local client traffic for %s to %s", ap, target)
+	if s.localClientRedirects == nil {
+		s.localClientRedirects = xsync.NewMap[types.AddrPortProto, netip.AddrPort]()
+	}
+	s.localClientRedirects.Store(ap, target)
+}
+
+func (s *session) removeLocalClientRedirect(ap types.AddrPortProto) {
+	clog.Debugf(s, "Removing local client redirect for %s", ap)
+	if s.localClientRedirects != nil {
+		s.localClientRedirects.Delete(ap)
+	}
+}
+
+func (s *session) listLocalClientRedirects() []*rpc.LocalClientRedirect {
+	if s.localClientRedirects == nil {
+		return nil
+	}
+	redirects := make([]*rpc.LocalClientRedirect, 0, s.localClientRedirects.Size())
+	s.localClientRedirects.Range(func(remote types.AddrPortProto, target netip.AddrPort) bool {
+		hpb, err := remote.MarshalBinary()
+		if err == nil {
+			redirects = append(redirects, &rpc.LocalClientRedirect{
+				DstHostPort: hpb,
+				LocalPort:   uint32(target.Port()),
+			})
+		}
+		return true
+	})
+	return redirects
 }
 
 type clusterLookupResult struct {
@@ -536,6 +594,13 @@ type clusterLookupResult struct {
 func (s *session) clusterLookup(ctx context.Context, q *dns2.Question) (dnsproxy.RRs, int, error) {
 	clog.Debugf(ctx, "Lookup %s %q", dns2.TypeToString[q.Qtype], q.Name)
 	s.dnsLookups++
+
+	if s.shouldLookupViaWorkload(q) {
+		if answer, rCode, err, ok := s.lookupViaWorkload(ctx, q); ok {
+			return answer, rCode, err
+		}
+		return s.complexClusterLookup(ctx, q)
+	}
 
 	if s.lookupSequencer == nil || !(q.Qtype == dns2.TypeA || q.Qtype == dns2.TypeAAAA) {
 		return s.complexClusterLookup(ctx, q)
@@ -558,6 +623,96 @@ func (s *session) clusterLookup(ctx context.Context, q *dns2.Question) (dnsproxy
 	return result.rrs, result.rCode, result.err
 }
 
+func (s *session) shouldLookupViaWorkload(question *dns2.Question) bool {
+	if (question.Qtype != dns2.TypeA && question.Qtype != dns2.TypeAAAA) ||
+		s.agentClients == nil || s.dnsServer == nil {
+		return false
+	}
+
+	name := strings.ToLower(strings.TrimSuffix(question.Name, "."))
+	clusterDomain := strings.ToLower(strings.TrimSuffix(s.dnsServer.ClusterDomain(), "."))
+	if name == clusterDomain || strings.HasSuffix(name, "."+clusterDomain) ||
+		name == "svc" || strings.HasSuffix(name, ".svc") {
+		return false
+	}
+
+	if !slices.ContainsFunc(s.dnsServer.GetConfig().IncludeSuffixes, func(suffix string) bool {
+		suffix = strings.ToLower(strings.Trim(strings.TrimSpace(suffix), "."))
+		return suffix != "" && (name == suffix || strings.HasSuffix(name, "."+suffix))
+	}) {
+		return false
+	}
+
+	return slices.ContainsFunc(s.subnetViaWorkloads, func(via *rpc.SubnetViaWorkload) bool {
+		return via.Workload != "" && via.Workload != "local"
+	})
+}
+
+func (s *session) lookupViaWorkload(
+	ctx context.Context,
+	question *dns2.Question,
+) (dnsproxy.RRs, int, error, bool) {
+	visited := make(map[string]struct{}, len(s.subnetViaWorkloads))
+	for _, via := range s.subnetViaWorkloads {
+		workload := via.Workload
+		if workload == "" || workload == "local" {
+			continue
+		}
+		if _, ok := visited[workload]; ok {
+			continue
+		}
+		visited[workload] = struct{}{}
+
+		prefixes := make([]netip.Prefix, 0)
+		for _, subnet := range s.localTranslationSubnets {
+			if subnet.workload == workload && subnet.IsValid() {
+				prefixes = append(prefixes, subnet.Prefix)
+			}
+		}
+		if len(prefixes) == 0 {
+			continue
+		}
+
+		agent := s.agentClients.GetAgentForWorkload(ctx, workload)
+		if agent == nil {
+			if err := ctx.Err(); err != nil {
+				return nil, dns2.RcodeServerFailure, err, true
+			}
+			continue
+		}
+		response, err := agent.Lookup(ctx, &manager.LookupRequest{Session: s.session, Name: question.Name})
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, dns2.RcodeServerFailure, err, true
+			}
+			clog.Debugf(ctx, "Workload %s could not resolve %q: %v", workload, question.Name, err)
+			continue
+		}
+		if response == nil {
+			continue
+		}
+
+		ips := make([]netip.Addr, 0, len(response.Ips))
+		for _, encodedIP := range response.Ips {
+			var addr netip.Addr
+			if err := addr.UnmarshalBinary(encodedIP); err != nil {
+				continue
+			}
+			addr = addr.Unmap()
+			if selected, ok := s.translationSubnetForIP(addr); ok && selected.workload == workload {
+				ips = append(ips, addr)
+			}
+		}
+		if len(ips) == 0 {
+			continue
+		}
+		clog.Debugf(ctx, "Using proxy-via workload %s for lookup %q", workload, question.Name)
+		answer, rCode, err := s.lookupIPRecords(question, ips)
+		return answer, rCode, err, true
+	}
+	return nil, dns2.RcodeNameError, nil, false
+}
+
 func (s *session) simpleLookup(ctx context.Context, question *dns2.Question) (dnsproxy.RRs, int, error) {
 	var lookupClient interface {
 		Lookup(context.Context, *manager.LookupRequest, ...grpc.CallOption) (*manager.LookupResponse, error)
@@ -578,7 +733,7 @@ func (s *session) simpleLookup(ctx context.Context, question *dns2.Question) (dn
 	}
 	if err != nil {
 		s.dnsFailures++
-		rCode := rcodeFromError(err)
+		rCode := dns2.RcodeServerFailure
 		clog.Errorf(ctx, "Lookup %q %s: %v", question.Name, dns2.RcodeToString[rCode], err)
 		return nil, rCode, err
 	}
@@ -589,18 +744,22 @@ func (s *session) simpleLookup(ctx context.Context, question *dns2.Question) (dn
 	for i := range resp.Ips {
 		_ = ips[i].UnmarshalBinary(resp.Ips[i])
 	}
+	return s.lookupIPRecords(question, ips)
+}
+
+func (s *session) lookupIPRecords(question *dns2.Question, ips []netip.Addr) (dnsproxy.RRs, int, error) {
 	if len(s.localTranslationSubnets) > 0 {
 		for i, ip := range ips {
-			ips[i], err = s.GetLocalIP(ip)
+			translated, err := s.GetLocalIP(ip)
 			if err != nil {
 				return nil, dns2.RcodeServerFailure, err
 			}
+			ips[i] = translated
 		}
 	}
 	ips4, ips6 := splitNameTypes(question.Name, ips)
 	rrs := ensureBothFamilies(question.Name, ips4, ips6)
-	rCode := dns2.RcodeSuccess
-	return rrs, rCode, err
+	return rrs, dns2.RcodeSuccess, nil
 }
 
 // rrHeader creates a common DNS RR header for INET class.
@@ -657,7 +816,7 @@ func (s *session) complexClusterLookup(ctx context.Context, q *dns2.Question) (d
 	})
 	if err != nil {
 		s.dnsFailures++
-		rCode := rcodeFromError(err)
+		rCode := dns2.RcodeServerFailure
 		clog.Errorf(ctx, "Lookup %s %q %s: %T %v", dns2.TypeToString[q.Qtype], q.Name, dns2.RcodeToString[rCode], err, err)
 		return nil, rCode, err
 	}
@@ -691,28 +850,13 @@ func (s *session) complexClusterLookup(ctx context.Context, q *dns2.Question) (d
 	return answer, rCode, err
 }
 
-// rcodeFromError maps lookup errors to appropriate DNS RCODEs.
-func rcodeFromError(err error) int {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded),
-		errors.Is(err, context.Canceled),
-		status.Code(err) == codes.DeadlineExceeded,
-		status.Code(err) == codes.Canceled:
-		return dns2.RcodeNameError
-	default:
-		return dns2.RcodeServerFailure
-	}
-}
-
 func (s *session) GetLocalIP(destinationIP netip.Addr) (netip.Addr, error) {
 	var err error
 	va, _ := s.localTranslationTable.LoadOrCompute(destinationIP, func() (netip.Addr, bool) {
-		for _, sn := range s.localTranslationSubnets {
-			if sn.Contains(destinationIP) {
-				var nip netip.Addr
-				nip, err = s.nextVirtualIP(sn.workload, destinationIP)
-				return nip, err != nil
-			}
+		if selected, ok := s.translationSubnetForIP(destinationIP); ok {
+			nip, allocErr := s.nextVirtualIP(selected.workload, destinationIP)
+			err = allocErr
+			return nip, err != nil
 		}
 		return netip.Addr{}, true
 	})
@@ -720,6 +864,18 @@ func (s *session) GetLocalIP(destinationIP netip.Addr) (netip.Addr, error) {
 		destinationIP = va
 	}
 	return destinationIP, err
+}
+
+func (s *session) translationSubnetForIP(destinationIP netip.Addr) (agentSubnet, bool) {
+	var selected agentSubnet
+	matched := false
+	for _, subnet := range s.localTranslationSubnets {
+		if subnet.Contains(destinationIP) && (!matched || subnet.Bits() > selected.Bits()) {
+			selected = subnet
+			matched = true
+		}
+	}
+	return selected, matched
 }
 
 func (s *session) nextVirtualIP(workload string, destinationIP netip.Addr) (netip.Addr, error) {
@@ -732,7 +888,8 @@ func (s *session) nextVirtualIP(workload string, destinationIP netip.Addr) (neti
 }
 
 func (s *session) getNetworkConfig() *rpc.NetworkConfig {
-	mc := client.GetConfig(s)
+	// Runtime addresses and preserved mappings belong to this status snapshot.
+	mc := client.GetConfig(client.WithConfig(s, client.GetConfig(s)))
 	r := mc.Routing()
 	if s.tunVif != nil {
 		r.Subnets = s.tunVif.Router.GetRoutedSubnets()
@@ -758,6 +915,7 @@ func (s *session) getNetworkConfig() *rpc.NetworkConfig {
 		r.AllowConflicting = nil
 	}
 	d := mc.DNS()
+	d.Mappings = s.dnsServer.GetConfig().Mappings
 	if proc.RunningInContainer() && s.teleroute != nil {
 		las := s.teleroute.DaemonAddresses()
 		d.LocalAddresses = make([]netip.AddrPort, len(las))
@@ -1165,51 +1323,42 @@ func computeNeverProxyOverrides(ctx context.Context, subnets, nvp []netip.Prefix
 	return subnet.Unique(proxy), neverProxy, neverProxyOverrides
 }
 
-// neverProxyWithLocalDNS returns the configured never-proxy subnets extended with
-// host routes for any local DNS server whose address is covered by one of the
-// subnets that we are about to route. Without this, DNS queries sent to such a
-// server would be captured by the TUN-device and tunnelled into the cluster
-// instead of reaching the real resolver, breaking name resolution for everything
-// that isn't a cluster name. See issue #2429.
+// neverProxyWithLocalDNS preserves physical routes to local DNS resolvers and
+// preserved cluster endpoints when their addresses overlap proxied subnets.
 func (s *session) neverProxyWithLocalDNS(subnets []netip.Prefix) (neverProxy, dnsRoutes []netip.Prefix) {
 	cfg := client.GetConfig(s).DNS()
 
-	// Collect the DNS server addresses from every source we know of: the user
-	// configuration, the addresses the DNS server actually settled on at runtime
-	// (e.g. resolved from /etc/resolv.conf), and the host's system resolvers.
-	dnsServers := make([]netip.Addr, 0, len(cfg.LocalAddresses)+len(s.dnsServer.LocalAddresses))
+	localEndpoints := make([]netip.Addr, 0, len(cfg.LocalAddresses)+len(s.dnsServer.LocalAddresses)+len(s.localClusterDNSMappings))
 	for _, ap := range cfg.LocalAddresses {
-		dnsServers = append(dnsServers, ap.Addr())
+		localEndpoints = append(localEndpoints, ap.Addr())
 	}
 	for _, ap := range s.dnsServer.LocalAddresses {
-		dnsServers = append(dnsServers, ap.Addr())
+		localEndpoints = append(localEndpoints, ap.Addr())
 	}
 	for _, ap := range dns.SystemResolvers(s) {
-		dnsServers = append(dnsServers, ap.Addr())
+		localEndpoints = append(localEndpoints, ap.Addr())
 	}
+	localEndpoints = appendPreservedLocalClusterDNSAddresses(localEndpoints, s.localClusterDNSMappings)
 
-	return appendLocalDNSNeverProxy(s, s.neverProxySubnets, subnets, dnsServers)
+	return appendLocalDNSNeverProxy(s, s.neverProxySubnets, subnets, localEndpoints)
 }
 
-// appendLocalDNSNeverProxy adds a host route (/32 or /128) to neverProxy for each
-// DNS server address that is covered by one of the routed subnets and not already
-// covered by a never-proxy entry. It also returns the host routes for those DNS
-// servers (dnsRoutes), so the router can route just these via their real path
-// while leaving every other never-proxy entry on the default route.
-func appendLocalDNSNeverProxy(ctx context.Context, neverProxy, subnets []netip.Prefix, dnsServers []netip.Addr) (allNeverProxy, dnsRoutes []netip.Prefix) {
+// appendLocalDNSNeverProxy returns host routes preserving physical access to
+// local endpoints covered by a proxied subnet.
+func appendLocalDNSNeverProxy(ctx context.Context, neverProxy, subnets []netip.Prefix, localEndpoints []netip.Addr) (allNeverProxy, dnsRoutes []netip.Prefix) {
 	nvp := slices.Clone(neverProxy)
-	for _, dnsIP := range slice.AppendUnique([]netip.Addr{}, dnsServers...) {
-		if !dnsIP.IsValid() || dnsIP.IsLoopback() || dnsIP.IsUnspecified() {
+	for _, localIP := range slice.AppendUnique([]netip.Addr{}, localEndpoints...) {
+		if !localIP.IsValid() || localIP.IsLoopback() || localIP.IsUnspecified() {
 			continue
 		}
 		for _, sn := range subnets {
-			if !sn.Contains(dnsIP) {
+			if !sn.Contains(localIP) {
 				continue
 			}
-			hostRoute := netip.PrefixFrom(dnsIP, dnsIP.BitLen())
+			hostRoute := netip.PrefixFrom(localIP, localIP.BitLen())
 			dnsRoutes = append(dnsRoutes, hostRoute)
 			if !slices.Contains(nvp, hostRoute) {
-				clog.Infof(ctx, "Adding local DNS server %s to never-proxy because it is covered by routed subnet %s", dnsIP, sn)
+				clog.Infof(ctx, "Adding local DNS or preserved cluster address %s to never-proxy because it is covered by routed subnet %s", localIP, sn)
 				nvp = append(nvp, hostRoute)
 			}
 			break
@@ -1404,20 +1553,36 @@ func (s *session) hasPodConnectivity(info *manager.ClusterInfo) bool {
 	}
 }
 
-func (s *session) run(initErrs chan<- error) {
+func (s *session) run(initErrs chan<- error, cancel context.CancelCauseFunc) {
+	s.runWithStart(initErrs, cancel, func(g log.Group) error { return s.Start(g, 0) })
+}
+
+func (s *session) runWithStart(initErrs chan<- error, cancel context.CancelCauseFunc, start func(log.Group) error) {
+	started := time.Now()
 	defer func() {
 		clog.Info(s, "-- session ended")
 	}()
 	g := log.NewGroup(s)
-	if err := s.Start(g, 0); err != nil {
+	if err := start(g); err != nil {
 		defer close(initErrs)
 		initErrs <- err
+		cancel(fmt.Errorf("root daemon session initialization failed: %w", err))
+		// Start can fail after launching DNS and VIF workers. Their teardown
+		// must finish before the service releases this attempt's barrier.
+		_ = g.Wait()
+		s.stop()
 		return
 	}
 	close(initErrs)
 	err := g.Wait()
-	if err != nil {
-		clog.Errorf(s, "session ended with error: %v", err)
+	elapsed := time.Since(started).Round(time.Millisecond)
+	switch {
+	case err != nil:
+		clog.Errorf(s, "session ended after %s with error: %v context=%v cause=%v", elapsed, err, s.Err(), context.Cause(s))
+	case s.Err() != nil:
+		clog.Infof(s, "session context ended after %s: context=%v cause=%v", elapsed, s.Err(), context.Cause(s))
+	default:
+		clog.Infof(s, "session services stopped cleanly after %s", elapsed)
 	}
 }
 
@@ -1743,6 +1908,9 @@ func (s *session) SetExcludes(excludes []string) {
 }
 
 func (s *session) SetMappings(mappings []*rpc.DNSMapping) {
+	if len(s.localClusterDNSMappings) > 0 {
+		mappings = mergeLocalClusterDNSMappings(client.MappingsFromRPC(mappings), s.localClusterDNSMappings).ToRPC()
+	}
 	s.dnsServer.SetMappings(mappings)
 }
 

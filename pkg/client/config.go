@@ -352,8 +352,10 @@ type Timeouts struct {
 	PrivateEndpointDial          time.Duration `json:"endpointDial"`
 	PrivateHelm                  time.Duration `json:"helm"`
 	PrivateIntercept             time.Duration `json:"intercept"`
+	PrivateInterceptEndpointDial time.Duration `json:"interceptEndpointDial"`
 	PrivateRoundtripLatency      time.Duration `json:"roundtripLatency"`
 	PrivateProxyDial             time.Duration `json:"proxyDial"`
+	PrivateTrafficAgentConnect   time.Duration `json:"trafficAgentConnect"`
 	PrivateTrafficManagerAPI     time.Duration `json:"trafficManagerAPI"`
 	PrivateTrafficManagerConnect time.Duration `json:"trafficManagerConnect"`
 	PrivateTrafficAgentArrival   time.Duration `json:"trafficAgentArrival"` // Deprecated.
@@ -380,11 +382,17 @@ const (
 	// TimeoutIntercept is the time to wait for an intercept after the agents has been installed.
 	TimeoutIntercept
 
+	// TimeoutInterceptEndpointDial is how long an intercepted agent should wait for the client to dial the local endpoint.
+	TimeoutInterceptEndpointDial
+
 	// TimeoutProxyDial is how long to wait for the proxy to establish an outbound connection.
 	TimeoutProxyDial
 
 	// TimeoutRoundtripLatency is how much to add to the EndpointDial timeout when establishing a remote connection.
 	TimeoutRoundtripLatency
+
+	// TimeoutTrafficAgentConnect is how long to wait for a direct connection to an agent pod.
+	TimeoutTrafficAgentConnect
 
 	// TimeoutTrafficManagerAPI is how long to wait for the traffic-manager API to connect.
 	TimeoutTrafficManagerAPI
@@ -434,10 +442,14 @@ func (t *Timeouts) Get(timeoutID TimeoutID) time.Duration {
 		timeoutVal = t.PrivateHelm
 	case TimeoutIntercept:
 		timeoutVal = t.PrivateIntercept
+	case TimeoutInterceptEndpointDial:
+		timeoutVal = t.PrivateInterceptEndpointDial
 	case TimeoutProxyDial:
 		timeoutVal = t.PrivateProxyDial
 	case TimeoutRoundtripLatency:
 		timeoutVal = t.PrivateRoundtripLatency
+	case TimeoutTrafficAgentConnect:
+		timeoutVal = t.PrivateTrafficAgentConnect
 	case TimeoutTrafficManagerAPI:
 		timeoutVal = t.PrivateTrafficManagerAPI
 	case TimeoutTrafficManagerConnect:
@@ -495,12 +507,18 @@ func (e timeoutError) Error() string {
 	case TimeoutIntercept:
 		yamlName = "intercept"
 		humanName = "intercept"
+	case TimeoutInterceptEndpointDial:
+		yamlName = "interceptEndpointDial"
+		humanName = "intercept local endpoint dial"
 	case TimeoutProxyDial:
 		yamlName = "proxyDial"
 		humanName = "proxy dial"
 	case TimeoutRoundtripLatency:
 		yamlName = "roundtripDelay"
 		humanName = "additional delay for tunnel roundtrip"
+	case TimeoutTrafficAgentConnect:
+		yamlName = "trafficAgentConnect"
+		humanName = "port-forward connection to a traffic agent"
 	case TimeoutTrafficManagerAPI:
 		yamlName = "trafficManagerAPI"
 		humanName = "traffic manager gRPC API"
@@ -537,11 +555,13 @@ func CheckTimeout(ctx context.Context, err error) error {
 const (
 	defaultTimeoutsClusterConnect        = 20 * time.Second
 	defaultTimeoutsConnectivityCheck     = 500 * time.Millisecond
-	defaultTimeoutsEndpointDial          = 3 * time.Second
+	defaultTimeoutsEndpointDial          = 15 * time.Second
 	defaultTimeoutsHelm                  = 30 * time.Second
 	defaultTimeoutsIntercept             = 30 * time.Second
+	defaultTimeoutsInterceptEndpointDial = 15 * time.Second
 	defaultTimeoutsProxyDial             = 5 * time.Second
 	defaultTimeoutsRoundtripLatency      = 2 * time.Second
+	defaultTimeoutsTrafficAgentConnect   = 15 * time.Second
 	defaultTimeoutsTrafficManagerAPI     = 15 * time.Second
 	defaultTimeoutsTrafficManagerConnect = 60 * time.Second
 	defaultTimeoutsFtpReadWrite          = 1 * time.Minute
@@ -556,8 +576,10 @@ var defaultTimeouts = Timeouts{ //nolint:gochecknoglobals // constant
 	PrivateEndpointDial:          defaultTimeoutsEndpointDial,
 	PrivateHelm:                  defaultTimeoutsHelm,
 	PrivateIntercept:             defaultTimeoutsIntercept,
+	PrivateInterceptEndpointDial: defaultTimeoutsInterceptEndpointDial,
 	PrivateProxyDial:             defaultTimeoutsProxyDial,
 	PrivateRoundtripLatency:      defaultTimeoutsRoundtripLatency,
+	PrivateTrafficAgentConnect:   defaultTimeoutsTrafficAgentConnect,
 	PrivateTrafficManagerAPI:     defaultTimeoutsTrafficManagerAPI,
 	PrivateTrafficManagerConnect: defaultTimeoutsTrafficManagerConnect,
 	PrivateFtpReadWrite:          defaultTimeoutsFtpReadWrite,
@@ -1206,6 +1228,9 @@ func (d *DNS) Equal(o *DNS) bool {
 		o.VIFAddress == d.VIFAddress &&
 		o.LookupTimeout == d.LookupTimeout &&
 		o.RecursionCheck == d.RecursionCheck &&
+		o.UseComplexLookup == d.UseComplexLookup &&
+		o.PreserveLocalClusterDNS == d.PreserveLocalClusterDNS &&
+		slices.Equal(o.PreserveLocalClusterDNSNames, d.PreserveLocalClusterDNSNames) &&
 		slices.Equal(o.IncludeSuffixes, d.IncludeSuffixes) &&
 		slices.Equal(o.ExcludeSuffixes, d.ExcludeSuffixes) &&
 		slices.Equal(o.Excludes, d.Excludes) &&
@@ -1221,7 +1246,8 @@ var DefaultExcludeSuffixes = []string{ //nolint:gochecknoglobals // constant
 }
 
 var defaultDNS = DNS{ //nolint:gochecknoglobals // constant
-	ExcludeSuffixes: DefaultExcludeSuffixes,
+	ExcludeSuffixes:         DefaultExcludeSuffixes,
+	PreserveLocalClusterDNS: true,
 }
 
 func (d *DNS) defaults() DefaultsAware {
@@ -1460,29 +1486,33 @@ type DNS struct {
 	// Deprecated: Use LocalAddresses.
 	LocalAddress netip.AddrPort `json:"localAddress"`
 
-	LocalAddresses   []netip.AddrPort `json:"localAddresses"`
-	VIFAddress       netip.AddrPort   `json:"vifAddress"`
-	IncludeSuffixes  []string         `json:"includeSuffixes"`
-	ExcludeSuffixes  []string         `json:"excludeSuffixes"`
-	Excludes         []string         `json:"excludes"`
-	Mappings         DNSMappings      `json:"mappings"`
-	LookupTimeout    time.Duration    `json:"lookupTimeout"`
-	RecursionCheck   bool             `json:"recursionCheck"`
-	UseComplexLookup bool             `json:"useComplexLookup"`
+	LocalAddresses               []netip.AddrPort `json:"localAddresses"`
+	VIFAddress                   netip.AddrPort   `json:"vifAddress"`
+	IncludeSuffixes              []string         `json:"includeSuffixes"`
+	ExcludeSuffixes              []string         `json:"excludeSuffixes"`
+	Excludes                     []string         `json:"excludes"`
+	Mappings                     DNSMappings      `json:"mappings"`
+	LookupTimeout                time.Duration    `json:"lookupTimeout"`
+	RecursionCheck               bool             `json:"recursionCheck"`
+	UseComplexLookup             bool             `json:"useComplexLookup"`
+	PreserveLocalClusterDNS      bool             `json:"preserveLocalClusterDNS"`
+	PreserveLocalClusterDNSNames []string         `json:"preserveLocalClusterDNSNames"`
 }
 
 // DNSSnake is the same as DNS but with snake_case json/yaml names.
 type DNSSnake struct {
-	Error            string           `json:"error"`
-	LocalAddresses   []netip.AddrPort `json:"local_addresses"`
-	VIFAddress       netip.AddrPort   `json:"vif_address"`
-	IncludeSuffixes  []string         `json:"include_suffixes"`
-	ExcludeSuffixes  []string         `json:"exclude_suffixes"`
-	Excludes         []string         `json:"excludes"`
-	Mappings         DNSMappings      `json:"mappings"`
-	LookupTimeout    time.Duration    `json:"lookup_timeout"`
-	RecursionCheck   bool             `json:"recursion_check"`
-	UseComplexLookup bool             `json:"use_complex_lookup"`
+	Error                        string           `json:"error"`
+	LocalAddresses               []netip.AddrPort `json:"local_addresses"`
+	VIFAddress                   netip.AddrPort   `json:"vif_address"`
+	IncludeSuffixes              []string         `json:"include_suffixes"`
+	ExcludeSuffixes              []string         `json:"exclude_suffixes"`
+	Excludes                     []string         `json:"excludes"`
+	Mappings                     DNSMappings      `json:"mappings"`
+	LookupTimeout                time.Duration    `json:"lookup_timeout"`
+	RecursionCheck               bool             `json:"recursion_check"`
+	UseComplexLookup             bool             `json:"use_complex_lookup"`
+	PreserveLocalClusterDNS      bool             `json:"preserve_local_cluster_dns"`
+	PreserveLocalClusterDNSNames []string         `json:"preserve_local_cluster_dns_names"`
 }
 
 func (d *DNS) ToRPC() *daemon.DNSConfig {
@@ -1515,16 +1545,18 @@ func (d *DNS) ToRPC() *daemon.DNSConfig {
 
 func (d *DNS) ToSnake() *DNSSnake {
 	return &DNSSnake{
-		LocalAddresses:   d.LocalAddresses,
-		VIFAddress:       d.VIFAddress,
-		ExcludeSuffixes:  d.ExcludeSuffixes,
-		IncludeSuffixes:  d.IncludeSuffixes,
-		Excludes:         d.Excludes,
-		Mappings:         d.Mappings,
-		LookupTimeout:    d.LookupTimeout,
-		RecursionCheck:   d.RecursionCheck,
-		UseComplexLookup: d.UseComplexLookup,
-		Error:            d.Error,
+		LocalAddresses:               d.LocalAddresses,
+		VIFAddress:                   d.VIFAddress,
+		ExcludeSuffixes:              d.ExcludeSuffixes,
+		IncludeSuffixes:              d.IncludeSuffixes,
+		Excludes:                     d.Excludes,
+		Mappings:                     d.Mappings,
+		LookupTimeout:                d.LookupTimeout,
+		RecursionCheck:               d.RecursionCheck,
+		UseComplexLookup:             d.UseComplexLookup,
+		PreserveLocalClusterDNS:      d.PreserveLocalClusterDNS,
+		PreserveLocalClusterDNSNames: d.PreserveLocalClusterDNSNames,
+		Error:                        d.Error,
 	}
 }
 

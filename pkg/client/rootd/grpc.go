@@ -2,6 +2,8 @@ package rootd
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -71,36 +73,45 @@ func (s *service) SetDNSMappings(ctx context.Context, req *rpc.SetDNSMappingsReq
 
 func (s *service) Connect(ctx context.Context, info *rpc.NetworkConfig) (reply *rpc.DaemonStatus, err error) {
 	reply = &rpc.DaemonStatus{Version: client.VersionInfo(ctx)}
-	err = s.withSession(ctx, func(_ context.Context, session *session) error {
-		reply.OutboundConfig = s.session.getNetworkConfig()
-		reply.TunnelTransport = s.session.tunnelTransportRPC()
-		reply.AgentTransports = s.session.agentTransportsRPC()
-		return nil
-	})
-	if err == nil {
-		return reply, nil
+	for {
+		s.sessionLock.Lock()
+		if s.session != nil && s.session.Err() == nil {
+			reply.OutboundConfig = s.session.getNetworkConfig()
+			reply.TunnelTransport = s.session.tunnelTransportRPC()
+			reply.AgentTransports = s.session.agentTransportsRPC()
+			s.sessionLock.Unlock()
+			return reply, nil
+		}
+		select {
+		case <-s.sessionRunning:
+			// Keep the lock through initialization. A predecessor has finished
+			// removing its DNS rules and routes before this attempt installs any.
+		default:
+			finished := s.sessionRunning
+			s.sessionLock.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, status.FromContextError(ctx.Err()).Err()
+			case <-s.Done():
+				return nil, status.FromContextError(s.Err()).Err()
+			case <-finished:
+				continue
+			}
+		}
+		break
 	}
-
-	s.sessionLock.Lock()
 	defer s.sessionLock.Unlock()
-	if s.session != nil {
-		// Someone took the lock before we did and created a session.k
-		reply.OutboundConfig = s.session.getNetworkConfig()
-		reply.TunnelTransport = s.session.tunnelTransportRPC()
-		reply.AgentTransports = s.session.agentTransportsRPC()
-		return reply, nil
-	}
 
 	cfg, err := client.UnmarshalJSONConfig(info.ClientConfig, false)
 	if err != nil {
 		return nil, err
 	}
 
-	sessionCtx, sessionCancel := context.WithCancel(s)
+	sessionCtx, sessionCancel := context.WithCancelCause(s)
 	var sn *session
 	sn, err = createSession(client.WithConfig(sessionCtx, cfg), ctx, info, s.activity, dns.CleanupRouting)
 	if err != nil {
-		sessionCancel()
+		sessionCancel(fmt.Errorf("failed to create root daemon session: %w", err))
 		return nil, err
 	}
 	if !s.managed {
@@ -118,37 +129,54 @@ func (s *service) Connect(ctx context.Context, info *rpc.NetworkConfig) (reply *
 	initErrCh := make(chan error, 1)
 
 	sessionRunning := make(chan struct{})
+	// Failed and canceled initialization attempts also own asynchronous workers.
+	// Publish their completion barrier before starting any of those workers.
+	s.sessionRunning = sessionRunning
 	go func() {
 		defer func() {
-			sessionCancel()
+			sessionCancel(context.Canceled)
 			if !s.managed {
 				// Restore log level from service config after session ends.
 				client.ReloadLogLevel(s)
 			}
 			close(sessionRunning)
 		}()
-		sn.run(initErrCh)
+		sn.run(initErrCh, sessionCancel)
 		s.clearSession(sn)
 	}()
 	select {
 	case <-sn.Done():
+		// Failed startup publishes its cause before cancellation. Preserve it
+		// when both the result and cancellation become ready together.
+		select {
+		case err = <-initErrCh:
+			if err != nil {
+				return nil, err
+			}
+		default:
+		}
 		// Session (or service) was canceled.
 		return nil, status.Error(codes.Canceled, "session canceled")
 	case <-ctx.Done():
 		// gRPC context was canceled, probably by the caller.
-		sessionCancel()
+		sessionCancel(errors.New("root daemon Connect call canceled"))
 		return nil, status.Error(codes.Canceled, "connect call canceled")
 	case err = <-initErrCh:
 		if err != nil {
 			// Session failed to initialize.
-			sessionCancel()
+			sessionCancel(fmt.Errorf("root daemon session initialization failed: %w", err))
 			return nil, err
 		}
 		// Session initialized successfully.
 	}
 	s.session = sn
-	s.sessionCancel = sessionCancel
-	s.sessionRunning = sessionRunning
+	s.sessionCancel = func(cause error) {
+		if cause == nil {
+			cause = context.Canceled
+		}
+		clog.Infof(sn, "canceling root daemon session: %v", cause)
+		sessionCancel(cause)
+	}
 	return reply, nil
 }
 
@@ -170,7 +198,7 @@ func (s *service) cancelSession(ctx context.Context) {
 	// We must use a shared read lock when cancelling to avoid a deadlock.
 	var oldSession *session
 	err := s.withSession(ctx, func(_ context.Context, session *session) error {
-		s.sessionCancel()
+		s.sessionCancel(errors.New("root daemon Disconnect request"))
 		oldSession = session
 		return nil
 	})
@@ -272,6 +300,38 @@ func (s *service) WatchAgentPods(stream rpc.Daemon_WatchAgentPodsServer) error {
 			return err
 		}
 	}
+}
+
+func (s *service) AddLocalClientRedirect(ctx context.Context, request *rpc.ReroutePortRequest) (rsp *emptypb.Empty, err error) {
+	err = s.withSession(ctx, func(_ context.Context, session *session) error {
+		var ap types.AddrPortProto
+		err = ap.UnmarshalBinary(request.DstHostPort)
+		if err == nil {
+			session.addLocalClientRedirect(ap, uint16(request.SrcPort))
+		}
+		return err
+	})
+	return &emptypb.Empty{}, err
+}
+
+func (s *service) RemoveLocalClientRedirect(ctx context.Context, request *rpc.ReroutePortRequest) (rsp *emptypb.Empty, err error) {
+	err = s.withSession(ctx, func(_ context.Context, session *session) error {
+		var ap types.AddrPortProto
+		err = ap.UnmarshalBinary(request.DstHostPort)
+		if err == nil {
+			session.removeLocalClientRedirect(ap)
+		}
+		return err
+	})
+	return &emptypb.Empty{}, err
+}
+
+func (s *service) ListLocalClientRedirects(ctx context.Context, _ *emptypb.Empty) (rsp *rpc.LocalClientRedirects, err error) {
+	err = s.withSession(ctx, func(_ context.Context, session *session) error {
+		rsp = &rpc.LocalClientRedirects{Redirects: session.listLocalClientRedirects()}
+		return nil
+	})
+	return rsp, err
 }
 
 func (s *service) withSession(ctx context.Context, f func(context.Context, *session) error) (err error) {

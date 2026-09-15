@@ -2,10 +2,8 @@ package auth
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -40,16 +38,11 @@ const (
 // Authenticator validates bearer tokens using cached Kubernetes TokenReviews, or,
 // first, a store of tokens minted by the x509 auth listener.
 type Authenticator struct {
-	token    authenticator.Token
-	minted   *MintedTokens
-	reviewer *tokenReviewer
-	metrics  *Metrics
-
-	// noManagerAudience remembers tokens the manager-audience review cannot
-	// validate, so Authenticate goes straight to the no-audience review. A
-	// token's audiences are a property of the token string, so an entry
-	// never goes stale; the bound only caps memory.
-	noManagerAudience audienceMemo
+	token         authenticator.Token
+	minted        *MintedTokens
+	reviewer      *tokenReviewer
+	metrics       *Metrics
+	reviewMetrics *tokenReviewMetrics
 }
 
 // Option configures an Authenticator constructed by NewAuthenticator.
@@ -86,9 +79,10 @@ func WithReviewAdmission() Option {
 func NewAuthenticator(ci kubernetes.Interface, opts ...Option) *Authenticator {
 	reviewer := &tokenReviewer{client: ci}
 	a := &Authenticator{
-		token:    cache.New(reviewer, true, successCacheTTL, failureCacheTTL),
-		reviewer: reviewer,
-		metrics:  unregisteredMetrics(),
+		token:         cache.New(reviewer, true, successCacheTTL, failureCacheTTL),
+		reviewer:      reviewer,
+		metrics:       unregisteredMetrics(),
+		reviewMetrics: newTokenReviewMetrics(),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -96,6 +90,7 @@ func NewAuthenticator(ci kubernetes.Interface, opts ...Option) *Authenticator {
 	// The reviewer only needs metrics wired once opts (which may set a.metrics) have
 	// all run.
 	reviewer.metrics = a.metrics
+	reviewer.reviewMetrics = a.reviewMetrics
 	return a
 }
 
@@ -107,64 +102,15 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (*Princi
 			return p, nil
 		}
 	}
-	hash := sha256.Sum256([]byte(token))
-	skipAudience := a.noManagerAudience.has(hash)
-	if !skipAudience {
-		resp, ok, err := a.reviewCounted(authenticator.WithAudiences(ctx, authenticator.Audiences{agentconfig.ManagerTokenAudience}), token)
-		if err != nil {
-			return nil, fmt.Errorf("token review: %w", err)
-		}
-		if ok {
-			return principalFromInfo(resp.User), nil
-		}
-	}
-	// The token may be a user/client token, valid against the API server's own
-	// audience rather than the manager's. Review without an audience constraint.
 	resp, ok, err := a.reviewCounted(ctx, token)
 	if err != nil {
 		return nil, fmt.Errorf("token review: %w", err)
 	}
 	if !ok {
-		a.noManagerAudience.remove(hash)
 		a.metrics.InvalidTokens.Inc()
 		return nil, ErrInvalidToken
 	}
-	a.noManagerAudience.add(hash)
 	return principalFromInfo(resp.User), nil
-}
-
-// audienceMemo is a bounded set of token hashes; when full, it is dropped
-// wholesale, costing at most one extra audience-scoped review per token.
-type audienceMemo struct {
-	mu     sync.Mutex
-	hashes map[[sha256.Size]byte]struct{}
-}
-
-const audienceMemoCapacity = 4096
-
-func (m *audienceMemo) has(hash [sha256.Size]byte) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	_, ok := m.hashes[hash]
-	return ok
-}
-
-func (m *audienceMemo) add(hash [sha256.Size]byte) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.hashes) >= audienceMemoCapacity {
-		m.hashes = nil
-	}
-	if m.hashes == nil {
-		m.hashes = make(map[[sha256.Size]byte]struct{})
-	}
-	m.hashes[hash] = struct{}{}
-}
-
-func (m *audienceMemo) remove(hash [sha256.Size]byte) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.hashes, hash)
 }
 
 // reviewCounted authenticates the token, counting a cache hit when the call completed
@@ -203,7 +149,8 @@ type tokenReviewer struct {
 	client kubernetes.Interface
 	// metrics is set by NewAuthenticator once its options have run; it is
 	// never nil.
-	metrics *Metrics
+	metrics       *Metrics
+	reviewMetrics *tokenReviewMetrics
 	// calls counts AuthenticateToken invocations -- i.e. cache misses.
 	calls atomic.Uint64
 	// limiter and sem, when set by WithReviewAdmission, bound the rate and
@@ -214,6 +161,16 @@ type tokenReviewer struct {
 
 func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 	t.calls.Add(1)
+	resp, ok, err := t.review(ctx, token, []string{agentconfig.ManagerTokenAudience}, "manager")
+	if err != nil || ok {
+		return resp, ok, err
+	}
+	// API-audience client credentials share one cached decision with the manager-audience attempt.
+	auds, _ := authenticator.AudiencesFrom(ctx)
+	return t.review(ctx, token, auds, "api")
+}
+
+func (t *tokenReviewer) review(ctx context.Context, token string, audiences []string, audienceLabel string) (*authenticator.Response, bool, error) {
 	if t.limiter != nil {
 		if !t.limiter.Allow() {
 			t.metrics.RateLimited.Inc()
@@ -227,15 +184,12 @@ func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*a
 			return nil, false, errTooManyReviews
 		}
 	}
-	auds, hasAuds := authenticator.AudiencesFrom(ctx)
 	review := &authenticationv1.TokenReview{
-		Spec: authenticationv1.TokenReviewSpec{Token: token},
+		Spec: authenticationv1.TokenReviewSpec{Token: token, Audiences: audiences},
 	}
-	if hasAuds {
-		review.Spec.Audiences = auds
-	}
+	start := time.Now()
 	result, err := t.client.AuthenticationV1().TokenReviews().Create(ctx, review, metav1.CreateOptions{})
-	if hasAuds {
+	if audienceLabel == "manager" {
 		t.metrics.FirstReviews.Inc()
 	} else {
 		t.metrics.FallbackReviews.Inc()
@@ -243,6 +197,14 @@ func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*a
 	if err != nil {
 		t.metrics.APIFailures.Inc()
 	}
+	outcome := "error"
+	if err == nil {
+		outcome = "rejected"
+		if result.Status.Authenticated {
+			outcome = "authenticated"
+		}
+	}
+	t.reviewMetrics.observe(audienceLabel, outcome, time.Since(start))
 	if err != nil {
 		return nil, false, err
 	}

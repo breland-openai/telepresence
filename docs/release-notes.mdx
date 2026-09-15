@@ -9,6 +9,18 @@ import { Note, Title, Body } from '@site/src/components/ReleaseNotes'
 # Telepresence Release Notes
 ## Version 2.32.0
 <Note>
+	<Title type="bugfix">Recover DNS after interrupted root daemon sessions</Title>
+	<Body>
+On Linux, root daemon startup removes recognized stale DNS redirects to unused local UDP endpoints before cluster authentication needs DNS. Reconnecting also waits for the previous session's workers and routing cleanup to finish, including when session initialization fails.
+  </Body>
+</Note>
+<Note>
+	<Title type="bugfix">Recover promptly from stalled manager sessions</Title>
+	<Body>
+Manager keepalive failures now use the existing session repair path instead of ending the client session. Expired sessions recover immediately, while repeated transient failures trigger repair without dropping active intercepts.
+  </Body>
+</Note>
+<Note>
 	<Title type="feature">Completion for use flag</Title>
 	<Body>
 Automcompletion for <code>use</code> flag now dynamically generates completions based on existing daemons.
@@ -18,6 +30,18 @@ Automcompletion for <code>use</code> flag now dynamically generates completions 
 	<Title type="bugfix">Preserve agent images during concurrent pod injection</Title>
 	<Body>
 The agent injector reused a cached sidecar config across concurrent pod admissions while serializing that config temporarily cleared creation-only fields such as the traffic-agent image. A concurrent admission could observe the cleared image and produce invalid traffic-agent and init-container patches with empty image fields. Serialization now strips those fields from a local copy, so parallel pod creation cannot corrupt the cached config or block a workload rollout.
+  </Body>
+</Note>
+<Note>
+	<Title type="feature" docs="reference/attachments/cli">HTTP intercepts can follow every workload selected by one Service</Title>
+	<Body>
+A Kubernetes Service can route requests to more than one workload, such as stable and canary Deployments, while an intercept previously followed only the workload named by the user. HTTP intercepts now let each selected workload participate in one logical intercept, so filtered traffic reaches the same local handler regardless of which selected workload receives it. If the selected workloads or their traffic-agents cannot support shared interception, Telepresence warns and keeps the historical single-workload behavior instead of failing the intercept.
+  </Body>
+</Note>
+<Note>
+	<Title type="bugfix">Improve selected-intercept tunnel stability</Title>
+	<Body>
+Selected-intercept tunnels now reconnect agent dial watchers with backoff, clean up abandoned forwards more carefully, use separate timeouts for agent connections and intercepted endpoints, and reject dial requests when responder capacity is full instead of letting work accumulate.
   </Body>
 </Note>
 <Note>

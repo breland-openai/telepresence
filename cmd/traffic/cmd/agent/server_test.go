@@ -7,14 +7,17 @@ package agent
 import (
 	"context"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/blang/semver/v4"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/telepresenceio/clog/testutil"
 	agentrpc "github.com/telepresenceio/telepresence/rpc/v2/agent"
@@ -23,6 +26,80 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/sessiontoken"
 	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
 )
+
+type metricsManagerClient struct {
+	rpc.ManagerClient
+	reports chan *rpc.TunnelMetrics
+}
+
+func (m *metricsManagerClient) ReportMetrics(
+	_ context.Context,
+	metrics *rpc.TunnelMetrics,
+	_ ...grpc.CallOption,
+) (*emptypb.Empty, error) {
+	m.reports <- metrics
+	return &emptypb.Empty{}, nil
+}
+
+func TestReportMetricsBeforeManagerConnection(t *testing.T) {
+	s := &state{}
+	s.ReportMetrics(context.Background(), &rpc.TunnelMetrics{ClientSessionId: "early-session"})
+	s.RefreshQuicAgentListener(context.Background(), context.Background())
+}
+
+func TestReportMetricsFollowsManagerReconnects(t *testing.T) {
+	s := &state{}
+	first := &metricsManagerClient{reports: make(chan *rpc.TunnelMetrics, 1)}
+	second := &metricsManagerClient{reports: make(chan *rpc.TunnelMetrics, 1)}
+
+	s.SetManager(&rpc.SessionInfo{SessionId: "first-manager"}, first, semver.Version{})
+	firstMetrics := &rpc.TunnelMetrics{ClientSessionId: "first-client"}
+	s.ReportMetrics(context.Background(), firstMetrics)
+	select {
+	case reported := <-first.reports:
+		require.Same(t, firstMetrics, reported)
+	case <-time.After(time.Second):
+		t.Fatal("first manager never received metrics")
+	}
+
+	s.SetManager(&rpc.SessionInfo{SessionId: "second-manager"}, second, semver.Version{})
+	secondMetrics := &rpc.TunnelMetrics{ClientSessionId: "second-client"}
+	s.ReportMetrics(context.Background(), secondMetrics)
+	select {
+	case reported := <-second.reports:
+		require.Same(t, secondMetrics, reported)
+	case <-time.After(time.Second):
+		t.Fatal("second manager never received metrics")
+	}
+}
+
+func TestManagerStateConcurrentReconnects(t *testing.T) {
+	const iterations = 100
+	s := &state{}
+	manager := &metricsManagerClient{reports: make(chan *rpc.TunnelMetrics, iterations)}
+	ctx := context.Background()
+	var workers sync.WaitGroup
+	workers.Add(2)
+
+	go func() {
+		defer workers.Done()
+		for range iterations {
+			s.SetManager(&rpc.SessionInfo{SessionId: "manager-session"}, manager, semver.Version{})
+		}
+	}()
+
+	go func() {
+		defer workers.Done()
+		for range iterations {
+			_ = s.ManagerClient()
+			_ = s.ManagerVersion()
+			_ = s.SessionInfo()
+			s.ReportMetrics(ctx, &rpc.TunnelMetrics{ClientSessionId: "client-session"})
+		}
+	}()
+
+	workers.Wait()
+}
 
 // fakeWatchDialServer is a minimal agentrpc.Agent_WatchDialServer: WatchDial only calls
 // Context and Send, so embedding a nil grpc.ServerStream satisfies the rest of the

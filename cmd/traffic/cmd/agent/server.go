@@ -27,6 +27,11 @@ type awaitingForward struct {
 	doneCh   <-chan struct{}
 }
 
+const (
+	clientTunnelSlowAfter       = time.Second
+	clientTunnelStillWaitingLog = 5 * time.Second
+)
+
 func (s *state) Version(context.Context, *emptypb.Empty) (*rpc.VersionInfo2, error) {
 	return &rpc.VersionInfo2{Name: DisplayName, Version: version.Version}, nil
 }
@@ -113,8 +118,11 @@ func (s *state) WatchDial(session *rpc.SessionInfo, server agent.Agent_WatchDial
 	if err != nil {
 		return err
 	}
-	clog.Debugf(ctx, "WatchDial called from client %s", session.SessionId)
-	defer clog.Debugf(ctx, "WatchDial ended from client %s", session.SessionId)
+	started := time.Now()
+	clog.Infof(ctx, "WatchDial called from client %s", session.SessionId)
+	defer func() {
+		clog.Infof(ctx, "WatchDial ended from client %s after %s: context=%v", session.SessionId, time.Since(started).Round(time.Millisecond), ctx.Err())
+	}()
 	drCh := make(chan *rpc.DialRequest)
 
 	// Displacement policy: a verified caller always takes over the slot, even from a
@@ -167,7 +175,10 @@ func (s *state) WatchDial(session *rpc.SessionInfo, server agent.Agent_WatchDial
 func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID tunnel.SessionID, id tunnel.ConnID, roundTripLatency, dialTimeout time.Duration,
 ) (tunnel.Stream, error) {
 	clog.Debugf(ctx, "Creating tunnel to client %s for id %s", sessionID, id)
+	createStart := time.Now()
 	var drCh chan<- *rpc.DialRequest
+	var awc *xsync.Map[tunnel.ConnID, *awaitingForward]
+	var aw *awaitingForward
 	var stCh <-chan tunnel.Stream
 
 	// A retry is needed here because what actually happens is that the dial watcher channel drCh is inserted when the
@@ -177,10 +188,10 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 		var ok bool
 		drCh, ok = s.dialWatchers.Load(sessionID)
 		if ok {
-			awc, _ := s.awaitingForwards.LoadOrCompute(sessionID, func() (*xsync.Map[tunnel.ConnID, *awaitingForward], bool) {
+			awc, _ = s.awaitingForwards.LoadOrCompute(sessionID, func() (*xsync.Map[tunnel.ConnID, *awaitingForward], bool) {
 				return xsync.NewMap[tunnel.ConnID, *awaitingForward](), false
 			})
-			aw, _ := awc.LoadOrCompute(id, func() (*awaitingForward, bool) {
+			aw, _ = awc.LoadOrCompute(id, func() (*awaitingForward, bool) {
 				return &awaitingForward{
 					streamCh: make(chan tunnel.Stream),
 					doneCh:   ctx.Done(),
@@ -192,28 +203,69 @@ func (s *state) CreateClientStream(ctx context.Context, _ tunnel.Tag, sessionID 
 		return fmt.Errorf("unable to create tunnel to client %s for id %s: no dial watcher", sessionID, id)
 	}, backoff.WithContext(backoff.NewConstantBackOff(20*time.Millisecond), ctx))
 	if err != nil {
+		clog.Warnf(ctx, "unable to create tunnel to client %s for id %s after %s: %v", sessionID, id, time.Since(createStart).Round(time.Millisecond), err)
 		return nil, err
 	}
+	defer func() {
+		if awc != nil && aw != nil {
+			awc.Compute(id, func(current *awaitingForward, loaded bool) (*awaitingForward, xsync.ComputeOp) {
+				if loaded && current == aw {
+					return nil, xsync.DeleteOp
+				}
+				return current, xsync.CancelOp
+			})
+		}
+	}()
 
-	drCh <- &rpc.DialRequest{ConnId: []byte(id), DialTimeout: int64(dialTimeout), RoundtripLatency: int64(roundTripLatency)}
-
+	requestStart := time.Now()
 	select {
 	case <-ctx.Done():
-		clog.Errorf(ctx, "unable to create tunnel to client %s for id %s: %v", sessionID, id, ctx.Done())
+		clog.Errorf(ctx, "unable to send DialRequest to client %s for id %s: %v", sessionID, id, ctx.Err())
 		return nil, ctx.Err()
-	case stream := <-stCh:
-		clog.Debugf(ctx, "Created tunnel to client %s for id %s", sessionID, id)
-		return stream, nil
+	case drCh <- &rpc.DialRequest{ConnId: []byte(id), DialTimeout: int64(dialTimeout), RoundtripLatency: int64(roundTripLatency)}:
+	}
+
+	waitLog := time.NewTimer(clientTunnelSlowAfter)
+	defer waitLog.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			clog.Errorf(ctx, "unable to create tunnel to client %s for id %s after %s: %v", sessionID, id, time.Since(requestStart).Round(time.Millisecond), ctx.Err())
+			return nil, ctx.Err()
+		case stream := <-stCh:
+			if elapsed := time.Since(requestStart); elapsed > clientTunnelSlowAfter {
+				clog.Warnf(ctx, "created tunnel to client %s for id %s slowly in %s", sessionID, id, elapsed.Round(time.Millisecond))
+			} else {
+				clog.Debugf(ctx, "Created tunnel to client %s for id %s in %s", sessionID, id, elapsed)
+			}
+			return stream, nil
+		case <-waitLog.C:
+			clog.Warnf(
+				ctx,
+				"still waiting for client tunnel after %s: clientSession=%s conn=%s dialTimeout=%s roundtripLatency=%s",
+				time.Since(requestStart).Round(time.Millisecond),
+				sessionID,
+				id,
+				dialTimeout,
+				roundTripLatency,
+			)
+			waitLog.Reset(clientTunnelStillWaitingLog)
+		}
 	}
 }
 
 // ReportMetrics makes an attempt to send metrics to the traffic-manager. The provided context is just
 // for logging (it can be cancelled). Errors are logged but not fatal.
 func (s *state) ReportMetrics(ctx context.Context, metrics *rpc.TunnelMetrics) {
+	manager := s.ManagerClient()
+	if manager == nil {
+		return
+	}
+
 	go func() {
 		mCtx, mCancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 		defer mCancel()
-		_, err := s.manager.ReportMetrics(mCtx, metrics)
+		_, err := manager.ReportMetrics(mCtx, metrics)
 		if err != nil && status.Code(err) != codes.Canceled {
 			clog.Errorf(ctx, "ReportMetrics failed: %v", err)
 		}

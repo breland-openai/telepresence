@@ -8,10 +8,9 @@ gone before Helm applies the StatefulSet.
 
 "helm.sh/hook": pre-upgrade already means Helm only ever runs this Job
 during `helm upgrade`, never `helm install` -- a fresh install has no
-Deployment to migrate, so no additional IsInstall guard is needed. The
-ServiceAccount/Role/RoleBinding below aren't hook resources themselves;
-they render on every install/upgrade like any other RBAC object,
-harmlessly unused outside a Deployment-to-StatefulSet upgrade.
+Deployment to migrate, so no additional IsInstall guard is needed. Its
+ServiceAccount, Role, and RoleBinding are earlier hooks, kept until the
+next upgrade so Helm cannot remove them before the Job uses them.
 
 Uses the same curl image as pre-delete-hook.yaml rather than adding an
 external kubectl image: the Kubernetes API server is a plain HTTPS REST
@@ -26,6 +25,10 @@ metadata:
   namespace: {{ include "traffic-manager.namespace" $ }}
   labels:
     {{- include "telepresence.labels" $ | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-20"
+    "helm.sh/hook-delete-policy": before-hook-creation
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -34,6 +37,10 @@ metadata:
   namespace: {{ include "traffic-manager.namespace" $ }}
   labels:
     {{- include "telepresence.labels" $ | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-15"
+    "helm.sh/hook-delete-policy": before-hook-creation
 rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
@@ -47,6 +54,10 @@ metadata:
   namespace: {{ include "traffic-manager.namespace" $ }}
   labels:
     {{- include "telepresence.labels" $ | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

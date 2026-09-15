@@ -316,3 +316,30 @@ func TestSessionBoundHandlers_UnknownSession(t *testing.T) {
 	err = mgr.WatchClusterInfo(unknown, newFakeServerStream[rpc.ClusterInfo](sctx))
 	req.Equal(codes.NotFound, status.Code(err))
 }
+
+func TestSessionBoundHandlers_MissingSession(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	ctx := testutil.NewContext(t, true)
+	_, mgr, sctx := getTestClientConnAndService(ctx, t, nil)
+
+	for _, tc := range []struct {
+		name    string
+		session *rpc.SessionInfo
+	}{
+		{name: "nil"},
+		{name: "empty", session: &rpc.SessionInfo{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := mgr.GetKnownWorkloadKinds(sctx, tc.session)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			_, err = mgr.LookupDNS(sctx, &rpc.DNSRequest{Session: tc.session, Name: "echo.default.", Type: 1})
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			_, err = mgr.UninstallAgents(sctx, &rpc.UninstallAgentsRequest{SessionInfo: tc.session})
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			err = mgr.WatchClusterInfo(tc.session, newFakeServerStream[rpc.ClusterInfo](sctx))
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			err = mgr.WatchIntercepts(tc.session, newFakeServerStream[rpc.InterceptInfoSnapshot](sctx))
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+		})
+	}
+}

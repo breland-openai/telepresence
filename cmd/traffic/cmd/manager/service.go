@@ -28,6 +28,7 @@ import (
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/yaml"
 
 	"github.com/telepresenceio/clog"
@@ -78,6 +79,7 @@ type service struct {
 	state              *state.State
 	clusterInfo        cluster.Info
 	configWatcher      config.Watcher
+	authenticator      *auth.Authenticator
 	authorizer         *auth.Authorizer
 	authMode           auth.Mode
 	authGrant          auth.Grant
@@ -103,7 +105,7 @@ type service struct {
 	quicDiscovery *quictunnel.Discovery
 
 	// mintedTokens holds the bearer tokens the x509 auth listener has issued, shared
-	// with the Authenticator constructed in serveHTTP so a token minted there is
+	// with the Authenticator so a token minted there is
 	// accepted on the regular gRPC channel. It exists regardless of whether the
 	// listener is enabled; an always-empty store is harmless.
 	mintedTokens *auth.MintedTokens
@@ -132,13 +134,14 @@ func checkCompat(ctx context.Context, name, requiredVersion string) error {
 	return nil
 }
 
-func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher) (Service, error) {
+func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, tokenReviewClient kubernetes.Interface) (Service, error) {
 	ret := &service{
 		id:            uuid.New().String(),
 		configWatcher: configWatcher,
 		authorizer:    auth.NewAuthorizer(k8sapi.GetK8sInterface(ctx)),
 		mintedTokens:  auth.NewMintedTokens(),
 	}
+	ret.authenticator = auth.NewAuthenticator(tokenReviewClient, auth.WithMintedTokens(ret.mintedTokens))
 
 	// These are context-dependent, so build them once the pool is up
 	var err error
@@ -325,7 +328,24 @@ func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClient
 
 	now := time.Now()
 	st.RestoreClient(sessionID, client, auth.PrincipalFrom(ctx), now)
-	agents := slices.DeleteFunc(slices.Clone(info.Agents), func(agent *rpc.AgentInfo) bool {
+	restoredAgents := info.Agents
+	if legacyForkClient(client) && len(restoredAgents) != 0 {
+		// Legacy compact snapshots encode their omitted-environment marker at
+		// the field number now used by the QUIC port. They therefore look
+		// complete after decoding, so let the real traffic-agents reconnect
+		// instead of restoring incomplete client-owned snapshots.
+		clog.Debugf(ctx, "Not restoring %d agents supplied by a legacy client; waiting for the traffic-agents to reconnect", len(restoredAgents))
+		restoredAgents = nil
+	}
+	agents := slices.DeleteFunc(slices.Clone(restoredAgents), func(agent *rpc.AgentInfo) bool {
+		if agent.GetContainerEnvironmentOmitted() {
+			// Compact watch snapshots are intentionally incomplete. Restoring
+			// one after a manager restart would make the omitted container
+			// environment authoritative until the real traffic-agent
+			// reconnects, breaking consumers that need it.
+			clog.Debugf(ctx, "Not restoring compact agent %s.%s; waiting for the traffic-agent to reconnect", agent.Name, agent.Namespace)
+			return true
+		}
 		if st.ManagesNamespace(ctx, agent.Namespace) {
 			return false
 		}
@@ -398,6 +418,9 @@ func (s *service) ArriveAsAgent(ctx context.Context, agent *rpc.AgentInfo) (*rpc
 	if val := validateAgent(agent); val != "" {
 		return nil, status.Error(codes.InvalidArgument, val)
 	}
+	if err := normalizeLegacyAgentInfo(agent); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid legacy agent information: %v", err)
+	}
 
 	for _, cn := range agent.Containers {
 		s.removeExcludedEnvVars(cn.Environment)
@@ -424,6 +447,9 @@ func (s *service) ReconnectAgent(ctx context.Context, rq *rpc.ReconnectAgentRequ
 	sessionID := tunnel.SessionID(rq.GetSession().SessionId)
 	if _, _, err := s.ensureAgentSession(ctx, rq.Session); err != nil && status.Code(err) != codes.NotFound {
 		return nil, err
+	}
+	if err := normalizeLegacyAgentInfo(rq.Agent); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid legacy agent information: %v", err)
 	}
 	principal, mismatch := verifiedAgentPrincipal(ctx, rq.Agent)
 	if mismatch && s.authMode == auth.ModeEnforcing {
@@ -539,13 +565,15 @@ func (s *service) Depart(ctx context.Context, session *rpc.SessionInfo) (*empty.
 		if err := agentOwnershipError(ctx, sessionID, agent); err != nil {
 			return nil, err
 		}
+		go s.state.RemoveAgentSession(agent)
+		return &empty.Empty{}, nil
 	} else if client := s.state.GetClient(sessionID); client != nil {
 		if err := state.ClientOwnershipError(ctx, sessionID, client); err != nil {
 			return nil, err
 		}
+		// There's no reason for the caller to wait for this removal to complete.
+		go s.state.RemoveSession(context.WithoutCancel(ctx), sessionID)
 	}
-	// There's no reason for the caller to wait for this removal to complete.
-	go s.state.RemoveSession(context.WithoutCancel(ctx), sessionID)
 	return &empty.Empty{}, nil
 }
 
@@ -764,7 +792,7 @@ func (s *service) watchAgentPods(ctx context.Context, namespaces []string, strea
 				Namespace:    a.Namespace,
 				PodIp:        aip.AsSlice(),
 				ApiPort:      a.ApiPort,
-				Intercepted:  s.state.IsInterceptedBy(a.Name, a.Namespace, clientSessionID),
+				Intercepted:  s.state.IsInterceptedBy(a, clientSessionID),
 				NodeAgent:    a.NodeAgent,
 				QuicSni:      quicSNIForAgent(a.QuicPort, a.PodUid),
 			}
@@ -865,7 +893,7 @@ func (p *agentPodProjection) run(ctx context.Context, sessionDone <-chan struct{
 						Namespace:    a.Namespace,
 						PodIp:        aip.AsSlice(),
 						ApiPort:      a.ApiPort,
-						Intercepted:  p.s.state.IsInterceptedBy(a.Name, a.Namespace, p.clientSessionID),
+						Intercepted:  p.s.state.IsInterceptedBy(a, p.clientSessionID),
 						NodeAgent:    a.NodeAgent,
 						QuicSni:      quicSNIForAgent(a.QuicPort, a.PodUid),
 						Version:      a.Version,
@@ -888,7 +916,8 @@ func (p *agentPodProjection) refreshIntercepted() {
 		if p.m.IsInactive(types.UID(a.PodId)) {
 			return true
 		}
-		intercepted := p.s.state.IsInterceptedBy(a.WorkloadName, a.Namespace, p.clientSessionID)
+		agent := p.s.state.GetAgent(tunnel.SessionID(state.AgentSessionIDPrefix + a.PodId))
+		intercepted := p.s.state.IsInterceptedBy(agent, p.clientSessionID)
 		p.agentPodInfos.Compute(k, func(a *rpc.AgentPodInfo, loaded bool) (*rpc.AgentPodInfo, xsync.ComputeOp) {
 			if loaded && a.Intercepted != intercepted {
 				a := proto.Clone(a).(*rpc.AgentPodInfo)
@@ -936,7 +965,8 @@ func (s *service) WatchAgents(session *rpc.SessionInfo, stream grpc.ServerStream
 		return err
 	}
 	ns := clientInfo.Namespace
-	return s.watchAgents(ctx, func(_ tunnel.SessionID, a *state.AgentSession) bool { return a.Namespace == ns }, stream)
+	return s.watchAgents(ctx, clientInfo.SupportsCompactAgentInfo, legacyForkClient(clientInfo.ClientInfo),
+		func(_ tunnel.SessionID, a *state.AgentSession) bool { return a.Namespace == ns }, stream)
 }
 
 func infosEqual(a, b *rpc.AgentInfo) bool {
@@ -946,7 +976,49 @@ func infosEqual(a, b *rpc.AgentInfo) bool {
 	return proto.Equal(a, b)
 }
 
-func (s *service) watchAgents(ctx context.Context, includeAgent func(tunnel.SessionID, *state.AgentSession) bool, stream grpc.ServerStreamingServer[rpc.AgentInfoSnapshot]) error {
+// agentInfoForWatch omits the potentially huge container environment maps for
+// clients that advertise support for fetching full agent details on demand.
+// The remaining AgentInfo is immutable state, so sharing its small repeated
+// fields is safe while avoiding a full proto.Clone of the omitted maps.
+func agentInfoForWatch(ai *rpc.AgentInfo, compact bool) *rpc.AgentInfo {
+	if !compact {
+		return ai
+	}
+	containers := make(map[string]*rpc.AgentInfo_ContainerInfo, len(ai.Containers))
+	for name, container := range ai.Containers {
+		containers[name] = &rpc.AgentInfo_ContainerInfo{
+			MountPoint: container.MountPoint,
+			Mounts:     container.Mounts,
+		}
+	}
+	return &rpc.AgentInfo{
+		Name:                        ai.Name,
+		Kind:                        ai.Kind,
+		Namespace:                   ai.Namespace,
+		PodName:                     ai.PodName,
+		PodIp:                       ai.PodIp,
+		PodUid:                      ai.PodUid,
+		ApiPort:                     ai.ApiPort,
+		SftpPort:                    ai.SftpPort,
+		FtpPort:                     ai.FtpPort,
+		Product:                     ai.Product,
+		Version:                     ai.Version,
+		Mechanisms:                  ai.Mechanisms,
+		Containers:                  containers,
+		NodeAgent:                   ai.NodeAgent,
+		QuicPort:                    ai.QuicPort,
+		InterceptTargets:            ai.InterceptTargets,
+		ContainerEnvironmentOmitted: true,
+	}
+}
+
+func (s *service) watchAgents(
+	ctx context.Context,
+	compact bool,
+	legacy bool,
+	includeAgent func(tunnel.SessionID, *state.AgentSession) bool,
+	stream grpc.ServerStreamingServer[rpc.AgentInfoSnapshot],
+) error {
 	deltaCh := s.state.WatchAgents(ctx, includeAgent)
 	sessionDone, err := s.state.SessionDone(managerutil.GetSessionID(ctx))
 	if err != nil {
@@ -972,7 +1044,7 @@ func (s *service) watchAgents(ctx context.Context, includeAgent func(tunnel.Sess
 		for _, agentSessionID := range agentSessionIDs {
 			ag, ok := snapshot.Load(agentSessionID)
 			if ok && !m.IsInactive(types.UID(ag.PodUid)) {
-				agents = append(agents, ag.AgentInfo)
+				agents = append(agents, agentInfoForClientWatch(ag.AgentInfo, compact, legacy))
 			}
 		}
 		if firstSnap {
@@ -1007,6 +1079,8 @@ func (s *service) WatchAgentsDelta(session *rpc.SessionInfo, stream grpc.ServerS
 		return err
 	}
 	ns := clientInfo.Namespace
+	compact := clientInfo.SupportsCompactAgentInfo
+	legacy := legacyForkClient(clientInfo.ClientInfo)
 	deltaCh := s.state.WatchAgents(ctx, func(_ tunnel.SessionID, a *state.AgentSession) bool { return a.Namespace == ns })
 	sessionDone, err := s.state.SessionDone(managerutil.GetSessionID(ctx))
 	if err != nil {
@@ -1023,7 +1097,7 @@ func (s *service) WatchAgentsDelta(session *rpc.SessionInfo, stream grpc.ServerS
 			if rl := len(delta.Upserts); rl > 0 {
 				aid.Upserts = make(map[string]*rpc.AgentInfo, rl)
 				for k, v := range delta.Upserts {
-					aid.Upserts[string(k)] = v.AgentInfo
+					aid.Upserts[string(k)] = agentInfoForClientWatch(v.AgentInfo, compact, legacy)
 				}
 			}
 			if rl := len(delta.Removals); rl > 0 {
@@ -1042,12 +1116,77 @@ func (s *service) WatchAgentsDelta(session *rpc.SessionInfo, stream grpc.ServerS
 	}
 }
 
+// filterInterceptDeltas keeps a per-subscriber view of matching intercepts.
+// Unlike cache.Map's stateless filter, it emits a removal when an updated
+// intercept stops matching, which is required when a Service selector prunes
+// a participant that previously received the intercept.
+func filterInterceptDeltas(
+	ctx context.Context,
+	source <-chan cache.Delta[string, *state.Intercept],
+	include func(string, *state.Intercept) bool,
+) <-chan cache.Delta[string, *state.Intercept] {
+	filtered := make(chan cache.Delta[string, *state.Intercept], 1)
+	go func() {
+		defer close(filtered)
+		included := make(map[string]*state.Intercept)
+		initialized := false
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case delta, ok := <-source:
+				if !ok {
+					return
+				}
+				next := cache.Delta[string, *state.Intercept]{}
+				for id := range delta.Removals {
+					if previous, exists := included[id]; exists {
+						if next.Removals == nil {
+							next.Removals = make(map[string]*state.Intercept)
+						}
+						next.Removals[id] = previous
+						delete(included, id)
+					}
+				}
+				for id, intercept := range delta.Upserts {
+					if include == nil || include(id, intercept) {
+						if next.Upserts == nil {
+							next.Upserts = make(map[string]*state.Intercept)
+						}
+						next.Upserts[id] = intercept
+						included[id] = intercept
+						continue
+					}
+					if previous, exists := included[id]; exists {
+						if next.Removals == nil {
+							next.Removals = make(map[string]*state.Intercept)
+						}
+						next.Removals[id] = previous
+						delete(included, id)
+					}
+				}
+				if initialized && len(next.Upserts) == 0 && len(next.Removals) == 0 {
+					continue
+				}
+				initialized = true
+				select {
+				case <-ctx.Done():
+					return
+				case filtered <- next:
+				}
+			}
+		}
+	}()
+	return filtered
+}
+
 func (s *service) watchIntercepts(ctx context.Context, session *rpc.SessionInfo) (<-chan cache.Delta[string, *state.Intercept], <-chan struct{}, error) {
 	sessionID := tunnel.SessionID(session.GetSessionId())
 	if sessionID == "" {
 		return nil, nil, errors.Errorf(codes.InvalidArgument, "a session id is required")
 	}
 	var filter func(id string, info *state.Intercept) bool
+	participantAwareFilter := false
 	sessionDone, err := s.state.SessionDone(sessionID)
 	if err != nil {
 		return nil, nil, err
@@ -1058,7 +1197,7 @@ func (s *service) watchIntercepts(ctx context.Context, session *rpc.SessionInfo)
 			return nil, nil, err
 		}
 		filter = func(id string, info *state.Intercept) bool {
-			if info.Spec.Namespace != agent.Namespace || info.Spec.Agent != agent.Name {
+			if !state.AgentMatchesInterceptInfo(agent.AgentInfo, info) {
 				// Don't return intercepts for different agents.
 				return false
 			}
@@ -1080,6 +1219,7 @@ func (s *service) watchIntercepts(ctx context.Context, session *rpc.SessionInfo)
 				return false
 			}
 		}
+		participantAwareFilter = true
 	} else {
 		// sessionID refers to a client session.
 		client := s.state.GetClient(sessionID)
@@ -1095,6 +1235,10 @@ func (s *service) watchIntercepts(ctx context.Context, session *rpc.SessionInfo)
 				!state.IsChildIntercept(info.Spec)
 		}
 	}
+
+	if participantAwareFilter {
+		return filterInterceptDeltas(ctx, s.state.WatchIntercepts(ctx, nil), filter), sessionDone, nil
+	}
 	return s.state.WatchIntercepts(ctx, filter), sessionDone, nil
 }
 
@@ -1106,12 +1250,13 @@ func (s *service) WatchIntercepts(session *rpc.SessionInfo, stream grpc.ServerSt
 	if err != nil {
 		return err
 	}
+	agentWatch := s.state.GetAgent(tunnel.SessionID(session.GetSessionId())) != nil
 	snapshot := cache.NewClientMap[string, *state.Intercept]()
 	return snapshot.Watch(sessionDone, deltaCh, func() error {
 		clog.Debug(ctx, "Sending update")
 		intercepts := make([]*rpc.InterceptInfo, 0, snapshot.Size())
 		snapshot.Range(func(_ string, intercept *state.Intercept) bool {
-			intercepts = append(intercepts, intercept.InterceptInfo)
+			intercepts = append(intercepts, watcherInterceptInfo(intercept.InterceptInfo, agentWatch))
 			return true
 		})
 		sort.Slice(intercepts, func(i, j int) bool {
@@ -1133,6 +1278,7 @@ func (s *service) WatchInterceptsDelta(session *rpc.SessionInfo, stream grpc.Ser
 	if err != nil {
 		return err
 	}
+	agentWatch := s.state.GetAgent(tunnel.SessionID(session.GetSessionId())) != nil
 	for {
 		select {
 		case <-ctx.Done():
@@ -1144,7 +1290,7 @@ func (s *service) WatchInterceptsDelta(session *rpc.SessionInfo, stream grpc.Ser
 			if rl := len(delta.Upserts); rl > 0 {
 				iid.Upserts = make(map[string]*rpc.InterceptInfo, rl)
 				for k, v := range delta.Upserts {
-					iid.Upserts[k] = v.InterceptInfo
+					iid.Upserts[k] = watcherInterceptInfo(v.InterceptInfo, agentWatch)
 				}
 			}
 			clog.Debugf(ctx, "Sending %d upserts and %d removals", len(iid.Upserts), len(iid.Removals))
@@ -1153,6 +1299,28 @@ func (s *service) WatchInterceptsDelta(session *rpc.SessionInfo, stream grpc.Ser
 				return err
 			}
 		}
+	}
+}
+
+func watcherInterceptInfo(info *rpc.InterceptInfo, agentWatch bool) *rpc.InterceptInfo {
+	if !agentWatch {
+		return info
+	}
+	return &rpc.InterceptInfo{
+		Spec:              info.Spec,
+		Id:                info.Id,
+		ClientSession:     info.ClientSession,
+		Disposition:       info.Disposition,
+		Message:           info.Message,
+		PodName:           info.PodName,
+		ApiPort:           info.ApiPort,
+		PodIp:             info.PodIp,
+		SftpPort:          info.SftpPort,
+		FtpPort:           info.FtpPort,
+		ClientMountPoint:  info.ClientMountPoint,
+		MechanismArgsDesc: info.MechanismArgsDesc,
+		ModifiedAt:        info.ModifiedAt,
+		ServiceWorkloads:  info.ServiceWorkloads,
 	}
 }
 
@@ -1536,31 +1704,7 @@ func (s *service) ReviewIntercept(ctx context.Context, rIReq *rpc.ReviewIntercep
 
 	s.removeExcludedEnvVars(rIReq.Environment)
 
-	intercept := s.state.UpdateIntercept(ceptID, func(intercept *state.Intercept) {
-		// Sanity check: The reviewing agent must be an agent for the intercept.
-		if intercept.Spec.Namespace != agent.Namespace || intercept.Spec.Agent != agent.Name {
-			return
-		}
-		if mutator.GetMap(ctx).IsInactive(types.UID(agent.PodUid)) {
-			clog.Debugf(ctx, "Pod %s(%s) is blacklisted", agent.PodName, agent.PodIp)
-			return
-		}
-
-		// Only update intercepts in the waiting or no agent states.  Agents race to review an intercept, but we
-		// expect they will always produce compatible answers.
-		if intercept.Disposition == rpc.InterceptDispositionType_NO_AGENT || intercept.Disposition == rpc.InterceptDispositionType_WAITING {
-			intercept.Disposition = rIReq.Disposition
-			intercept.Message = rIReq.Message
-			intercept.PodIp = rIReq.PodIp
-			intercept.PodName = agent.PodName
-			intercept.FtpPort = rIReq.FtpPort
-			intercept.SftpPort = rIReq.SftpPort
-			intercept.MountPoint = rIReq.MountPoint
-			intercept.MechanismArgsDesc = rIReq.MechanismArgsDesc
-			intercept.Environment = rIReq.Environment
-			intercept.Mounts = rIReq.Mounts
-		}
-	})
+	intercept := s.state.ApplyAgentReview(ctx, ceptID, agent, rIReq)
 
 	if intercept == nil {
 		return nil, status.Errorf(codes.NotFound, "Intercept with ID %q not found for this session", ceptID)
@@ -2252,7 +2396,10 @@ func (s *service) updateTrafficManagerConfigMap(ctx context.Context) error {
 
 func (s *service) ensureClientSession(ctx context.Context, sessionInfo *rpc.SessionInfo) (context.Context, *state.ClientSession, error) {
 	ctx = managerutil.WithSessionInfo(ctx, sessionInfo)
-	sessionID := tunnel.SessionID(sessionInfo.SessionId)
+	sessionID := tunnel.SessionID(sessionInfo.GetSessionId())
+	if sessionID == "" {
+		return ctx, nil, errors.Errorf(codes.InvalidArgument, "a session id is required")
+	}
 	session := s.state.GetClient(sessionID)
 	if session == nil {
 		return ctx, nil, errors.Errorf(codes.NotFound, "Client session %q not found", sessionID)

@@ -2,6 +2,7 @@ package dnsproxy
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"runtime"
@@ -162,7 +163,7 @@ func TestLookupIPAddressFamilies(t *testing.T) {
 				require.ErrorAs(t, err, &dnsErr)
 				require.True(t, dnsErr.IsTemporary)
 				rCode, rpcErr := MakeDNSError(err)
-				require.Equal(t, dns.RcodeNameError, rCode)
+				require.Equal(t, dns.RcodeServerFailure, rCode)
 				require.Equal(t, codes.Unavailable, status.Code(rpcErr))
 				return
 			}
@@ -194,7 +195,7 @@ func TestLookupIPAddressFamilies(t *testing.T) {
 		require.ErrorAs(t, err, &dnsErr)
 		require.True(t, dnsErr.IsTemporary)
 		rCode, rpcErr := MakeDNSError(err)
-		require.Equal(t, dns.RcodeNameError, rCode)
+		require.Equal(t, dns.RcodeServerFailure, rCode)
 		require.Equal(t, codes.Unavailable, status.Code(rpcErr))
 	})
 
@@ -205,7 +206,7 @@ func TestLookupIPAddressFamilies(t *testing.T) {
 		require.Empty(t, ips)
 		require.ErrorIs(t, err, context.Canceled)
 		rCode, rpcErr := MakeDNSError(err)
-		require.Equal(t, dns.RcodeNameError, rCode)
+		require.Equal(t, dns.RcodeServerFailure, rCode)
 		require.Equal(t, codes.Canceled, status.Code(rpcErr))
 	})
 
@@ -216,9 +217,192 @@ func TestLookupIPAddressFamilies(t *testing.T) {
 		require.Empty(t, ips)
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 		rCode, rpcErr := MakeDNSError(err)
-		require.Equal(t, dns.RcodeNameError, rCode)
+		require.Equal(t, dns.RcodeServerFailure, rCode)
 		require.Equal(t, codes.DeadlineExceeded, status.Code(rpcErr))
 	})
+}
+
+type ipResolverFunc func(context.Context, string, string) ([]net.IP, error)
+
+func (f ipResolverFunc) LookupIP(ctx context.Context, network, host string) ([]net.IP, error) {
+	return f(ctx, network, host)
+}
+
+func TestLookupIPUsesCombinedResult(t *testing.T) {
+	for _, network := range []string{"ip4", "ip6"} {
+		t.Run(network, func(t *testing.T) {
+			var calls []string
+			resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+				calls = append(calls, network+" "+host)
+				return []net.IP{net.ParseIP("192.0.2.20"), net.ParseIP("2001:db8::20")}, nil
+			})
+			ips, err := lookupIP(testutil.NewContext(t, false), network, "dual.example.", ".example.", resolver)
+			require.NoError(t, err)
+			require.Len(t, ips, 1)
+			want := "192.0.2.20"
+			if network == "ip6" {
+				want = "2001:db8::20"
+			}
+			require.Equal(t, want, ips[0].String())
+			require.Equal(t, []string{"ip dual.example."}, calls)
+		})
+	}
+	for _, tt := range []struct {
+		name string
+		ips  []net.IP
+		err  error
+	}{
+		{name: "only opposite family", ips: []net.IP{net.ParseIP("2001:db8::20")}},
+		{name: "both families absent", err: &net.DNSError{Err: "no such host", IsNotFound: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls []string
+			resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+				calls = append(calls, network+" "+host)
+				return tt.ips, tt.err
+			})
+			ips, err := lookupIP(testutil.NewContext(t, false), "ip4", "name.example.", ".example.", resolver)
+			require.Empty(t, ips)
+			if tt.err == nil {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, tt.err)
+			}
+			require.Equal(t, []string{"ip name.example."}, calls)
+		})
+	}
+}
+
+func TestLookupIPRetriesAbsoluteName(t *testing.T) {
+	var calls []string
+	resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+		calls = append(calls, network+" "+host)
+		if host == "name.example." {
+			return []net.IP{net.ParseIP("192.0.2.20")}, nil
+		}
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	})
+	ips, err := lookupIP(testutil.NewContext(t, false), "ip4", "name.example.", "", resolver)
+	require.NoError(t, err)
+	require.Len(t, ips, 1)
+	require.Equal(t, "192.0.2.20", ips[0].String())
+	require.Equal(t, []string{"ip name.example", "ip name.example."}, calls)
+}
+
+func TestLookupIPStopsCanceledRetries(t *testing.T) {
+	allCalls := []string{"ip missing.example", "ip4 missing.example", "ip missing.example.", "ip4 missing.example."}
+	for _, tt := range []struct {
+		name        string
+		cancelAfter int
+	}{
+		{name: "before first query"},
+		{name: "before requested family retry", cancelAfter: 1},
+		{name: "before absolute name retry", cancelAfter: 2},
+		{name: "before requested family absolute retry", cancelAfter: 3},
+		{name: "during final query", cancelAfter: 4},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(testutil.NewContext(t, false))
+			defer cancel()
+			if tt.cancelAfter == 0 {
+				cancel()
+			}
+			calls := make([]string, 0, len(allCalls))
+			resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+				calls = append(calls, network+" "+host)
+				if len(calls) == tt.cancelAfter {
+					cancel()
+				}
+				if network == "ip" {
+					return nil, &net.DNSError{Err: "server misbehaving", Name: host, IsTemporary: true}
+				}
+				return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+			})
+
+			ips, err := lookupIP(ctx, "ip4", "missing.example.", "", resolver)
+
+			require.Empty(t, ips)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Equal(t, allCalls[:tt.cancelAfter], calls)
+		})
+	}
+}
+
+func TestLookupIPPreservesOppositeFamilyFailure(t *testing.T) {
+	for _, failure := range []error{
+		&net.DNSError{Err: "server misbehaving", IsTemporary: true},
+		context.Canceled,
+		context.DeadlineExceeded,
+	} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			var calls []string
+			resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+				calls = append(calls, network+" "+host)
+				if network == "ip4" {
+					return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+				}
+				return nil, failure
+			})
+
+			ips, err := lookupIP(testutil.NewContext(t, false), "ip4", "missing.example.", ".example.", resolver)
+
+			require.Empty(t, ips)
+			require.ErrorIs(t, err, failure)
+			wantCalls := []string{"ip missing.example."}
+			if !errors.Is(failure, context.Canceled) && !errors.Is(failure, context.DeadlineExceeded) {
+				wantCalls = append(wantCalls, "ip4 missing.example.")
+			}
+			require.Equal(t, wantCalls, calls)
+		})
+	}
+}
+
+func TestLookupIPPreservesRequestedFamilyContextFailure(t *testing.T) {
+	for _, failure := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			var calls []string
+			resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+				calls = append(calls, network+" "+host)
+				if network == "ip" {
+					return nil, &net.DNSError{Err: "server misbehaving", Name: host, IsTemporary: true}
+				}
+				return nil, failure
+			})
+			ips, err := lookupIP(testutil.NewContext(t, false), "ip4", "name.example.", "", resolver)
+			require.Empty(t, ips)
+			require.ErrorIs(t, err, failure)
+			require.Equal(t, []string{"ip name.example", "ip4 name.example"}, calls)
+		})
+	}
+}
+
+func TestMakeDNSErrorPreservesFailureClassification(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		err   error
+		rCode int
+		code  codes.Code
+	}{
+		{name: "absent", err: &net.DNSError{Err: "no such host", IsNotFound: true}, rCode: dns.RcodeNameError, code: codes.OK},
+		{name: "canceled", err: context.Canceled, rCode: dns.RcodeServerFailure, code: codes.Canceled},
+		{name: "deadline", err: context.DeadlineExceeded, rCode: dns.RcodeServerFailure, code: codes.DeadlineExceeded},
+		{name: "temporary", err: &net.DNSError{Err: "server misbehaving", IsTemporary: true}, rCode: dns.RcodeServerFailure, code: codes.Unavailable},
+		{name: "timeout", err: &net.DNSError{Err: "timeout", IsTimeout: true, IsTemporary: true}, rCode: dns.RcodeServerFailure, code: codes.DeadlineExceeded},
+		{name: "other", err: errors.New("resolver failed"), rCode: dns.RcodeServerFailure, code: codes.Internal},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rCode, err := MakeDNSError(tt.err)
+			require.Equal(t, tt.rCode, rCode)
+			require.Equal(t, tt.code, status.Code(err))
+
+			response, err := ToRPC(nil, rCode)
+			require.NoError(t, err)
+			records, decodedCode, err := FromRPC(response)
+			require.NoError(t, err)
+			require.Empty(t, records)
+			require.Equal(t, tt.rCode, decodedCode)
+		})
+	}
 }
 
 func startLookupIPTestResolver(t *testing.T) *net.Resolver {

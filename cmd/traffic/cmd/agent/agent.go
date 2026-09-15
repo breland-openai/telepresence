@@ -236,20 +236,29 @@ func MakeInterceptStates(cn *agentconfig.Container) map[types.PortAndProto]agent
 func TalkToManagerLoop(ctx context.Context, s State, info *rpc.AgentInfo) {
 	ac := s.AgentConfig()
 	gRPCAddress := fmt.Sprintf("%s:%v", ac.ManagerHost, ac.ManagerPort)
+	talkToManagerLoop(ctx, 5*time.Second, func(ctx context.Context) error {
+		return TalkToManager(ctx, gRPCAddress, info, s)
+	})
+}
 
-	// Don't reconnect more than every 5s
-	ticker := time.NewTicker(5 * time.Second)
+func talkToManagerLoop(ctx context.Context, retryInterval time.Duration, talk func(context.Context) error) {
+	ticker := time.NewTicker(retryInterval)
 	defer ticker.Stop()
 
 	for {
-		err := TalkToManager(ctx, gRPCAddress, info, s)
+		err := talk(ctx)
 		if err != nil {
 			switch status.Code(err) {
-			case codes.AlreadyExists, codes.Aborted, codes.Canceled:
-				// This won't change, so abort here.
+			case codes.AlreadyExists, codes.Canceled:
 				return
+			case codes.Aborted:
+				if !isInactivePodRejection(err) {
+					return
+				}
+				clog.Warnf(ctx, "traffic-manager temporarily rejected the inactive pod; retrying: %v", err)
+			default:
+				clog.Errorf(ctx, "error talking to traffic-manager: %v", err)
 			}
-			clog.Errorf(ctx, "error talking to traffic-manager: %v", err)
 		}
 
 		select {
@@ -258,6 +267,66 @@ func TalkToManagerLoop(ctx context.Context, s State, info *rpc.AgentInfo) {
 		case <-ticker.C:
 		}
 	}
+}
+
+func isInactivePodRejection(err error) bool {
+	if status.Code(err) != codes.Aborted {
+		return false
+	}
+
+	var grpcStatus interface {
+		GRPCStatus() *status.Status
+	}
+	if !errors.As(err, &grpcStatus) {
+		return false
+	}
+
+	s := grpcStatus.GRPCStatus()
+	return s != nil && s.Message() == "inactivated pod"
+}
+
+func advertisedInterceptTargets(ac *agentconfig.Sidecar) []*rpc.AgentInfo_InterceptTarget {
+	interceptTargets := make([]*rpc.AgentInfo_InterceptTarget, 0)
+	seenTargets := make(map[string]struct{})
+	for _, cn := range ac.Containers {
+		for _, ic := range cn.Intercepts {
+			if ic.ServiceUID == "" {
+				continue
+			}
+			key := fmt.Sprintf("%s/%d/%s/%s/%d",
+				ic.ServiceUID, ic.ServicePort, ic.Protocol, cn.Name, ic.ContainerPort)
+			if _, ok := seenTargets[key]; ok {
+				continue
+			}
+			seenTargets[key] = struct{}{}
+			interceptTargets = append(interceptTargets, &rpc.AgentInfo_InterceptTarget{
+				ServiceUid:      string(ic.ServiceUID),
+				ServiceName:     ic.ServiceName,
+				ServicePortName: ic.ServicePortName,
+				ServicePort:     int32(ic.ServicePort),
+				Protocol:        ic.Protocol.String(),
+				ContainerName:   cn.Name,
+				ContainerPort:   int32(ic.ContainerPort),
+			})
+		}
+	}
+	sort.Slice(interceptTargets, func(i, j int) bool {
+		a, b := interceptTargets[i], interceptTargets[j]
+		if a.ServiceUid != b.ServiceUid {
+			return a.ServiceUid < b.ServiceUid
+		}
+		if a.ServicePort != b.ServicePort {
+			return a.ServicePort < b.ServicePort
+		}
+		if a.Protocol != b.Protocol {
+			return a.Protocol < b.Protocol
+		}
+		if a.ContainerName != b.ContainerName {
+			return a.ContainerName < b.ContainerName
+		}
+		return a.ContainerPort < b.ContainerPort
+	})
+	return interceptTargets
 }
 
 func StartServices(g log.Group, config Config, srv State) (*rpc.AgentInfo, error) {
@@ -340,6 +409,7 @@ func StartServices(g log.Group, config Config, srv State) (*rpc.AgentInfo, error
 			Mounts:      appMounts.ToRPC(),
 		}
 	}
+	interceptTargets := advertisedInterceptTargets(ac)
 
 	return &rpc.AgentInfo{
 		Name:      ac.AgentName,
@@ -367,7 +437,8 @@ func StartServices(g log.Group, config Config, srv State) (*rpc.AgentInfo, error
 				Version: version.Version,
 			},
 		},
-		Containers: containers,
+		Containers:       containers,
+		InterceptTargets: interceptTargets,
 	}, nil
 }
 

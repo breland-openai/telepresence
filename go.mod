@@ -53,7 +53,7 @@ require (
 	golang.org/x/time v0.15.0
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 	golang.zx2c4.com/wireguard/windows v1.0.1
-	google.golang.org/grpc v1.83.1
+	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 	gvisor.dev/gvisor v0.0.0-20260721223538-98cc75378104
 	helm.sh/helm/v3 v3.21.3

@@ -27,6 +27,20 @@ items:
   - version: 2.32.0
     date: (TBD)
     notes:
+      - type: bugfix
+        title: Recover DNS after interrupted root daemon sessions
+        body: >-
+          On Linux, root daemon startup removes recognized stale DNS redirects
+          to unused local UDP endpoints before cluster authentication needs DNS.
+          Reconnecting also waits for the previous session's workers and routing
+          cleanup to finish, including when session initialization fails.
+      - type: bugfix
+        title: Recover promptly from stalled manager sessions
+        body: >-
+          Manager keepalive failures now use the existing session repair path
+          instead of ending the client session. Expired sessions recover
+          immediately, while repeated transient failures trigger repair
+          without dropping active intercepts.
       - type: feature
         title: Completion for use flag
         body: >-
@@ -43,6 +57,28 @@ items:
           Serialization now strips those fields from a local copy, so parallel
           pod creation cannot corrupt the cached config or block a workload
           rollout.
+      - type: feature
+        title: HTTP intercepts can follow every workload selected by one Service
+        body: >-
+          A Kubernetes Service can route requests to more than one workload,
+          such as stable and canary Deployments, while an intercept previously
+          followed only the workload named by the user. HTTP intercepts
+          now let each selected workload
+          participate in one logical intercept, so filtered traffic reaches
+          the same local handler regardless of which selected workload
+          receives it. If the selected workloads or their traffic-agents
+          cannot support shared interception, Telepresence warns and keeps
+          the historical single-workload behavior instead of failing the
+          intercept.
+        docs: reference/attachments/cli
+      - type: bugfix
+        title: Improve selected-intercept tunnel stability
+        body: >-
+          Selected-intercept tunnels now reconnect agent dial watchers with
+          backoff, clean up abandoned forwards more carefully, use separate
+          timeouts for agent connections and intercepted endpoints, and reject
+          dial requests when responder capacity is full instead of letting
+          work accumulate.
       - type: feature
         title: Guided traffic-manager setup with telepresence setup
         body: >-

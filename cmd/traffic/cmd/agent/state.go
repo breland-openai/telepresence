@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"net/http"
+	"sync"
 
 	"github.com/blang/semver/v4"
 	"github.com/puzpuzpuz/xsync/v4"
@@ -99,7 +100,9 @@ type state struct {
 	tlsManager       tls.Manager
 
 	// The sessionInfo and manager client are needed when forwarders establish their
-	// tunnel to the traffic-manager.
+	// tunnel to the traffic-manager. They are replaced together whenever the agent
+	// reconnects, while forwarding and metrics reporting continue concurrently.
+	managerMu   sync.RWMutex
 	sessionInfo *rpc.SessionInfo
 	manager     rpc.ManagerClient
 	mgrVer      semver.Version
@@ -124,10 +127,14 @@ type state struct {
 }
 
 func (s *state) ManagerClient() rpc.ManagerClient {
+	s.managerMu.RLock()
+	defer s.managerMu.RUnlock()
 	return s.manager
 }
 
 func (s *state) ManagerVersion() semver.Version {
+	s.managerMu.RLock()
+	defer s.managerMu.RUnlock()
 	return s.mgrVer
 }
 
@@ -137,7 +144,15 @@ func (s *state) SetFileSharingPorts(ftp uint16, sftp uint16) {
 }
 
 func (s *state) SessionInfo() *rpc.SessionInfo {
+	s.managerMu.RLock()
+	defer s.managerMu.RUnlock()
 	return s.sessionInfo
+}
+
+func (s *state) managerSession() (rpc.ManagerClient, *rpc.SessionInfo) {
+	s.managerMu.RLock()
+	defer s.managerMu.RUnlock()
+	return s.manager, s.sessionInfo
 }
 
 func NewState(ctx context.Context, config Config) (State, error) {
@@ -230,6 +245,8 @@ func (s *state) InterceptInfo(ctx context.Context, callerID, path string, contai
 }
 
 func (s *state) SetManager(sessionInfo *rpc.SessionInfo, manager rpc.ManagerClient, version semver.Version) {
+	s.managerMu.Lock()
+	defer s.managerMu.Unlock()
 	s.manager = manager
 	s.sessionInfo = sessionInfo
 	s.mgrVer = version

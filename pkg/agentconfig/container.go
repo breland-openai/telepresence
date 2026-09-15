@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	core "k8s.io/api/core/v1"
 
@@ -17,9 +18,10 @@ import (
 )
 
 type ContainerBuilder struct {
-	MountPolicies types.MountPolicies
-	Pod           *core.PodTemplateSpec
-	Config        *Sidecar
+	MountPolicies       types.MountPolicies
+	Pod                 *core.PodTemplateSpec
+	Config              *Sidecar
+	PreStopDrainTimeout time.Duration
 
 	// CoverDir, when set, is mirrored into the agent's GOCOVERDIR env and mounted at the same path.
 	CoverDir string
@@ -175,7 +177,10 @@ func (a *ContainerBuilder) AgentContainer(ctx context.Context) (*core.Container,
 		}
 	})
 
-	cfg, _ := MarshalTight(a.Config)
+	cfg, err := MarshalTight(a.Config)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to marshal agent config for %s.%s: %w", a.Config.WorkloadName, a.Config.Namespace, err)
+	}
 	anns[annotation.Config] = cfg
 
 	if len(ports) == 0 {
@@ -202,6 +207,15 @@ func (a *ContainerBuilder) AgentContainer(ctx context.Context) (*core.Container,
 		},
 		ImagePullPolicy: core.PullPolicy(a.Config.PullPolicy),
 	}
+	if timeout := a.preStopDrainTimeout(); timeout > 0 {
+		ac.Lifecycle = &core.Lifecycle{
+			PreStop: &core.LifecycleHandler{
+				Exec: &core.ExecAction{
+					Command: []string{"/usr/local/bin/traffic", "agent-drain", timeout.String()},
+				},
+			},
+		}
+	}
 	if r := a.Config.Resources; r != nil {
 		ac.Resources = *r
 	}
@@ -213,6 +227,17 @@ func (a *ContainerBuilder) AgentContainer(ctx context.Context) (*core.Container,
 	ac.SecurityContext = appSc
 
 	return ac, anns, nil
+}
+
+func (a *ContainerBuilder) preStopDrainTimeout() time.Duration {
+	if a.PreStopDrainTimeout <= 0 {
+		return 0
+	}
+	gracePeriod := 30 * time.Second
+	if seconds := a.Pod.Spec.TerminationGracePeriodSeconds; seconds != nil {
+		gracePeriod = time.Duration(*seconds) * time.Second
+	}
+	return max(min(a.PreStopDrainTimeout, gracePeriod-5*time.Second), 0)
 }
 
 // AgentSecurityContext returns the security context for the traffic-agent container. It is

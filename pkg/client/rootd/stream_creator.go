@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"time"
 
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
@@ -12,10 +11,40 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/types"
 )
 
-const dnsConnTTL = 5 * time.Second
-
 func (s *session) isForDNS(ip netip.Addr, port uint16) bool {
 	return s.vifDNS.Addr() == ip && s.vifDNS.Port() == port
+}
+
+func (s *session) applyPortMapping(id tunnel.ConnID) tunnel.ConnID {
+	if s.l4PortMap == nil {
+		return id
+	}
+	destAddr := id.DestinationAddr()
+	if mp, ok := s.l4PortMap.Load(types.AddrPortProto{
+		AddrPort: netip.AddrPortFrom(destAddr, id.DestinationPort()),
+		Proto:    id.Protocol(),
+	}); ok {
+		return tunnel.NewConnID(id.Protocol(), id.Source(), netip.AddrPortFrom(destAddr, mp))
+	}
+	return id
+}
+
+func (s *session) localClientRedirectTarget(id tunnel.ConnID) (netip.AddrPort, bool) {
+	if s.localClientRedirects == nil {
+		return netip.AddrPort{}, false
+	}
+	return s.localClientRedirects.Load(types.AddrPortProto{
+		AddrPort: id.Destination(),
+		Proto:    id.Protocol(),
+	})
+}
+
+func (s *session) newLocalClientRedirectStream(c context.Context, id tunnel.ConnID, target netip.AddrPort) tunnel.Stream {
+	pipeID := tunnel.NewConnID(id.Protocol(), id.Source(), target)
+	clog.Debugf(c, "Redirecting local client traffic for %s to %s", id.Destination(), target)
+	from, to := tunnel.NewPipe(pipeID, tunnel.SessionID(s.session.SessionId), tunnel.LocalToTun, tunnel.TunToLocal)
+	tunnel.NewDialer(to, func() {}, nil, nil).Start(c)
+	return from
 }
 
 // checkRecursion checks that the given IP is not contained in any of the subnets
@@ -62,7 +91,8 @@ func (s *session) streamCreator() tunnel.StreamCreator {
 				pipeId := tunnel.NewConnID(p, id.Source(), s.localDNS)
 				clog.Tracef(c, "Intercept DNS %s to %s", id, pipeId.Destination())
 				from, to := tunnel.NewPipe(pipeId, tunnel.SessionID(s.session.SessionId), tunnel.DnsToTun, tunnel.TunToDNS)
-				tunnel.NewDialerTTL(to, func() {}, dnsConnTTL, nil, nil).Start(c)
+				ttl := tunnel.DNSConnTTL(client.GetConfig(c).DNS().LookupTimeout)
+				tunnel.NewDialerTTL(to, func() {}, ttl, nil, nil).Start(c)
 				return from, nil
 			}
 		}
@@ -70,11 +100,10 @@ func (s *session) streamCreator() tunnel.StreamCreator {
 		// tunnel attempt.
 		countAsOutbound = true
 
-		if mp, ok := s.l4PortMap.Load(types.AddrPortProto{
-			AddrPort: netip.AddrPortFrom(destAddr, id.DestinationPort()),
-			Proto:    id.Protocol(),
-		}); ok {
-			id = tunnel.NewConnID(id.Protocol(), id.Source(), netip.AddrPortFrom(destAddr, mp))
+		id = s.applyPortMapping(id)
+		destAddr = id.DestinationAddr()
+		if target, ok := s.localClientRedirectTarget(id); ok {
+			return s.newLocalClientRedirectStream(c, id, target), nil
 		}
 
 		var tp tunnel.Provider

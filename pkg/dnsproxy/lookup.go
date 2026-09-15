@@ -173,23 +173,62 @@ func useLookupName(qName, noSearchDomain string) (string, bool) {
 	return name, dots == 0 || dots > 3
 }
 
-func lookupIP(ctx context.Context, network, qName, noSearchDomain string, r *net.Resolver) ([]net.IP, error) {
-	name, final := useLookupName(qName, noSearchDomain)
-	lookup := func(name string) ([]net.IP, error) {
-		ips, err := r.LookupIP(ctx, "ip", name)
-		var dnsErr *net.DNSError
-		if errors.As(err, &dnsErr) && dnsErr.IsTemporary {
-			if requested, requestedErr := r.LookupIP(ctx, network, name); requestedErr == nil {
-				return requested, nil
-			}
-		}
+type ipResolver interface {
+	LookupIP(context.Context, string, string) ([]net.IP, error)
+}
+
+func lookupIPFamily(ctx context.Context, network, name string, r ipResolver) ([]net.IP, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ips, err := r.LookupIP(ctx, "ip", name)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
+	}
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) || !dnsErr.IsTemporary {
 		return ips, err
 	}
-	ips, err := lookup(name)
-	if err != nil && !final {
-		clog.Errorf(ctx, "LookupIP failed %q failed, trying LookupIP %q", name, qName)
-		ips, err = lookup(qName)
+	requested, requestedErr := r.LookupIP(ctx, network, name)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
 	}
+	if errors.Is(requestedErr, context.Canceled) || errors.Is(requestedErr, context.DeadlineExceeded) {
+		return nil, requestedErr
+	}
+	if requestedErr == nil {
+		return requested, nil
+	}
+	return ips, err
+}
+
+func lookupIPName(ctx context.Context, network, name, qName string, final bool, r ipResolver) ([]net.IP, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ips, err := lookupIPFamily(ctx, network, name, r)
+	if err != nil && !final {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		clog.Debugf(ctx, "LookupIP %q failed, trying LookupIP %q", name, qName)
+		ips, err = lookupIPFamily(ctx, network, qName, r)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return ips, err
+}
+
+func lookupIP(ctx context.Context, network, qName, noSearchDomain string, r ipResolver) ([]net.IP, error) {
+	name, final := useLookupName(qName, noSearchDomain)
+	ips, err := lookupIPName(ctx, network, name, qName, final, r)
 	if err == nil && len(ips) == 0 {
 		err = &net.DNSError{
 			Err:        "no such host",
@@ -209,17 +248,17 @@ func MakeDNSError(err error) (int, error) {
 	var dnsErr *net.DNSError
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		return dns.RcodeNameError, status.Error(codes.DeadlineExceeded, err.Error())
+		return dns.RcodeServerFailure, status.Error(codes.DeadlineExceeded, err.Error())
 	case errors.Is(err, context.Canceled):
-		return dns.RcodeNameError, status.Error(codes.Canceled, err.Error())
+		return dns.RcodeServerFailure, status.Error(codes.Canceled, err.Error())
 	case errors.As(err, &dnsErr):
 		switch {
 		case dnsErr.IsNotFound:
 			return dns.RcodeNameError, nil
-		case dnsErr.IsTemporary:
-			return dns.RcodeNameError, status.Error(codes.Unavailable, dnsErr.Error())
 		case dnsErr.IsTimeout:
-			return dns.RcodeNameError, status.Error(codes.DeadlineExceeded, dnsErr.Error())
+			return dns.RcodeServerFailure, status.Error(codes.DeadlineExceeded, dnsErr.Error())
+		case dnsErr.IsTemporary:
+			return dns.RcodeServerFailure, status.Error(codes.Unavailable, dnsErr.Error())
 		}
 	}
 	return dns.RcodeServerFailure, status.Error(codes.Internal, err.Error())

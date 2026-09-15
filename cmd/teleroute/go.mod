@@ -8,7 +8,7 @@ require (
 	github.com/puzpuzpuz/xsync/v4 v4.5.0
 	github.com/telepresenceio/clog v0.0.0-20260114221933-287514cf9831
 	github.com/telepresenceio/telepresence/rpc/v2 v2.31.2
-	google.golang.org/grpc v1.83.1
+	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 )
 

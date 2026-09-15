@@ -475,19 +475,29 @@ shellscripts += ./build-aux/vagrant-rtest/run-shards.sh
 
 lint: lint-rpc lint-go lint-docs
 
+define resolve-golangci-lint-version
+ver="$${GOLANGCI_LINT_VERSION:-}"; \
+if [ -z "$$ver" ]; then \
+  ver=$$(curl -fsSL 'https://api.github.com/repos/golangci/golangci-lint/releases/latest' | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4); \
+fi; \
+if [ -z "$$ver" ]; then \
+  echo 'Unable to resolve golangci-lint version; set GOLANGCI_LINT_VERSION explicitly.' >&2; exit 1; \
+fi;
+endef
+
 lint-docs: $(tools/docslint) ## (QA) Lint the documentation
 	$(tools/docslint) docs
 	docker run --rm -v $$(pwd):/docs -w /docs jdkato/vale:latest docs
 
 lint-go: lint-deps ## (QA) Run the golangci-lint
 ifeq ($(GOOS),windows)
-	@ver=$$(curl -fsSL 'https://api.github.com/repos/golangci/golangci-lint/releases/latest' | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) && \
+	@$(resolve-golangci-lint-version) \
 	docker run -e GOOS=$(GOOS) --rm -v $$(pwd):/app -v ~/.cache/golangci-lint/$$ver:/root/.cache -w /app golangci/golangci-lint:$$ver golangci-lint \
 	run --timeout 8m ./cmd/cobraparser/... ./cmd/telepresence/... ./pkg/...
 else
 	# libfuse-dev provides fuse.h, which cgofuse needs to typecheck the linked
 	# fuseftp file system on Linux.
-	@ver=$$(curl -fsSL 'https://api.github.com/repos/golangci/golangci-lint/releases/latest' | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) && \
+	@$(resolve-golangci-lint-version) \
 	docker run -e GOOS=$(GOOS) --rm -v $$(pwd):/app -v ~/.cache/golangci-lint/$$ver:/root/.cache -w /app --entrypoint bash golangci/golangci-lint:$$ver \
 	-c "apt-get update -qq && apt-get install -y -qq libfuse-dev && golangci-lint run --timeout 8m ./..."
 endif
@@ -501,11 +511,11 @@ endif
 .PHONY: format
 format: lint-deps ## (QA) Automatically fix linter complaints
 ifeq ($(GOHOSTOS),windows)
-	@ver=$$(curl -fsSL 'https://api.github.com/repos/golangci/golangci-lint/releases/latest' | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) && \
+	@$(resolve-golangci-lint-version) \
 	docker run -e GOOS=$(GOOS) --rm -v $$(pwd):/app -v ~/.cache/golangci-lint/$$ver:/root/.cache -w /app golangci/golangci-lint:$$ver golangci-lint \
 	run --timeout 8m --fix ./cmd/telepresence/... ./pkg/...
 else
-	@ver=$$(curl -fsSL 'https://api.github.com/repos/golangci/golangci-lint/releases/latest' | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) && \
+	@$(resolve-golangci-lint-version) \
 	docker run -e GOOS=$(GOOS) --rm -v $$(pwd):/app -v ~/.cache/golangci-lint/$$ver:/root/.cache -w /app golangci/golangci-lint:$$ver golangci-lint \
 	run --timeout 8m --fix ./...
 endif

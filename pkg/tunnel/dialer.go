@@ -30,11 +30,22 @@ const (
 	tcpConnTTL       = 2 * time.Hour // Default tcp_keepalive_time on Linux
 	udpConnTTL       = 2 * time.Second
 	localDialTimeout = 2 * time.Second
+	slowDialResponse = 2 * time.Second
 )
+
+// DNSConnTTL keeps DNS forwarding endpoints alive throughout a lookup.
+func DNSConnTTL(lookupTimeout time.Duration) time.Duration {
+	return lookupTimeout + time.Second
+}
 
 // Limit selected-intercept dial responders so bursty workloads cannot create
 // unbounded goroutines and gRPC tunnels in the client daemon.
-const maxConcurrentDialResponders = 256
+const (
+	maxConcurrentDialResponders = 256
+	maxConcurrentDialRejecters  = 16
+	minDialRequestTimeout       = time.Second
+	maxDialRejectTimeout        = 5 * time.Second
+)
 
 const (
 	notConnected = int32(iota)
@@ -459,13 +470,42 @@ func DialWaitLoop(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	dialResponders := make(chan struct{}, maxConcurrentDialResponders)
+	dialRejecters := make(chan struct{}, maxConcurrentDialRejecters)
 	for ctx.Err() == nil {
 		dr, err := dialStream.Recv()
 		if err == nil {
+			queueStart := time.Now()
+			queueTimer := time.NewTimer(dialRequestTimeout(dr))
 			select {
 			case dialResponders <- struct{}{}:
+				if !queueTimer.Stop() {
+					select {
+					case <-queueTimer.C:
+					default:
+					}
+				}
+				if queueWait := time.Since(queueStart); queueWait > 100*time.Millisecond {
+					clog.Debugf(ctx, "   %s %s, dial responder queued for %s", tag, ConnID(dr.ConnId), queueWait)
+				}
 			case <-ctx.Done():
+				queueTimer.Stop()
 				return nil
+			case <-queueTimer.C:
+				id := ConnID(dr.ConnId)
+				clog.Errorf(ctx, "!! %s %s, dial responder queue saturated for %s; rejecting", tag, id, time.Since(queueStart))
+				select {
+				case dialRejecters <- struct{}{}:
+					dr := dr
+					go func() {
+						defer func() {
+							<-dialRejecters
+						}()
+						dialReject(ctx, tag, tunnelProvider, dr, sessionID)
+					}()
+				default:
+					clog.Errorf(ctx, "!! %s %s, dial reject queue saturated; dropping request", tag, id)
+				}
+				continue
 			}
 			if metrics != nil {
 				metrics.IncomingDial()
@@ -494,9 +534,56 @@ func DialWaitLoop(
 	return nil
 }
 
+func dialRequestTimeout(dr *rpc.DialRequest) time.Duration {
+	timeout := time.Duration(dr.DialTimeout) + time.Duration(dr.RoundtripLatency)
+	if timeout < minDialRequestTimeout {
+		return minDialRequestTimeout
+	}
+	return timeout
+}
+
+func dialRejectTimeout(dr *rpc.DialRequest) time.Duration {
+	timeout := dialRequestTimeout(dr)
+	if timeout > maxDialRejectTimeout {
+		return maxDialRejectTimeout
+	}
+	return timeout
+}
+
+func dialReject(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.DialRequest, sessionID SessionID) {
+	id := ConnID(dr.ConnId)
+	ctx, cancel := context.WithTimeout(ctx, dialRejectTimeout(dr))
+	defer cancel()
+	mt, err := tunnelProvider.Tunnel(ctx)
+	if err != nil {
+		clog.Errorf(ctx, "!! %s %s, failed to create reject tunnel: %v", tag, id, err)
+		return
+	}
+	s, err := NewClientStream(ctx, tag, mt, id, sessionID, time.Duration(dr.RoundtripLatency), time.Duration(dr.DialTimeout))
+	if err != nil {
+		clog.Errorf(ctx, "!! %s %s, failed to create reject stream: %v", tag, id, err)
+		return
+	}
+	if err = s.Send(ctx, NewMessage(DialReject, nil)); err != nil {
+		clog.Errorf(ctx, "!! %s %s, failed to send DialReject: %v", tag, id, err)
+	}
+	if err = s.CloseSend(ctx); err != nil {
+		clog.Errorf(ctx, "!! %s %s, reject stream CloseSend failed: %v", tag, id, err)
+	}
+}
+
 func dialRespond(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.DialRequest, sessionID SessionID, metrics DialMetrics) {
 	id := ConnID(dr.ConnId)
 	ctx, cancel := context.WithCancel(ctx)
+	respondStart := time.Now()
+	var slowLogged atomic.Bool
+	slowTimer := time.AfterFunc(slowDialResponse, func() {
+		slowLogged.Store(true)
+		clog.Warnf(ctx, "!! %s %s, dial response still active after %s for session %s", tag, id, time.Since(respondStart).Round(time.Millisecond), sessionID)
+	})
+	defer slowTimer.Stop()
+
+	tunnelStart := time.Now()
 	mt, err := tunnelProvider.Tunnel(ctx)
 	if err != nil {
 		clog.Errorf(ctx, "!! %s %s, call to manager Tunnel failed: %v", tag, id, err)
@@ -506,6 +593,13 @@ func dialRespond(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.
 		cancel()
 		return
 	}
+	tunnelDuration := time.Since(tunnelStart)
+	if tunnelDuration > time.Second {
+		clog.Warnf(ctx, "   %s %s, Tunnel stream established slowly in %s", tag, id, tunnelDuration.Round(time.Millisecond))
+	} else if tunnelDuration > 100*time.Millisecond {
+		clog.Debugf(ctx, "   %s %s, Tunnel stream established in %s", tag, id, tunnelDuration)
+	}
+	streamStart := time.Now()
 	s, err := NewClientStream(ctx, tag, mt, id, sessionID, time.Duration(dr.RoundtripLatency), time.Duration(dr.DialTimeout))
 	if err != nil {
 		clog.Error(ctx, err)
@@ -515,7 +609,29 @@ func dialRespond(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.
 		cancel()
 		return
 	}
-	d := NewDialer(s, cancel, nil, nil)
+	streamDuration := time.Since(streamStart)
+	if streamDuration > time.Second {
+		clog.Warnf(ctx, "   %s %s, client stream handshake completed slowly in %s", tag, id, streamDuration.Round(time.Millisecond))
+	} else if streamDuration > 100*time.Millisecond {
+		clog.Debugf(ctx, "   %s %s, client stream handshake completed in %s", tag, id, streamDuration)
+	}
+	ingressBytes := NewCounterProbe("FromClientBytes")
+	egressBytes := NewCounterProbe("ToClientBytes")
+	d := NewDialer(s, cancel, ingressBytes, egressBytes)
 	d.Start(ctx)
 	<-d.Done()
+	if elapsed := time.Since(respondStart); slowLogged.Load() || elapsed > slowDialResponse {
+		clog.Warnf(
+			ctx,
+			"!! %s %s, dial response ended after %s for session %s: ingressBytes=%d egressBytes=%d context=%v cause=%v",
+			tag,
+			id,
+			elapsed.Round(time.Millisecond),
+			sessionID,
+			ingressBytes.GetValue(),
+			egressBytes.GetValue(),
+			ctx.Err(),
+			context.Cause(ctx),
+		)
+	}
 }

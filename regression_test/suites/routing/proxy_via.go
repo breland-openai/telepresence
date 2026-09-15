@@ -1,11 +1,19 @@
 package routing
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"net/netip"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/subnet"
 	"github.com/telepresenceio/telepresence/v2/pkg/vif"
+	"github.com/telepresenceio/telepresence/v2/regression_test/framework/check"
+	"github.com/telepresenceio/telepresence/v2/regression_test/framework/cli"
 	"github.com/telepresenceio/telepresence/v2/regression_test/framework/managers"
 	"github.com/telepresenceio/telepresence/v2/regression_test/framework/rt"
 	"github.com/telepresenceio/telepresence/v2/regression_test/framework/workloads"
@@ -80,4 +88,86 @@ func (s *ProxyVia) Test_AllSubnetsRouteThroughWorkload() {
 		vs, lastSubnets, lastVirtualSubnet)
 
 	rt.RoutedToCluster(t, wl.ServiceURL())
+}
+
+// Test_ComplexLookupUsesProxyViaWorkload gives two agents contradictory
+// pod-local answers for a name the manager cannot resolve. The selected
+// proxy-via workload must provide the answer and carry the translated traffic.
+func (s *ProxyVia) Test_ComplexLookupUsesProxyViaWorkload() {
+	const (
+		hostname = "proxy-via-agent.rtest.invalid"
+		suffix   = ".rtest.invalid"
+	)
+
+	t := s.T()
+	ctx := s.Ctx()
+	ns := s.AppNamespace()
+	s.Manager()
+	target := rt.Mutate(t, rt.WorkloadFixture(ns, workloads.Echo("proxy-via-dns-target")))
+	decoy := rt.Mutate(t, rt.WorkloadFixture(ns, workloads.Echo("proxy-via-dns-decoy")))
+
+	serviceAddress := func(workload *rt.Workload) netip.Addr {
+		address, err := s.R().Kubectl(ctx, ns, "get", "service", workload.SvcName, "-o", "jsonpath={.spec.clusterIP}")
+		s.Require().NoError(err)
+		ip, err := netip.ParseAddr(strings.TrimSpace(address))
+		s.Require().NoError(err)
+
+		patch := fmt.Sprintf(`{"spec":{"template":{"spec":{"hostAliases":[{"ip":%q,"hostnames":[%q]}]}}}}`, ip, hostname)
+		_, err = s.R().Kubectl(ctx, ns, "patch", "deployment", workload.Name, "--type=merge", "-p", patch)
+		s.Require().NoError(err)
+		_, err = s.R().Kubectl(ctx, ns, "rollout", "status", "deployment/"+workload.Name, "--timeout=120s")
+		s.Require().NoError(err)
+		return ip
+	}
+	targetIP := serviceAddress(target)
+	decoyIP := serviceAddress(decoy)
+	s.Require().NotEqual(targetIP, decoyIP)
+	targetSubnet := netip.PrefixFrom(targetIP, targetIP.BitLen())
+
+	conn := rt.Mutate(t, rt.ConnectionFixture(ns,
+		rt.ConnExtraArgs("--proxy-via", targetSubnet.String()+"="+target.Name),
+		rt.ConnWithConfig(func(config client.Config) {
+			config.DNS().UseComplexLookup = true
+			config.DNS().IncludeSuffixes = append(config.DNS().IncludeSuffixes, suffix)
+		}),
+	))
+	t.Cleanup(func() { conn.Disconnect(t) })
+	awaitRouted(t, ctx, s.CLI(), ns)
+	var status struct {
+		RootDaemon struct {
+			DNS struct {
+				UseComplexLookup bool     `json:"use_complex_lookup"`
+				IncludeSuffixes  []string `json:"include_suffixes"`
+			} `json:"dns"`
+		} `json:"root_daemon"`
+	}
+	s.Require().NoError(s.CLI().JSON(ctx, &status, "status", "--format", "json"))
+	s.Require().True(status.RootDaemon.DNS.UseComplexLookup)
+	s.Require().Contains(status.RootDaemon.DNS.IncludeSuffixes, suffix)
+
+	attachment := conn.Intercept(t, decoy, rt.ToLocal(s.LocalEcho(), "http"), cli.MountFalse())
+	t.Cleanup(func() { attachment.Detach(t) })
+
+	virtualSubnet := client.DefaultVirtualSubnet()
+	if targetIP.Is6() {
+		virtualSubnet = vif.TelepresenceULA6
+	}
+	var resolved []string
+	s.Eventually(func() bool {
+		lookupContext, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		var err error
+		resolved, err = net.DefaultResolver.LookupHost(lookupContext, hostname)
+		if err != nil || len(resolved) != 1 {
+			return false
+		}
+		address, err := netip.ParseAddr(resolved[0])
+		return err == nil && virtualSubnet.Contains(address)
+	}, subnetPollTimeout, time.Second,
+		"%s should resolve to a virtual IP in %s, not target %s or decoy %s; got %v",
+		hostname, virtualSubnet, targetIP, decoyIP, resolved)
+
+	url := "http://" + net.JoinHostPort(hostname, strconv.Itoa(target.Port))
+	check.EventuallyHTTP(t, url, check.BodyContains(target.Name), subnetPollTimeout)
+	rt.RoutedToCluster(t, target.ServiceURL())
 }

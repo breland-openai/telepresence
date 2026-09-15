@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/quic-go/quic-go"
 	"google.golang.org/grpc"
@@ -47,7 +48,7 @@ type client struct {
 	owner           *clients
 	cancelClient    context.CancelFunc
 	cancelDialWatch context.CancelFunc
-	connectErr      error
+	dialWatchID     uint64
 	tunnelCount     int32
 	lastActive      int64
 
@@ -73,7 +74,12 @@ type client struct {
 	transport atomic.Value
 }
 
-const dormantLingerTime = 5 * time.Second
+const (
+	dormantLingerTime             = 5 * time.Second
+	dialWatcherReconnectInitial   = 250 * time.Millisecond
+	dialWatcherReconnectMax       = 5 * time.Second
+	dialWatcherReconnectResetTime = 30 * time.Second
+)
 
 // connectRetryInterval is how long WaitForIP waits between attempts to reach an agent that the
 // watch reports as present but that isn't dialable yet.
@@ -92,11 +98,16 @@ func (ac *client) Tunnel(ctx context.Context, opts ...grpc.CallOption) (tunnel.G
 	if err != nil {
 		return nil, err
 	}
+	start := time.Now()
 	clog.Tracef(ctx, "%s(%s) creating Tunnel over gRPC", ac, net.IP(ac.info.PodIp))
 	tc, err := cli.Tunnel(ctx, opts...)
+	elapsed := time.Since(start)
 	if err != nil {
-		clog.Tracef(ctx, "%s(%s) failed to create Tunnel over gRPC: %v", ac, net.IP(ac.info.PodIp), err)
+		clog.Warnf(ctx, "%s(%s) failed to create Tunnel over gRPC after %s: %v", ac, net.IP(ac.info.PodIp), elapsed.Round(time.Millisecond), err)
 		return nil, err
+	}
+	if elapsed > time.Second {
+		clog.Warnf(ctx, "%s(%s) created Tunnel over gRPC slowly in %s", ac, net.IP(ac.info.PodIp), elapsed.Round(time.Millisecond))
 	}
 	atomic.AddInt32(&ac.tunnelCount, 1)
 	clog.Tracef(ctx, "%s(%s) have %d active tunnels", ac, net.IP(ac.info.PodIp), atomic.LoadInt32(&ac.tunnelCount))
@@ -118,12 +129,13 @@ func (ac *client) ensureConnect(ctx context.Context) (agent.AgentClient, error) 
 }
 
 func (ac *client) ensureConnectLocked(ctx context.Context) (agent.AgentClient, error) {
-	if ac.connectErr != nil {
-		return nil, ac.connectErr
+	if ac.info.Intercepted {
+		ac.startDialWatcherLocked()
 	}
 
 	if ac.cli == nil {
-		dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
+		tos := tpClient.GetConfig(ac).Timeouts()
+		dialCtx, dialCancel := tos.TimeoutContext(ctx, tpClient.TimeoutTrafficAgentConnect)
 		defer dialCancel()
 
 		ai := ac.info
@@ -133,7 +145,9 @@ func (ac *client) ensureConnectLocked(ctx context.Context) (agent.AgentClient, e
 		}
 		conn, cli, err := ac.dialAgent(dialCtx, ns, ai)
 		if err != nil {
-			ac.connectErr = err
+			if ac.info.Intercepted {
+				return nil, err
+			}
 
 			// There's a risk for deadlock here, because of the Range iteration of the map that performs cancel. This cancel will block
 			// because we're holding the lock now, and since the Range iteration holds a lock for the entry that we're about to delete,
@@ -160,12 +174,6 @@ func (ac *client) ensureConnectLocked(ctx context.Context) (agent.AgentClient, e
 		}
 	}
 
-	if ac.info.Intercepted {
-		err := ac.startDialWatcherLocked()
-		if err != nil {
-			return nil, err
-		}
-	}
 	atomic.StoreInt64(&ac.lastActive, time.Now().UnixNano())
 	return ac.cli, nil
 }
@@ -287,53 +295,102 @@ func (ac *client) refresh(ai *manager.AgentPodInfo) {
 	}
 }
 
-func (ac *client) startDialWatcherLocked() error {
+func (ac *client) startDialWatcherLocked() {
 	if ac.cancelDialWatch != nil {
 		// Already started
-		return nil
+		return
 	}
 	ctx, cancel := context.WithCancel(ac)
-
-	// Create the dial watcher
-	clog.Debugf(ctx, "watching dials from agent pod %s", ac)
-	dialStream, err := ac.cli.WatchDial(ctx, ac.session)
-	if err != nil {
-		cancel()
-		return err
-	}
-
+	ac.dialWatchID++
+	watchID := ac.dialWatchID
 	ac.cancelDialWatch = func() {
 		ac.Lock()
-		ac.info.Intercepted = false
-		ac.cancelDialWatch = nil
+		if ac.dialWatchID == watchID {
+			ac.cancelDialWatch = nil
+		}
 		ac.Unlock()
 		cancel()
 	}
 
-	go func() {
-		var metrics tunnel.DialMetrics
-		if ac.owner != nil {
-			metrics = ac.owner.loadDialMetrics()
+	go ac.runDialWatcher(ctx, watchID)
+}
+
+func (ac *client) resetAgentClient() {
+	ac.Lock()
+	cancelClient := ac.cancelClient
+	ac.cancelClient = nil
+	ac.cli = nil
+	atomic.StoreInt32(&ac.tunnelCount, 0)
+	ac.Unlock()
+	if cancelClient != nil {
+		cancelClient()
+	}
+}
+
+func (ac *client) runDialWatcher(ctx context.Context, watchID uint64) {
+	defer func() {
+		ac.Lock()
+		if ac.dialWatchID == watchID {
+			ac.cancelDialWatch = nil
 		}
-		err := tunnel.DialWaitLoop(ctx, tunnel.AgentToClient, tunnel.AgentProvider(ac.cli), dialStream, tunnel.SessionID(ac.session.SessionId), metrics)
-		if err != nil {
-			// The traffic-agent closed the dial wait loop, which means that it's terminating.
-			clog.Error(ctx, err)
-		}
-		ai := ac.info
-		clog.Debugf(ctx, "DialWaitLoop ended for %s.%s", ai.PodName, ai.Namespace)
-		ac.RLock()
-		dwCancel := ac.cancelDialWatch
-		ac.RUnlock()
-		if dwCancel != nil {
-			dwCancel()
-		}
+		ac.Unlock()
 	}()
-	return nil
+
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = dialWatcherReconnectInitial
+	bo.MaxInterval = dialWatcherReconnectMax
+	bo.MaxElapsedTime = 0
+	bo.Reset()
+	lastConnected := time.Now()
+
+	for ctx.Err() == nil {
+		cli, err := ac.ensureConnect(ctx)
+		if err == nil {
+			ac.RLock()
+			session := ac.session
+			ai := ac.info
+			ac.RUnlock()
+
+			clog.Debugf(ctx, "watching dials from agent pod %s(%s)", ai.PodName, net.IP(ai.PodIp))
+			dialStream, watchErr := cli.WatchDial(ctx, session)
+			if watchErr == nil {
+				var metrics tunnel.DialMetrics
+				if ac.owner != nil {
+					metrics = ac.owner.loadDialMetrics()
+				}
+				if time.Since(lastConnected) > dialWatcherReconnectResetTime {
+					bo.Reset()
+				}
+				lastConnected = time.Now()
+				watchErr = tunnel.DialWaitLoop(ctx, tunnel.AgentToClient, tunnel.AgentProvider(cli), dialStream, tunnel.SessionID(session.SessionId), metrics)
+			}
+			err = watchErr
+		}
+		if ctx.Err() != nil {
+			return
+		}
+
+		if err != nil {
+			clog.Warnf(ctx, "dial watcher for %s ended; reconnecting: %v", ac, err)
+			ac.resetAgentClient()
+		} else {
+			clog.Warnf(ctx, "dial watcher for %s ended unexpectedly; reconnecting", ac)
+		}
+
+		delay := bo.NextBackOff()
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }
 
 type Clients interface {
 	GetRandomAgent(context.Context) agent.AgentClient
+	GetAgentForWorkload(context.Context, string) agent.AgentClient
 	GetClient(netip.Addr) tunnel.Provider
 	WatchAgentPods(rmc manager.ManagerClient) error
 
@@ -598,10 +655,56 @@ func (s *clients) GetRandomAgent(context.Context) (aa agent.AgentClient) {
 		return nil
 	}
 	connected.Lock()
-	connected.lastActive = time.Now().UnixNano()
+	atomic.StoreInt64(&connected.lastActive, time.Now().UnixNano())
 	aa = connected.cli
 	connected.Unlock()
 	return aa
+}
+
+// GetAgentForWorkload returns a connected traffic-agent for the workload in the connected namespace.
+func (s *clients) GetAgentForWorkload(ctx context.Context, workload string) agent.AgentClient {
+	if workload == "" || s.disabled.Load() {
+		return nil
+	}
+
+	var connected, other *client
+	var connectedKey, otherKey string
+	s.clients.Range(func(key string, ac *client) bool {
+		ac.RLock()
+		info := ac.info
+		matches := info != nil && !info.NodeAgent && info.WorkloadName == workload && info.Namespace == s.Namespace
+		isConnected := ac.cli != nil
+		ac.RUnlock()
+
+		if !matches {
+			return true
+		}
+		if isConnected {
+			if connected == nil || key < connectedKey {
+				connected = ac
+				connectedKey = key
+			}
+		} else if other == nil || key < otherKey {
+			other = ac
+			otherKey = key
+		}
+		return true
+	})
+
+	selected := connected
+	if selected == nil {
+		selected = other
+	}
+	if selected == nil {
+		return nil
+	}
+
+	agentClient, err := selected.ensureConnect(ctx)
+	if err != nil {
+		clog.Warn(s, err)
+		return nil
+	}
+	return agentClient
 }
 
 // GetWorkloadClient returns tunnel.Provider that opens a tunnel to a traffic-agent that
@@ -792,7 +895,7 @@ func (s *clients) teardown() {
 		}
 		return true
 	})
-	clog.Debugf(s, "WatchAgentPods ending with %d clients still active", activeCount)
+	clog.Infof(s, "WatchAgentPods ending with %d clients still active", activeCount)
 	s.disabled.Store(true)
 }
 

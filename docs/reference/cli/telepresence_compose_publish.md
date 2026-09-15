@@ -27,7 +27,6 @@ Publish compose application
 
 ### Compose publish flags:
 ```
-      --app                     Published compose application (includes referenced images)
       --oci-version string      OCI image/artifact specification version (automatically determined by default)
       --resolve-image-digests   Pin image tags to digests
       --with-env                Include environment variables in the published OCI artifact
