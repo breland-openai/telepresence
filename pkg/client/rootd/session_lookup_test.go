@@ -194,6 +194,10 @@ func lookupQuestion(name string, qType uint16) *dns2.Question {
 	return &dns2.Question{Name: name, Qtype: qType, Qclass: dns2.ClassINET}
 }
 
+func workloadLookupIPv4() netip.Addr {
+	return client.DefaultVirtualSubnet().Masked().Addr().Next()
+}
+
 func requireLookupAnswer(t *testing.T, records dnsproxy.RRs, expected string) {
 	t.Helper()
 	for _, record := range records {
@@ -241,14 +245,14 @@ func TestClusterLookupUsesSelectedProxyViaWorkload(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, dns2.RcodeSuccess, rCode)
-	requireLookupAnswer(t, records, "246.246.0.1")
+	requireLookupAnswer(t, records, workloadLookupIPv4().String())
 	require.Len(t, records, 2)
 	require.Equal(t, []string{"target"}, fixture.clients.selectedWorkloads())
 	require.Equal(t, 1, fixture.agents["target"].callCount())
 	require.Zero(t, fixture.agents["frontend"].callCount())
 	require.Zero(t, fixture.manager.callCount())
 
-	virtual, found := fixture.session.virtualIPs.Load(netip.MustParseAddr("246.246.0.1"))
+	virtual, found := fixture.session.virtualIPs.Load(workloadLookupIPv4())
 	require.True(t, found)
 	require.Equal(t, "target", virtual.workload)
 	require.Equal(t, netip.MustParseAddr("198.18.0.77"), virtual.destinationIP)
@@ -275,12 +279,12 @@ func TestClusterLookupUsesConfiguredProxyViaWorkloadOrder(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, dns2.RcodeSuccess, rCode)
-	requireLookupAnswer(t, records, "246.246.0.1")
+	requireLookupAnswer(t, records, workloadLookupIPv4().String())
 	require.Equal(t, []string{"target", "frontend"}, fixture.clients.selectedWorkloads())
 	require.Equal(t, 1, fixture.agents["target"].callCount())
 	require.Equal(t, 1, fixture.agents["frontend"].callCount())
 	require.Zero(t, fixture.manager.callCount())
-	virtual, found := fixture.session.virtualIPs.Load(netip.MustParseAddr("246.246.0.1"))
+	virtual, found := fixture.session.virtualIPs.Load(workloadLookupIPv4())
 	require.True(t, found)
 	require.Equal(t, "frontend", virtual.workload)
 }
@@ -339,9 +343,9 @@ func TestClusterLookupOverlappingRoutesUseMostSpecificWorkload(t *testing.T) {
 				require.Zero(t, fixture.session.virtualIPs.Size())
 				return
 			}
-			requireLookupAnswer(t, records, "246.246.0.1")
+			requireLookupAnswer(t, records, workloadLookupIPv4().String())
 			require.Zero(t, fixture.manager.callCount())
-			virtual, found := fixture.session.virtualIPs.Load(netip.MustParseAddr("246.246.0.1"))
+			virtual, found := fixture.session.virtualIPs.Load(workloadLookupIPv4())
 			require.True(t, found)
 			require.Equal(t, tt.wantWorkload, virtual.workload)
 			require.Equal(t, netip.MustParseAddr("198.18.0.77"), virtual.destinationIP)
@@ -368,7 +372,7 @@ func TestClusterLookupUsesManagerProvidedIncludeSuffix(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, dns2.RcodeSuccess, rCode)
-	requireLookupAnswer(t, records, "246.246.0.1")
+	requireLookupAnswer(t, records, workloadLookupIPv4().String())
 	require.Zero(t, fixture.manager.callCount())
 	require.Equal(t, 1, fixture.agents["target"].callCount())
 }
@@ -533,7 +537,7 @@ func TestClusterLookupWorkloadScope(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, dns2.RcodeSuccess, rCode)
 			if tt.wantAgent {
-				requireLookupAnswer(t, records, "246.246.0.1")
+				requireLookupAnswer(t, records, workloadLookupIPv4().String())
 				require.Equal(t, 1, fixture.agents["target"].callCount())
 				require.Zero(t, fixture.manager.callCount())
 			} else {
@@ -579,7 +583,7 @@ func TestClusterLookupWorkloadOppositeFamilyDoesNotFallBack(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, dns2.RcodeSuccess, rCode)
 	require.Len(t, records, 2)
-	requireLookupAnswer(t, records, "246.246.0.1")
+	requireLookupAnswer(t, records, workloadLookupIPv4().String())
 	require.Zero(t, fixture.manager.callCount())
 }
 
@@ -609,7 +613,7 @@ func TestClusterLookupWorkloadConcurrentAddressFamilies(t *testing.T) {
 		require.True(t, got.ok)
 		require.NoError(t, got.err)
 		require.Equal(t, dns2.RcodeSuccess, got.rCode)
-		requireLookupAnswer(t, got.records, "246.246.0.1")
+		requireLookupAnswer(t, got.records, workloadLookupIPv4().String())
 	}
 	require.Equal(t, 2, fixture.agents["target"].callCount())
 	require.Equal(t, 1, fixture.session.virtualIPs.Size())
