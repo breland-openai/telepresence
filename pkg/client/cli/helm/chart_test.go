@@ -17,7 +17,7 @@ import (
 // which is the path that reaches the templates' own guards.
 func renderCoreChart(t *testing.T, vals map[string]any, withSchema bool) error {
 	t.Helper()
-	chrt, err := loadCoreChart(semver.MustParse("2.31.0"))
+	chrt, err := loadCoreChart(semver.MustParse("2.32.0"))
 	require.NoError(t, err)
 	if !withSchema {
 		chrt.Schema = nil
@@ -146,7 +146,7 @@ func TestAgentPreStopDrainTimeoutManagerEnvironment(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			chrt, err := loadCoreChart(semver.MustParse("2.31.0"))
+			chrt, err := loadCoreChart(semver.MustParse("2.32.0"))
 			require.NoError(t, err)
 			values, err := chartutil.ToRenderValues(chrt, tt.vals,
 				chartutil.ReleaseOptions{Name: "traffic-manager", Namespace: "ambassador", IsInstall: true},
@@ -154,12 +154,14 @@ func TestAgentPreStopDrainTimeoutManagerEnvironment(t *testing.T) {
 			require.NoError(t, err)
 			rendered, err := engine.Engine{}.Render(chrt, values)
 			require.NoError(t, err)
-			deployment := rendered["telepresence-oss/templates/deployment.yaml"]
+			const managerTemplate = "telepresence-oss/templates/statefulset.yaml"
+			require.Contains(t, rendered, managerTemplate)
+			statefulSet := rendered[managerTemplate]
 			if tt.value == "" {
-				require.NotContains(t, deployment, "AGENT_PRE_STOP_DRAIN_TIMEOUT")
+				require.NotContains(t, statefulSet, "AGENT_PRE_STOP_DRAIN_TIMEOUT")
 				return
 			}
-			require.Contains(t, deployment, "- name: AGENT_PRE_STOP_DRAIN_TIMEOUT\n            value: \""+tt.value+"\"")
+			require.Contains(t, statefulSet, "- name: AGENT_PRE_STOP_DRAIN_TIMEOUT\n            value: \""+tt.value+"\"")
 		})
 	}
 }
