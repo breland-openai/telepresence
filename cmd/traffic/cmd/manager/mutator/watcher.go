@@ -65,7 +65,8 @@ type configWatcher struct {
 
 type workloadEvictionState struct {
 	sync.Mutex
-	replacementPending bool
+	replacementPending  bool
+	acceptedReplacement *podReplacement
 }
 
 func (c *configWatcher) lockEvictionState(key WorkloadKey) *workloadEvictionState {

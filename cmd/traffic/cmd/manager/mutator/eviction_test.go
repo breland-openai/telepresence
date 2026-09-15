@@ -459,6 +459,290 @@ func TestDeferredEvictionIsNotMarkedDeleted(t *testing.T) {
 	assert.False(t, cw.isEvicted(pod.UID))
 }
 
+func TestAcceptedEvictionWaitsForOwnedReadyReplacementWithoutDeploymentUpdate(t *testing.T) {
+	const namespace = "default"
+	deployment := replacementTestDeployment("echo", namespace, 6)
+	canary := replacementTestDeployment("echo-canary", namespace, 1)
+	oldPods := make([]*core.Pod, 6)
+	objects := []runtime.Object{deployment, canary}
+	for i := range oldPods {
+		oldPods[i] = replacementTestPod(fmt.Sprintf("echo-old-%d", i), namespace, deployment.Name)
+		objects = append(objects, oldPods[i])
+	}
+	client := fake.NewSimpleClientset(objects...)
+	var evicted []types.UID
+	client.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		eviction := action.(k8stesting.CreateAction).GetObject().(*policy.Eviction)
+		require.NotNil(t, eviction.DeleteOptions.Preconditions.UID)
+		evicted = append(evicted, *eviction.DeleteOptions.Preconditions.UID)
+		return true, nil, nil
+	})
+	ownerReadFails := false
+	client.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		name := action.(k8stesting.GetAction).GetName()
+		if ownerReadFails && name == "unknown" {
+			return true, nil, k8sErrors.NewForbidden(apps.Resource("deployments"), name, fmt.Errorf("denied"))
+		}
+		return false, nil, nil
+	})
+	ctx := k8sapi.WithJoinedClientSetInterface(context.Background(), client, argorolloutsfake.NewSimpleClientset())
+	ctx = informer.WithFactory(ctx, "")
+	ctx = managerutil.WithEnv(ctx, &managerutil.Env{EnabledWorkloadKinds: k8sapi.Kinds{k8sapi.DeploymentKind}})
+	factory := informer.GetK8sFactory(ctx, namespace)
+	deploymentStore := factory.Apps().V1().Deployments().Informer().GetStore()
+	podStore := factory.Core().V1().Pods().Informer().GetStore()
+	for _, workload := range []*apps.Deployment{deployment, canary} {
+		require.NoError(t, deploymentStore.Add(workload.DeepCopy()))
+	}
+	for _, pod := range oldPods {
+		require.NoError(t, podStore.Add(pod.DeepCopy()))
+	}
+	wl := k8sapi.Deployment(deployment)
+	cw := NewWatcher().(*configWatcher)
+	config := &agentconfig.Sidecar{}
+	configJSON, err := agentconfig.MarshalTight(config)
+	require.NoError(t, err)
+	reconcile := func() error { return cw.EvictPodsWithAgentConfigMismatch(ctx, wl, config) }
+	podsAPI := client.CoreV1().Pods(namespace)
+	create := func(pod *core.Pod) {
+		pod.Annotations[annotation.Config] = configJSON
+		_, createErr := podsAPI.Create(ctx, pod, meta.CreateOptions{})
+		require.NoError(t, createErr)
+		require.NoError(t, podStore.Add(pod.DeepCopy()))
+	}
+	update := func(pod *core.Pod) {
+		_, updateErr := podsAPI.Update(ctx, pod, meta.UpdateOptions{})
+		require.NoError(t, updateErr)
+	}
+	preexisting := replacementTestPod("echo-existing-pending", namespace, deployment.Name)
+	preexisting.Status = core.PodStatus{Phase: core.PodPending}
+	create(preexisting)
+
+	require.NoError(t, cw.evictPods(ctx, wl, oldPods))
+	require.Equal(t, []types.UID{oldPods[0].UID}, evicted)
+	assert.True(t, cw.isEvicted(oldPods[0].UID))
+	liveDeployment, err := client.AppsV1().Deployments(namespace).Get(ctx, deployment.Name, meta.GetOptions{})
+	require.NoError(t, err)
+	assert.True(t, k8sapi.Deployment(liveDeployment).Updated(deployment.Generation))
+	require.NoError(t, reconcile())
+	assert.Len(t, evicted, 1)
+
+	foreign := replacementTestPod("echo-canary-new", namespace, canary.Name)
+	create(foreign)
+	fresh := replacementTestPod("echo-fresh", namespace, deployment.Name)
+	fresh.Status = core.PodStatus{Phase: core.PodPending}
+	create(fresh)
+	unknown := replacementTestPod("echo-unknown", namespace, "unknown")
+	_, err = podsAPI.Create(ctx, unknown, meta.CreateOptions{})
+	require.NoError(t, err)
+	fresh.Status = replacementTestPod(fresh.Name, namespace, deployment.Name).Status
+	update(fresh)
+	ownerReadFails = true
+	require.NoError(t, reconcile(), "an old live UID holds the guard without inspecting other pods")
+	assert.Len(t, evicted, 1)
+	fresh.Status = core.PodStatus{Phase: core.PodPending}
+	update(fresh)
+	old := oldPods[0].DeepCopy()
+	now := meta.Now()
+	old.DeletionTimestamp = &now
+	update(old)
+	require.ErrorContains(t, reconcile(), "denied", "an ownership read failure must retain the guard")
+	assert.Len(t, evicted, 1)
+	ownerReadFails = false
+	preexisting.Status = replacementTestPod(preexisting.Name, namespace, deployment.Name).Status
+	update(preexisting)
+	require.NoError(t, reconcile(), "a foreign Ready pod and an owned Pending pod cannot replace the eviction")
+	assert.Len(t, evicted, 1)
+	require.NoError(t, podsAPI.Delete(ctx, old.Name, meta.DeleteOptions{}))
+	require.NoError(t, reconcile())
+	assert.Len(t, evicted, 1)
+
+	fresh.Status = replacementTestPod(fresh.Name, namespace, deployment.Name).Status
+	update(fresh)
+	sibling := oldPods[1].DeepCopy()
+	otherSibling := oldPods[2].DeepCopy()
+	sibling.Status.Conditions[0].Status = core.ConditionFalse
+	otherSibling.Status.Conditions[0].Status = core.ConditionFalse
+	update(sibling)
+	update(otherSibling)
+	require.NoError(t, reconcile(), "an owned Ready replacement cannot release below desired Ready capacity")
+	assert.Len(t, evicted, 1)
+	sibling.Status.Conditions[0].Status = core.ConditionTrue
+	otherSibling.Status.Conditions[0].Status = core.ConditionTrue
+	update(sibling)
+	update(otherSibling)
+	require.NoError(t, reconcile())
+	require.Len(t, evicted, 2)
+	assert.NotEqual(t, old.UID, evicted[1])
+	assert.NotEqual(t, foreign.UID, evicted[1])
+	assert.NotEqual(t, fresh.UID, evicted[1])
+	assert.True(t, cw.isEvicted(evicted[1]))
+	require.NoError(t, reconcile(), "another call cannot evict a third pod while the second target is still live")
+	assert.Len(t, evicted, 2)
+	assert.Zero(t, countActions(client.Actions(), "patch", "deployments"))
+	liveDeployment, err = client.AppsV1().Deployments(namespace).Get(ctx, deployment.Name, meta.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, deployment.Status, liveDeployment.Status)
+}
+
+func TestAcceptedEvictionRecoveryAllowsIntentionalScaleDown(t *testing.T) {
+	const namespace = "default"
+	deployment := replacementTestDeployment("echo", namespace, 3)
+	oldPods := []*core.Pod{
+		replacementTestPod("echo-old", namespace, deployment.Name),
+		replacementTestPod("echo-sibling-a", namespace, deployment.Name),
+		replacementTestPod("echo-sibling-b", namespace, deployment.Name),
+	}
+	client := fake.NewSimpleClientset(deployment, oldPods[1], oldPods[2])
+	ctx := k8sapi.WithJoinedClientSetInterface(context.Background(), client, argorolloutsfake.NewSimpleClientset())
+	ctx = informer.WithFactory(ctx, "")
+	ctx = managerutil.WithEnv(ctx, &managerutil.Env{EnabledWorkloadKinds: k8sapi.Kinds{k8sapi.DeploymentKind}})
+	factory := informer.GetK8sFactory(ctx, namespace)
+	require.NoError(t, factory.Apps().V1().Deployments().Informer().GetStore().Add(deployment.DeepCopy()))
+	pending := newPodReplacement(k8sapi.Deployment(deployment), oldPods[0], oldPods)
+	recovered, err := pending.recovered(ctx, k8sapi.Deployment(deployment))
+	require.NoError(t, err)
+	assert.False(t, recovered)
+	scaled := replacementTestDeployment(deployment.Name, namespace, 2)
+	recovered, err = pending.recovered(ctx, k8sapi.Deployment(scaled))
+	require.NoError(t, err)
+	assert.True(t, recovered)
+	scaled = replacementTestDeployment(deployment.Name, namespace, 0)
+	_, err = client.AppsV1().Deployments(namespace).Update(ctx, scaled, meta.UpdateOptions{})
+	require.NoError(t, err)
+	cw := NewWatcher().(*configWatcher)
+	require.NoError(t, cw.evictPods(ctx, k8sapi.Deployment(scaled), oldPods[1:]))
+	assert.Zero(t, countActions(client.Actions(), "create", "pods"))
+}
+
+func TestAcceptedEvictionRecoveryRecognizesReusedStatefulSetPodName(t *testing.T) {
+	const namespace = "default"
+	replicas := int32(2)
+	statefulSet := &apps.StatefulSet{
+		ObjectMeta: meta.ObjectMeta{Name: "echo", Namespace: namespace, UID: "echo-stateful-set"},
+		Spec: apps.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &meta.LabelSelector{MatchLabels: map[string]string{"app": "echo"}},
+		},
+	}
+	old := replacementTestPod("echo-0", namespace, statefulSet.Name)
+	sibling := replacementTestPod("echo-1", namespace, statefulSet.Name)
+	for _, pod := range []*core.Pod{old, sibling} {
+		pod.Labels[agentconfig.WorkloadKindLabel] = string(k8sapi.StatefulSetKind)
+	}
+	replacement := old.DeepCopy()
+	replacement.UID = "new-echo-0"
+	client := fake.NewSimpleClientset(statefulSet, sibling, replacement)
+	ctx := k8sapi.WithJoinedClientSetInterface(context.Background(), client, argorolloutsfake.NewSimpleClientset())
+	ctx = informer.WithFactory(ctx, "")
+	ctx = managerutil.WithEnv(ctx, &managerutil.Env{EnabledWorkloadKinds: k8sapi.Kinds{k8sapi.StatefulSetKind}})
+	factory := informer.GetK8sFactory(ctx, namespace)
+	require.NoError(t, factory.Apps().V1().StatefulSets().Informer().GetStore().Add(statefulSet.DeepCopy()))
+	wl := k8sapi.StatefulSet(statefulSet)
+	pending := newPodReplacement(wl, old, []*core.Pod{old, sibling})
+	recovered, err := pending.recovered(ctx, wl)
+	require.NoError(t, err)
+	assert.True(t, recovered)
+}
+
+func TestAcceptedEvictionRecoveryChecksEachControllerUID(t *testing.T) {
+	const namespace = "default"
+	for _, tc := range []struct {
+		name              string
+		stalePodOwner     bool
+		staleParentOwner  bool
+		recreatedWorkload bool
+		wantRecovery      bool
+	}{
+		{name: "all controller UIDs match", wantRecovery: true},
+		{name: "pod refers to previous ReplicaSet UID", stalePodOwner: true},
+		{name: "ReplicaSet refers to previous Deployment UID", staleParentOwner: true},
+		{name: "same name now belongs to a new Deployment UID", recreatedWorkload: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			controller := true
+			deployment := replacementTestDeployment("echo", namespace, 2)
+			liveDeployment := deployment.DeepCopy()
+			if tc.recreatedWorkload {
+				liveDeployment.UID = "new-deployment-uid"
+			}
+			replicaSet := &apps.ReplicaSet{ObjectMeta: meta.ObjectMeta{
+				Name: "echo-abc123", Namespace: namespace, UID: "new-replica-set-uid",
+				OwnerReferences: []meta.OwnerReference{{
+					Kind: string(k8sapi.DeploymentKind), Name: liveDeployment.Name, UID: liveDeployment.UID, Controller: &controller,
+				}},
+			}}
+			if tc.staleParentOwner {
+				replicaSet.OwnerReferences[0].UID = "old-deployment-uid"
+			}
+			old := replacementTestPod("echo-old", namespace, deployment.Name)
+			sibling := replacementTestPod("echo-sibling", namespace, deployment.Name)
+			fresh := replacementTestPod("echo-fresh", namespace, deployment.Name)
+			fresh.OwnerReferences = []meta.OwnerReference{{
+				Kind: string(k8sapi.ReplicaSetKind), Name: replicaSet.Name, UID: replicaSet.UID, Controller: &controller,
+			}}
+			if tc.stalePodOwner {
+				fresh.OwnerReferences[0].UID = "old-replica-set-uid"
+			}
+			client := fake.NewSimpleClientset(liveDeployment, replicaSet, sibling, fresh)
+			ctx := k8sapi.WithJoinedClientSetInterface(context.Background(), client, argorolloutsfake.NewSimpleClientset())
+			ctx = informer.WithFactory(ctx, "")
+			ctx = managerutil.WithEnv(ctx, &managerutil.Env{EnabledWorkloadKinds: k8sapi.Kinds{k8sapi.DeploymentKind}})
+			factory := informer.GetK8sFactory(ctx, namespace)
+			require.NoError(t, factory.Apps().V1().Deployments().Informer().GetStore().Add(deployment.DeepCopy()))
+			cachedReplicaSet := replicaSet.DeepCopy()
+			cachedReplicaSet.UID = fresh.OwnerReferences[0].UID
+			require.NoError(t, factory.Apps().V1().ReplicaSets().Informer().GetStore().Add(cachedReplicaSet))
+			wl := k8sapi.Deployment(deployment)
+			pending := newPodReplacement(wl, old, []*core.Pod{old, sibling})
+			recovered, err := pending.recovered(ctx, wl)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantRecovery, recovered)
+			if tc.recreatedWorkload {
+				owned, listErr := liveWorkloadPods(ctx, wl)
+				require.NoError(t, listErr)
+				assert.Empty(t, owned)
+				cw := NewWatcher().(*configWatcher)
+				require.NoError(t, cw.evictPods(ctx, wl, []*core.Pod{sibling}))
+				assert.Zero(t, countActions(client.Actions(), "create", "pods"))
+			}
+		})
+	}
+}
+
+func replacementTestDeployment(name, namespace string, replicas int32) *apps.Deployment {
+	return &apps.Deployment{
+		ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace, Generation: 12, UID: types.UID(name + "-deployment-uid")},
+		Spec: apps.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &meta.LabelSelector{MatchLabels: map[string]string{"app": "echo"}},
+		},
+		Status: apps.DeploymentStatus{
+			ObservedGeneration: 12, Replicas: replicas, UpdatedReplicas: replicas,
+			ReadyReplicas: replicas, AvailableReplicas: replicas,
+		},
+	}
+}
+
+func replacementTestPod(name, namespace, workload string) *core.Pod {
+	return &core.Pod{
+		ObjectMeta: meta.ObjectMeta{
+			Name: name, Namespace: namespace, UID: types.UID(name),
+			Labels: map[string]string{
+				"app": "echo", agentconfig.WorkloadNameLabel: workload,
+				agentconfig.WorkloadKindLabel: string(k8sapi.DeploymentKind),
+			},
+			Annotations: map[string]string{annotation.Config: "stale"},
+		},
+		Status: core.PodStatus{
+			Phase: core.PodRunning, Conditions: []core.PodCondition{{Type: core.PodReady, Status: core.ConditionTrue}},
+		},
+	}
+}
+
 func TestAbsentPodDoesNotConsumeSuccessfulEvictionCount(t *testing.T) {
 	replicas := int32(2)
 	deployment := &apps.Deployment{
@@ -695,7 +979,7 @@ func TestDeleteMapsAndRolloutNamespaceWaitsForAllEvictions(t *testing.T) {
 				},
 				Annotations: map[string]string{annotation.Config: "stale"},
 			},
-			Status: core.PodStatus{Phase: core.PodRunning},
+			Status: core.PodStatus{Phase: core.PodRunning, Conditions: []core.PodCondition{{Type: core.PodReady, Status: core.ConditionTrue}}},
 		})
 	}
 
@@ -746,7 +1030,7 @@ func TestDeleteMapsAndRolloutNamespaceWaitsForAllEvictions(t *testing.T) {
 					agentconfig.WorkloadKindLabel: string(k8sapi.ReplicaSetKind),
 				},
 			},
-			Status: core.PodStatus{Phase: core.PodRunning},
+			Status: core.PodStatus{Phase: core.PodRunning, Conditions: []core.PodCondition{{Type: core.PodReady, Status: core.ConditionTrue}}},
 		}
 		require.NoError(t, tracker.Create(podsResource, replacement, namespace))
 		recovered := updating.DeepCopy()
