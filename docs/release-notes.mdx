@@ -15,6 +15,12 @@ On Linux, root daemon startup removes recognized stale DNS redirects to unused l
   </Body>
 </Note>
 <Note>
+	<Title type="bugfix">Route Kubernetes pod DNS through Telepresence on Linux</Title>
+	<Body>
+Kubernetes pod addresses now use Telepresence DNS when the machine's physical network also advertises the Kubernetes DNS domain. This keeps pod names reachable when virtual network address translation is enabled.
+  </Body>
+</Note>
+<Note>
 	<Title type="bugfix">Recover promptly from stalled manager sessions</Title>
 	<Body>
 Manager keepalive failures now use the existing session repair path instead of ending the client session. Expired sessions recover immediately, while repeated transient failures trigger repair without dropping active intercepts.
