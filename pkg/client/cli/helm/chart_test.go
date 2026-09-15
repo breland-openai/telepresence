@@ -1,12 +1,15 @@
 package helm
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/blang/semver/v4"
 	"github.com/stretchr/testify/require"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
+	appsv1 "k8s.io/api/apps/v1"
+	"sigs.k8s.io/yaml"
 )
 
 // renderCoreChart renders the embedded telepresence-oss chart with vals coalesced
@@ -156,12 +159,38 @@ func TestAgentPreStopDrainTimeoutManagerEnvironment(t *testing.T) {
 			require.NoError(t, err)
 			const managerTemplate = "telepresence-oss/templates/statefulset.yaml"
 			require.Contains(t, rendered, managerTemplate)
-			statefulSet := rendered[managerTemplate]
-			if tt.value == "" {
-				require.NotContains(t, statefulSet, "AGENT_PRE_STOP_DRAIN_TIMEOUT")
-				return
+			manifest := rendered[managerTemplate]
+			lf := strings.ReplaceAll(manifest, "\r\n", "\n")
+			for _, format := range []struct{ name, manifest string }{
+				{"rendered", manifest}, {"LF", lf}, {"CRLF", strings.ReplaceAll(lf, "\n", "\r\n")},
+			} {
+				t.Run(format.name, func(t *testing.T) {
+					var statefulSet appsv1.StatefulSet
+					require.NoError(t, yaml.Unmarshal([]byte(format.manifest), &statefulSet))
+					require.Equal(t, "StatefulSet", statefulSet.Kind)
+					var foundManager, foundVariable bool
+					var actual string
+					for _, container := range statefulSet.Spec.Template.Spec.Containers {
+						if container.Name != "traffic-manager" {
+							continue
+						}
+						foundManager = true
+						for _, env := range container.Env {
+							if env.Name == "AGENT_PRE_STOP_DRAIN_TIMEOUT" {
+								require.False(t, foundVariable, "drain timeout must be rendered exactly once")
+								foundVariable, actual = true, env.Value
+							}
+						}
+					}
+					require.True(t, foundManager, "manager container must exist")
+					if tt.value == "" {
+						require.False(t, foundVariable)
+						return
+					}
+					require.True(t, foundVariable)
+					require.Equal(t, tt.value, actual)
+				})
 			}
-			require.Contains(t, statefulSet, "- name: AGENT_PRE_STOP_DRAIN_TIMEOUT\n            value: \""+tt.value+"\"")
 		})
 	}
 }

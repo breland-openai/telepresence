@@ -35,6 +35,12 @@ items:
           Reconnecting also waits for the previous session's workers and routing
           cleanup to finish, including when session initialization fails.
       - type: bugfix
+        title: Route Kubernetes pod DNS through Telepresence on Linux
+        body: >-
+          Kubernetes pod addresses now use Telepresence DNS when the machine's
+          physical network also advertises the Kubernetes DNS domain. This keeps
+          pod names reachable when virtual network address translation is enabled.
+      - type: bugfix
         title: Recover promptly from stalled manager sessions
         body: >-
           Manager keepalive failures now use the existing session repair path
