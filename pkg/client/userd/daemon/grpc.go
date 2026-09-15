@@ -29,7 +29,6 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/logging"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/userd"
-	"github.com/telepresenceio/telepresence/v2/pkg/client/userd/trafficmgr"
 	"github.com/telepresenceio/telepresence/v2/pkg/errcat"
 	grpcErrors "github.com/telepresenceio/telepresence/v2/pkg/grpc/errors"
 	"github.com/telepresenceio/telepresence/v2/pkg/grpc/server"
@@ -45,16 +44,17 @@ func (s *service) FuseFTPError() error {
 
 func (s *service) withSession(ctx context.Context, f func(context.Context, userd.Session) error) (err error) {
 	s.sessionLock.RLock()
-	defer s.sessionLock.RUnlock()
-	if s.session == nil {
+	session := s.session
+	s.sessionLock.RUnlock()
+	if session == nil {
 		return status.Error(codes.Unavailable, "no active session")
 	}
 	select {
-	case <-s.session.Done():
+	case <-session.Done():
 		return status.Error(codes.Canceled, "session cancelled")
 	default:
-		s.session.MarkActivity()
-		return f(server.NewCombinedContext(s.session, ctx), s.session)
+		session.MarkActivity()
+		return f(server.NewCombinedContext(session, ctx), session)
 	}
 }
 
@@ -73,16 +73,67 @@ func (s *service) Connect(ctx context.Context, cr *rpc.ConnectRequest) (result *
 		return result, err
 	}
 
-	s.sessionLock.Lock()
-	defer s.sessionLock.Unlock()
-	if s.session != nil {
-		// Someone beat us to taking the lock.
-		err = s.session.CheckStatus(cr)
-		if err != nil {
-			return nil, err
+	var attempt *connectAttempt
+	var sessionCtx context.Context
+	for {
+		if err = ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
 		}
-		return s.session.Status(server.NewCombinedContext(s.session, ctx))
+		s.sessionLock.Lock()
+		if err = s.Err(); err != nil {
+			s.sessionLock.Unlock()
+			return nil, status.FromContextError(err).Err()
+		}
+		if session := s.session; session != nil {
+			s.sessionLock.Unlock()
+			if err = session.CheckStatus(cr); err != nil {
+				return nil, err
+			}
+			return session.Status(server.NewCombinedContext(session, ctx))
+		}
+		if active := s.connecting; active != nil {
+			s.sessionLock.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, status.FromContextError(ctx.Err()).Err()
+			case <-s.Done():
+				return nil, status.FromContextError(s.Err()).Err()
+			case <-active.done:
+				continue
+			}
+		}
+		var cancel context.CancelCauseFunc
+		sessionCtx, cancel = context.WithCancelCause(s.Context)
+		attempt = &connectAttempt{done: make(chan struct{}), cancel: cancel}
+		s.connecting = attempt
+		s.sessionLock.Unlock()
+		break
 	}
+	defer func() {
+		s.sessionLock.Lock()
+		if err != nil {
+			s.clientConfigLock.Lock()
+			s.clientConfig = nil
+			s.clientConfigLock.Unlock()
+		}
+		s.connecting = nil
+		close(attempt.done)
+		s.sessionLock.Unlock()
+	}()
+	sessionCancel := attempt.cancel
+	stopOwnerCancellation := context.AfterFunc(ctx, func() {
+		s.sessionLock.Lock()
+		if s.connecting == attempt && s.session == nil {
+			sessionCancel(context.Cause(ctx))
+		}
+		s.sessionLock.Unlock()
+	})
+	defer stopOwnerCancellation()
+	defer func() {
+		if err != nil {
+			sessionCancel(err)
+		}
+	}()
 
 	var cfg client.Config
 	cfg, err = client.LoadConfig(s)
@@ -93,12 +144,11 @@ func (s *service) Connect(ctx context.Context, cr *rpc.ConnectRequest) (result *
 	// Obtain the kubeconfig from the request parameters so that we can determine
 	// what kubernetes context that will be used.
 	var kubeConfig *k8s.Kubeconfig
-	sessionCtx, sessionCancel := context.WithCancelCause(s.Context)
 	kubeConfig, err = k8s.DaemonKubeconfig(client.WithConfig(sessionCtx, cfg), cr)
 	if err != nil {
 		sessionCancel(fmt.Errorf("failed to obtain kubeconfig: %w", err))
 		if s.rootSessionInProc {
-			s.quit(true)
+			s.quit(false)
 		}
 		clog.Errorf(ctx, "Failed to obtain kubeconfig: %v", err)
 		return result, err
@@ -110,41 +160,55 @@ func (s *service) Connect(ctx context.Context, cr *rpc.ConnectRequest) (result *
 	s.clientConfigLock.Lock()
 	s.clientConfig = kubeConfig.ClientConfig
 	s.clientConfigLock.Unlock()
-	defer func() {
-		if err != nil {
-			s.clientConfigLock.Lock()
-			s.clientConfig = nil
-			s.clientConfigLock.Unlock()
-		}
-	}()
 
 	daemonID := cliDaemon.NewIdentifier(cr.Name, kubeConfig.KubeContext, kubeConfig.Namespace, proc.RunningInContainer())
 	wg := &sync.WaitGroup{}
 
 	var session userd.Session
-	session, result, err = trafficmgr.NewSession(s, server.NewCombinedContext(s, ctx), cr, kubeConfig, wg)
+	session, result, err = s.newSession(s, server.NewCombinedContext(sessionCtx, ctx), cr, kubeConfig, wg)
+	if err == nil {
+		s.sessionLock.Lock()
+		if err = ctx.Err(); err == nil {
+			err = sessionCtx.Err()
+		}
+		if err != nil {
+			s.sessionLock.Unlock()
+			err = status.FromContextError(err).Err()
+		}
+	}
 	if err != nil {
 		sessionCancel(fmt.Errorf("failed to create user daemon session: %w", err))
+		if session != nil {
+			session.Close()
+		}
+		wg.Wait()
 		if s.rootSessionInProc {
 			// Simplified session management. The daemon handles one session, then exits.
-			s.quit(true)
+			s.quit(false)
 		}
 		return nil, err
 	}
 	client.ReloadLogLevel(session)
+	var cancelOnce sync.Once
 	s.sessionCancel = func(cause error) {
-		if cause == nil {
-			cause = context.Canceled
-		}
-		clog.Infof(session, "canceling user daemon session: %v", cause)
-		if err := session.ClearIngestsAndIntercepts(); err != nil {
-			clog.Errorf(ctx, "failed to clear intercepts: %v", err)
-		}
-		sessionCancel(cause)
+		cancelOnce.Do(func() {
+			if cause == nil {
+				cause = context.Canceled
+			}
+			clog.Infof(session, "canceling user daemon session: %v", cause)
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(session), 3*time.Second)
+			defer cancel()
+			defer sessionCancel(cause)
+			if err := session.ClearIngestsAndIntercepts(cleanupCtx); err != nil {
+				clog.Errorf(ctx, "failed to clear intercepts: %v", err)
+			}
+		})
 	}
+	cancelUserSession := s.sessionCancel
 	sessionRunning := make(chan struct{})
 	s.session = session
 	s.sessionRunning = sessionRunning
+	s.sessionLock.Unlock()
 
 	// Run the session asynchronously. We must be able to respond to connect (with UpdateStatus) while
 	// the session is running. The s.sessionCancel is called from Disconnect
@@ -159,7 +223,6 @@ func (s *service) Connect(ctx context.Context, cr *rpc.ConnectRequest) (result *
 		s.clearSession(session)
 	}()
 	if s.rootSessionInProc {
-		cancelUserSession := s.sessionCancel
 		go runAliveAndCancellationSession(session, func() {
 			cancelUserSession(errors.New("session daemon info file disappeared"))
 		}, daemonID, wg)
@@ -180,13 +243,18 @@ func (s *service) Disconnect(ctx context.Context, ex *empty.Empty) (*empty.Empty
 }
 
 func (s *service) cancelSession(ctx context.Context, disconnectRoot bool) {
-	var oldSession userd.Session
-	err := s.withSession(ctx, func(_ context.Context, session userd.Session) error {
-		oldSession = session
-		s.sessionCancel(errors.New("connector Disconnect request"))
-		return nil
-	})
-	if err == nil && s.clearSession(oldSession) {
+	s.sessionLock.RLock()
+	oldSession, cancel := s.session, s.sessionCancel
+	if oldSession == nil && s.connecting != nil {
+		s.connecting.cancel(errors.New("connector Disconnect request"))
+	}
+	s.sessionLock.RUnlock()
+	if oldSession == nil || oldSession.Err() != nil {
+		return
+	}
+	oldSession.MarkActivity()
+	cancel(errors.New("connector Disconnect request"))
+	if s.clearSession(oldSession) {
 		if disconnectRoot {
 			_ = s.withRootDaemon(ctx, func(ctx context.Context, rd daemon.DaemonClient) error {
 				_, _ = rd.Disconnect(ctx, &empty.Empty{})
@@ -223,6 +291,12 @@ func (s *service) Status(ctx context.Context, ex *empty.Empty) (result *rpc.Conn
 	})
 	if status.Code(err) != codes.Unavailable {
 		return result, err
+	}
+	s.sessionLock.RLock()
+	connecting := s.connecting != nil && s.session == nil
+	s.sessionLock.RUnlock()
+	if connecting {
+		return nil, status.Error(codes.FailedPrecondition, "connection in progress")
 	}
 	err = s.withRootDaemon(ctx, func(c context.Context, dc daemon.DaemonClient) (err error) {
 		if result == nil {
@@ -392,7 +466,9 @@ func (s *service) SetLogLevel(ctx context.Context, request *rpc.LogLevelRequest)
 func (s *service) Quit(ctx context.Context, ex *empty.Empty) (qr *daemon.QuitResponse, err error) {
 	s.cancelSession(ctx, false)
 	s.quit(false)
-	err = s.withRootDaemon(context.WithoutCancel(ctx), func(ctx context.Context, rd daemon.DaemonClient) (err error) {
+	rootCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	err = s.withRootDaemon(rootCtx, func(ctx context.Context, rd daemon.DaemonClient) (err error) {
 		clog.Debug(ctx, "Telling root daemon to Quit")
 		qr, err = rd.Quit(ctx, ex)
 		return err
@@ -694,9 +770,10 @@ func (s *service) ListLocalClientRedirects(ctx context.Context, request *empty.E
 
 func (s *service) withRootDaemon(ctx context.Context, f func(ctx context.Context, daemonClient daemon.DaemonClient) error) error {
 	s.sessionLock.RLock()
-	defer s.sessionLock.RUnlock()
-	if s.session != nil {
-		return s.session.WithRootClient(ctx, f)
+	session := s.session
+	s.sessionLock.RUnlock()
+	if session != nil {
+		return session.WithRootClient(ctx, f)
 	}
 
 	if s.rootSessionInProc {

@@ -806,14 +806,26 @@ func (s *session) RemoveIntercept(name string) error {
 }
 
 func (s *session) removeIntercept(ic *intercept) error {
+	return s.removeInterceptWithContext(s.Context, ic)
+}
+
+func (s *session) removeInterceptWithContext(c context.Context, ic *intercept) error {
 	name := ic.Spec.Name
-	s.stopHandler(name, ic.handlerContainer, ic.pid)
+	s.stopHandlerWithContext(c, name, ic.handlerContainer, ic.pid)
 
 	// Unmount filesystems before telling the manager to remove the intercept
 	ic.cancel()
-	ic.wg.Wait()
+	unmounted := make(chan struct{})
+	go func() {
+		ic.wg.Wait()
+		close(unmounted)
+	}()
+	select {
+	case <-c.Done():
+		return c.Err()
+	case <-unmounted:
+	}
 
-	c := s.Context
 	clog.Debugf(c, "telling manager to remove intercept %s", name)
 	tos := client.GetConfig(c).Timeouts()
 	cc, cancel := tos.TimeoutContext(c, client.TimeoutTrafficManagerAPI)
@@ -835,11 +847,14 @@ func (s *session) removeIntercept(ic *intercept) error {
 }
 
 func (s *session) stopHandler(name, handlerContainer string, pid int) {
+	s.stopHandlerWithContext(s.Context, name, handlerContainer, pid)
+}
+
+func (s *session) stopHandlerWithContext(c context.Context, name, handlerContainer string, pid int) {
 	// No use trying to kill processes when using a container-based daemon, unless
 	// that daemon runs as a normal user daemon with a separate root daemon.
 	// Some users run a standard telepresence client together with ingests/intercepts
 	// in one single container.
-	c := s.Context
 	if !(proc.RunningInContainer() && s.GetService().RootSessionInProcess()) {
 		if handlerContainer != "" {
 			if err := docker.StopContainer(c, handlerContainer); err != nil {
@@ -994,20 +1009,27 @@ func (s *session) InterceptsForWorkload(workloadName, namespace string) []*manag
 }
 
 // ClearIngestsAndIntercepts removes all intercepts.
-func (s *session) ClearIngestsAndIntercepts() error {
+func (s *session) ClearIngestsAndIntercepts(ctx context.Context) error {
 	for _, ic := range s.getCurrentIntercepts() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		clog.Debugf(s, "Clearing intercept %s", ic.Spec.Name)
-		err := s.removeIntercept(ic)
+		err := s.removeInterceptWithContext(ctx, ic)
 		if err != nil && status.Code(err) != codes.NotFound {
 			return err
 		}
 	}
+	var err error
 	s.currentIngests.Range(func(key ingestKey, ig *ingest) bool {
+		if err = ctx.Err(); err != nil {
+			return false
+		}
 		clog.Debugf(s, "Clearing ingest %s", key)
-		s.stopHandler(key.workload+"/"+key.container, ig.handlerContainer, ig.pid)
+		s.stopHandlerWithContext(ctx, key.workload+"/"+key.container, ig.handlerContainer, ig.pid)
 		return true
 	})
-	return nil
+	return err
 }
 
 // reconcileAPIServers start/stop API servers as needed based on the TELEPRESENCE_API_PORT environment variable

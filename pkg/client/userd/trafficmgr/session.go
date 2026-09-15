@@ -274,6 +274,12 @@ func NewSession(
 		clog.Errorf(config, "Unable to connect to session: %s", err)
 		return nil, nil, err
 	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			tmgr.Close()
+		}
+	}()
 	if tmgr.compareFinalizedManagerVersion(2, 21, 0) < 0 {
 		return nil, nil,
 			fmt.Errorf("traffic manager version %s is too old. Minimum supported version is 2.21.0, please upgrade", tmgr.ManagerVersion())
@@ -309,7 +315,6 @@ func NewSession(
 	rootCtx, rootCancel := tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
 	defer rootCancel()
 	if err = tmgr.connectRootDaemon(rootCtx, oi, wg, cr.IsPodDaemon); err != nil {
-		_ = tmgr.managerConnection().Close()
 		return nil, nil, err
 	}
 
@@ -318,7 +323,11 @@ func NewSession(
 
 	tmgr.AddNamespaceEventHandler(tmgr.updateDaemonNamespaces)
 	ci, err := tmgr.status(rootCtx, true)
-	return tmgr, ci, err
+	if err != nil {
+		return nil, nil, err
+	}
+	handedOff = true
+	return tmgr, ci, nil
 }
 
 func (s *session) GetService() userd.Service {
@@ -336,7 +345,9 @@ func (s *session) Run() {
 	started := time.Now()
 	g := log.NewGroup(s)
 	defer func() {
-		_ = s.WithRootClient(context.WithoutCancel(s), func(ctx context.Context, rd rootdRpc.DaemonClient) error {
+		rootCtx, cancel := context.WithTimeout(context.WithoutCancel(s), 3*time.Second)
+		defer cancel()
+		_ = s.WithRootClient(rootCtx, func(ctx context.Context, rd rootdRpc.DaemonClient) error {
 			_, _ = rd.Disconnect(ctx, &empty.Empty{})
 			return nil
 		})
@@ -353,6 +364,19 @@ func (s *session) Run() {
 		clog.Infof(s, "session context ended after %s: context=%v cause=%v", elapsed, s.Err(), context.Cause(s))
 	default:
 		clog.Infof(s, "session services stopped cleanly after %s", elapsed)
+	}
+}
+
+func (s *session) Close() {
+	rootCtx, cancel := context.WithTimeout(context.WithoutCancel(s), 3*time.Second)
+	defer cancel()
+	_ = s.WithRootClient(rootCtx, func(ctx context.Context, rd rootdRpc.DaemonClient) error {
+		_, err := rd.Disconnect(ctx, &empty.Empty{})
+		return err
+	})
+	s.closeRootDaemon()
+	if conn := s.managerConnection(); conn != nil {
+		_ = conn.Close()
 	}
 }
 
@@ -430,6 +454,12 @@ func connectMgr(
 	if err != nil {
 		return nil, err
 	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			_ = conn.Close()
+		}
+	}()
 	if sdc := cfg.Grpc().SimulateDisconnect; sdc > 0 {
 		time.AfterFunc(sdc, func() {
 			clog.Info(cluster, "Simulated disconnect from manager")
@@ -512,6 +542,7 @@ func connectMgr(
 		podRelay:           newPodRelay(),
 	}
 	sess.Context = withSession(sess.Context, sess)
+	handedOff = true
 	return sess, nil
 }
 
@@ -1282,12 +1313,29 @@ func (s *session) updateClientConfig(ctx context.Context, namespaces []string) {
 
 func (s *session) status(ctx context.Context, initial bool) (*rpc.ConnectInfo, error) {
 	cfg := s.Kubeconfig
+	managerInstallID := s.SessionInfo().GetManagerInstallId()
+	if managerInstallID == "" {
+		var kubeCtx context.Context
+		var kubeCancel context.CancelFunc
+		if deadline, ok := ctx.Deadline(); ok {
+			kubeCtx, kubeCancel = context.WithDeadline(s, deadline)
+		} else {
+			kubeCtx, kubeCancel = context.WithCancel(s)
+		}
+		stopKubeCancel := context.AfterFunc(ctx, kubeCancel)
+		if ctx.Err() != nil {
+			kubeCancel()
+		}
+		managerInstallID = s.GetManagerInstallId(kubeCtx)
+		stopKubeCancel()
+		kubeCancel()
+	}
 	_, managerName, managerVersion, _ := s.managerSnapshot()
 	ret := &rpc.ConnectInfo{
 		Initial:          initial,
 		ClusterContext:   cfg.KubeContext,
 		ClusterServer:    cfg.Server,
-		ManagerInstallId: s.GetManagerInstallId(),
+		ManagerInstallId: managerInstallID,
 		SessionInfo:      s.SessionInfo(),
 		ConnectionName:   s.daemonID.Name,
 		KubeFlags:        s.OriginalFlagMap,
@@ -1306,7 +1354,7 @@ func (s *session) status(ctx context.Context, initial bool) (*rpc.ConnectInfo, e
 		ret.MappedNamespaces = s.GetCurrentNamespaces(true)
 	}
 	err := s.WithRootClient(ctx, func(ctx context.Context, rd rootdRpc.DaemonClient) (err error) {
-		ret.DaemonStatus, err = rd.Status(s, &empty.Empty{})
+		ret.DaemonStatus, err = rd.Status(ctx, &empty.Empty{})
 		return err
 	})
 	if err != nil {
@@ -1426,7 +1474,7 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 				// ...or not, since we've already done it.
 				return errors.New("unable to reconnect to root daemon")
 			}
-			if _, err = rd.Disconnect(s, &empty.Empty{}); err != nil {
+			if _, err = rd.Disconnect(timeoutCtx, &empty.Empty{}); err != nil {
 				return fmt.Errorf("failed to disconnect from the root daemon: %w", err)
 			}
 		}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/netip"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	empty "google.golang.org/protobuf/types/known/emptypb"
@@ -331,10 +332,12 @@ func getStatusInfo(ctx context.Context, di *daemon.Info) (*StatusInfo, error) {
 			tm := &wt.TrafficManager
 			tm.Name = mv.Name
 			tm.Version = mv.Version
-			if af, err := userD.AgentImageFQN(ctx, &empty.Empty{}); err == nil {
+			metadataCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			if af, err := userD.AgentImageFQN(metadataCtx, &empty.Empty{}); err == nil {
 				tm.TrafficAgent = af.FQN
 			}
-			tm.extendedInfo = GetTrafficManagerStatusExtras(ctx, userD)
+			tm.extendedInfo = GetTrafficManagerStatusExtras(metadataCtx, userD)
+			cancel()
 		}
 		rStatus = status.DaemonStatus
 	} else {

@@ -21,9 +21,11 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/daemon"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/docker"
+	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/logging"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/remotefs"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/userd"
+	"github.com/telepresenceio/telepresence/v2/pkg/client/userd/trafficmgr"
 	"github.com/telepresenceio/telepresence/v2/pkg/filelocation"
 	"github.com/telepresenceio/telepresence/v2/pkg/grpc/server"
 	"github.com/telepresenceio/telepresence/v2/pkg/log"
@@ -58,10 +60,14 @@ type service struct {
 	clientConfigLock sync.Mutex
 	clientConfig     clientcmd.ClientConfig
 
+	// Session-state locks must not be held over network calls or connection initialization.
 	sessionLock    sync.RWMutex
 	session        userd.Session
 	sessionCancel  func(error)
 	sessionRunning chan struct{}
+	// A replacement may not start until the previous construction and its cleanup finish.
+	connecting *connectAttempt
+	newSession func(userd.Service, context.Context, *rpc.ConnectRequest, *k8s.Kubeconfig, *sync.WaitGroup) (userd.Session, *rpc.ConnectInfo, error)
 
 	fuseFtpMgr remotefs.FuseFTPManager
 
@@ -73,6 +79,11 @@ type service struct {
 
 	// Port where root daemon (or rather the embedded root daemon) starts the teleroute service.
 	teleroutePort uint16
+}
+
+type connectAttempt struct {
+	done   chan struct{}
+	cancel context.CancelCauseFunc
 }
 
 func (s *service) ClientConfig() (clientcmd.ClientConfig, error) {
@@ -96,6 +107,7 @@ func newService(ctx context.Context, cancel context.CancelFunc, cfg client.Confi
 		timedLogLevel:  log.NewTimedLevel(cfg.LogLevels().UserDaemon, clog.SetTreeLevel),
 		fuseFtpMgr:     remotefs.NewFuseFTPManager(),
 		sessionRunning: make(chan struct{}),
+		newSession:     trafficmgr.NewSession,
 	}
 	s.initFTPServer(ctx, cfg)
 	close(s.sessionRunning)

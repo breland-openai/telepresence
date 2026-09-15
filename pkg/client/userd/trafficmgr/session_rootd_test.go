@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -17,14 +20,128 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	connectorRpc "github.com/telepresenceio/telepresence/rpc/v2/connector"
 	rootdRpc "github.com/telepresenceio/telepresence/rpc/v2/daemon"
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
+	cliDaemon "github.com/telepresenceio/telepresence/v2/pkg/client/cli/daemon"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/remotefs"
+	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
 )
+
+func TestSessionStatusUsesManagerInstallIDWithoutKubernetes(t *testing.T) {
+	server := &rootDaemonReconnectTestServer{}
+	conn, cleanup, err := dialTestRootDaemon(server)
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	s := rootStatusTestSession(t.Context(), conn, "manager-namespace-id")
+	info, err := s.Status(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "manager-namespace-id", info.ManagerInstallId)
+}
+
+func TestSessionStatusForwardsCallerDeadlineToRootDaemon(t *testing.T) {
+	server := &rootDaemonStalledStatusTestServer{started: make(chan struct{}), canceled: make(chan struct{})}
+	conn, cleanup, err := dialTestRootDaemon(server)
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	s := rootStatusTestSession(t.Context(), conn, "manager-namespace-id")
+	requestCtx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, callErr := s.Status(requestCtx)
+		result <- callErr
+	}()
+	select {
+	case <-server.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("root daemon status was not called")
+	}
+	select {
+	case err = <-result:
+		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	case <-time.After(2 * time.Second):
+		t.Fatal("root daemon status did not respect the request deadline")
+	}
+	select {
+	case <-server.canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("root daemon status handler did not observe request cancellation")
+	}
+	require.NoError(t, s.Err())
+}
+
+func TestSessionStatusFallbackKubernetesHonorsCallerCancellation(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	api := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	t.Cleanup(api.Close)
+	ki, err := kubernetes.NewForConfig(&rest.Config{Host: api.URL})
+	require.NoError(t, err)
+	conn, cleanup, err := dialTestRootDaemon(&rootDaemonReconnectTestServer{})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	s := rootStatusTestSession(k8sapi.WithK8sInterface(t.Context(), ki), conn, "")
+	requestCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, callErr := s.Status(requestCtx)
+		result <- callErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the older session did not request its manager namespace ID")
+	}
+	cancel()
+	select {
+	case err = <-result:
+		require.Equal(t, codes.Canceled, status.Code(err))
+	case <-time.After(2 * time.Second):
+		t.Fatal("the namespace lookup did not respect request cancellation")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Kubernetes handler did not observe request cancellation")
+	}
+	require.NoError(t, s.Err())
+}
+
+func rootStatusTestSession(ctx context.Context, conn *grpc.ClientConn, managerInstallID string) *session {
+	ctx = client.WithConfig(ctx, client.GetDefaultConfig())
+	return &session{
+		Cluster: &k8s.Cluster{Kubeconfig: &k8s.Kubeconfig{
+			Context: ctx, Namespace: "default", KubeContext: "test", Server: "https://cluster.example",
+		}},
+		daemonID:       cliDaemon.NewIdentifier("test", "test", "default", false),
+		sessionInfo:    &manager.SessionInfo{SessionId: "test-session", ManagerInstallId: managerInstallID},
+		rootDaemon:     rootdRpc.NewDaemonClient(conn),
+		currentIngests: xsync.NewMap[ingestKey, *ingest](),
+	}
+}
+
+type rootDaemonStalledStatusTestServer struct {
+	rootdRpc.UnimplementedDaemonServer
+	started, canceled chan struct{}
+}
+
+func (s *rootDaemonStalledStatusTestServer) Status(ctx context.Context, _ *emptypb.Empty) (*rootdRpc.DaemonStatus, error) {
+	close(s.started)
+	<-ctx.Done()
+	close(s.canceled)
+	return nil, ctx.Err()
+}
 
 func TestRootDaemonActivityWatcherReconnectsRootDaemon(t *testing.T) {
 	const sessionID = "test-session"

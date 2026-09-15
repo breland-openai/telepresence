@@ -44,7 +44,9 @@ type Session interface {
 	AddIntercept(context.Context, *rpc.CreateInterceptRequest) (*manager.InterceptInfo, error)
 	AddInterceptor(string, *rpc.Interceptor) error
 	CanIntercept(context.Context, *rpc.CreateInterceptRequest) (InterceptInfo, error)
-	ClearIngestsAndIntercepts() error
+	ClearIngestsAndIntercepts(context.Context) error
+	// Close releases a session that will not be started.
+	Close()
 	GatherLogs(context.Context, *rpc.LogsRequest) (*rpc.LogsResponse, error)
 	GetConfig() (*client.SessionConfig, error)
 	GetCurrentNamespaces(forClientAccess bool) []string
