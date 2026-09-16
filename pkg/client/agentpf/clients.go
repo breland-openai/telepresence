@@ -651,20 +651,17 @@ func (s *clients) GetClient(ip netip.Addr) (pvd tunnel.Provider) {
 // lookup's whole deadline. An agent that no traffic has needed yet is therefore left to
 // the dial watcher and the ip-waiter loop, which connect on the session's own context.
 //
-// Node-agent sessions are never returned. A node-agent's pod runs in the
-// traffic-manager's namespace rather than the workload's, so its resolv.conf
-// search path qualifies bare (single-label) names against the wrong
-// namespace and DNS lookups delegated to it would incorrectly fail. When no
-// eligible (non-node-agent) client remains, this function returns nil and
-// the caller falls back to querying the traffic-manager directly, which
-// qualifies single-label names against the client's connected namespace
-// itself.
+// Only sidecars in the connected namespace are eligible. Other mapped namespaces
+// and node-agent pods have a different resolv.conf search path and can resolve
+// bare names in the wrong namespace. With no eligible client, the caller queries
+// the traffic-manager, which qualifies bare names against the connected namespace.
 //
-// The function returns nil when no agent is connected.
+// The function returns nil when no eligible agent is connected.
 func (s *clients) GetRandomAgent(context.Context) (aa agent.AgentClient) {
 	var connected *client
 	s.clients.Range(func(_ string, ac *client) bool {
-		if ac.podInfo().NodeAgent {
+		ai := ac.podInfo()
+		if ai.NodeAgent || ai.Namespace == "" || ai.Namespace != s.Namespace {
 			return true
 		}
 		if ac.connected() {
