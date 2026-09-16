@@ -62,6 +62,12 @@ func runCell(s *rt.Suite, verb string, tpl workloads.Template) {
 	default:
 		t.Fatalf("unknown verb %q", verb)
 	}
+	detached := false
+	defer func() {
+		if !detached {
+			a.DetachWithin(t, 30*time.Second, time.Second)
+		}
+	}()
 
 	entries := conn.List(t)
 	s.True(listContains(entries, wl.Name, wl.Namespace), "list should show %s.%s", wl.Name, wl.Namespace)
@@ -99,6 +105,7 @@ func runCell(s *rt.Suite, verb string, tpl workloads.Template) {
 	}
 
 	a.Detach(t)
+	detached = true
 
 	s.False(attachedInList(conn.List(t), wl.Name, wl.Namespace, verb),
 		"list should no longer show %s.%s as attached after detach", wl.Name, wl.Namespace)
