@@ -3,6 +3,7 @@ package trafficmgr
 import (
 	"context"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -90,6 +91,122 @@ func TestNativeProxyViaOrdinaryAndLocalOnlyRetainConnectDeadline(t *testing.T) {
 			require.Equal(t, int32(0), root.networkRequests.Load())
 		})
 	}
+}
+
+func TestNativeProxyViaBudgetsEverySerialDistinctColdWorkload(t *testing.T) {
+	const arrival = 650 * time.Millisecond
+	s, root, mgr := newProxyArrivalSession(t, arrival)
+	mgr.releases = map[string]chan struct{}{"first": make(chan struct{}), "second": make(chan struct{})}
+	nc := proxyArrivalNetwork("first")
+	nc.SubnetViaWorkloads = append(nc.SubnetViaWorkloads, &rootdRpc.SubnetViaWorkload{Workload: "second", Subnet: "10.8.0.2/32"})
+	ctx, cancel := s.rootDaemonConnectTimeout(t.Context(), nc)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- s.connectRootDaemon(ctx, nc, nil, false) }()
+	first := receiveProxyEvent(t, mgr.started)
+	require.Equal(t, "first", first.workload)
+	require.InDelta(t, (proxyTestManagerConnect + 2*arrival).Seconds(), first.deadline.Sub(first.received).Seconds(), 0.12)
+	select {
+	case unexpected := <-mgr.started:
+		t.Fatalf("second manager request began before the first agent arrived: %#v", unexpected)
+	case err := <-result:
+		t.Fatalf("cold first agent returned prematurely: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(mgr.releases["first"])
+	second := receiveProxyEvent(t, mgr.started)
+	require.Equal(t, "second", second.workload)
+	require.WithinDuration(t, first.deadline, second.deadline, 30*time.Millisecond)
+	select {
+	case err := <-result:
+		t.Fatalf("second cold agent exhausted the single-workload deadline: %v", err)
+	case <-time.After(375 * time.Millisecond):
+	}
+	close(mgr.releases["second"])
+	require.NoError(t, receiveProxyEvent(t, result))
+	require.Equal(t, int32(2), mgr.agentRequests.Load())
+	require.Equal(t, int32(1), root.networkRequests.Load())
+}
+
+func TestNativeProxyViaDuplicateAndLocalRoutesDoNotAddAgentAllowances(t *testing.T) {
+	const arrival = 650 * time.Millisecond
+	s, root, mgr := newProxyArrivalSession(t, arrival)
+	nc := proxyArrivalNetwork("same")
+	nc.SubnetViaWorkloads = append(nc.SubnetViaWorkloads,
+		&rootdRpc.SubnetViaWorkload{Workload: "same", Subnet: "10.8.0.2/32"},
+		&rootdRpc.SubnetViaWorkload{Workload: "local", Subnet: "10.8.0.3/32"},
+		&rootdRpc.SubnetViaWorkload{Subnet: "10.8.0.4/32"}, nil)
+	ctx, cancel := s.rootDaemonConnectTimeout(t.Context(), nc)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- s.connectRootDaemon(ctx, nc, nil, false) }()
+	request := receiveProxyEvent(t, mgr.started)
+	require.Equal(t, "same", request.workload)
+	require.InDelta(t, (proxyTestManagerConnect + arrival).Seconds(), request.deadline.Sub(request.received).Seconds(), 0.12)
+	close(mgr.release)
+	require.NoError(t, receiveProxyEvent(t, result))
+	require.Equal(t, int32(1), mgr.agentRequests.Load())
+	require.Equal(t, int32(1), root.networkRequests.Load())
+}
+
+func TestNativeProxyViaCallerCancellationStopsTheSecondColdWorkload(t *testing.T) {
+	s, root, mgr := newProxyArrivalSession(t, 650*time.Millisecond)
+	mgr.releases = map[string]chan struct{}{"first": make(chan struct{}), "second": make(chan struct{})}
+	nc := proxyArrivalNetwork("first")
+	nc.SubnetViaWorkloads = append(nc.SubnetViaWorkloads, &rootdRpc.SubnetViaWorkload{Workload: "second", Subnet: "10.8.0.2/32"})
+	parent, stop := context.WithCancel(t.Context())
+	defer stop()
+	ctx, cancel := s.rootDaemonConnectTimeout(parent, nc)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- s.connectRootDaemon(ctx, nc, nil, false) }()
+	require.Equal(t, "first", receiveProxyEvent(t, mgr.started).workload)
+	close(mgr.releases["first"])
+	require.Equal(t, "second", receiveProxyEvent(t, mgr.started).workload)
+	started := time.Now()
+	stop()
+	require.Equal(t, codes.Canceled, status.Code(receiveProxyEvent(t, result)))
+	receiveProxyEvent(t, mgr.canceled)
+	require.Less(t, time.Since(started), 250*time.Millisecond)
+	require.Equal(t, int32(2), mgr.agentRequests.Load())
+	require.Equal(t, int32(0), root.networkRequests.Load())
+}
+
+type proxyArrivalEmbeddedService struct{ rootDaemonReconnectTestService }
+
+func (proxyArrivalEmbeddedService) RootSessionInProcess() bool { return true }
+
+func TestNativeEmbeddedProxyViaFailedStartupRegistersAndJoinsPersistentWorkers(t *testing.T) {
+	s, _, mgr := newProxyArrivalSession(t, 650*time.Millisecond)
+	s.service = proxyArrivalEmbeddedService{}
+	persistent, stopSession := context.WithCancel(s.Context)
+	defer stopSession()
+	s.Context = persistent
+	nc := proxyArrivalNetwork("missing")
+	nc.AgentPodNamespaces = []string{"default"}
+	parent, stopCaller := context.WithCancel(t.Context())
+	defer stopCaller()
+	ctx, stopTimeout := s.rootDaemonConnectTimeout(parent, nc)
+	defer stopTimeout()
+	var wg sync.WaitGroup
+	result := make(chan error, 1)
+	go func() { result <- s.connectRootDaemon(ctx, nc, &wg, true) }()
+	require.Equal(t, "missing", receiveProxyEvent(t, mgr.started).workload)
+	receiveProxyEvent(t, mgr.watchStarted)
+	stopCaller()
+	require.Equal(t, codes.Canceled, status.Code(receiveProxyEvent(t, result)))
+	receiveProxyEvent(t, mgr.canceled)
+	require.NoError(t, persistent.Err())
+	joined := make(chan struct{}, 1)
+	go func() { wg.Wait(); joined <- struct{}{} }()
+	select {
+	case <-joined:
+		t.Fatal("the failed embedded root did not register its still-running native manager watch")
+	case <-time.After(30 * time.Millisecond):
+	}
+	stopSession()
+	receiveProxyEvent(t, mgr.watchStopped)
+	receiveProxyEvent(t, joined)
 }
 
 func TestNativeProxyViaAgentWaitStopsImmediatelyOnCallerCancellation(t *testing.T) {
@@ -232,6 +349,61 @@ func TestNativeProxyViaReportsOnlyItsOwnComposedTimeout(t *testing.T) {
 	}
 }
 
+func TestNativeProxyViaNetworkWaitPreservesCallerAndConfiguredRPCCodes(t *testing.T) {
+	for _, tt := range []struct {
+		name, workload string
+		caller         bool
+		wantCode       codes.Code
+	}{
+		{name: "named configured deadline", workload: "same", wantCode: codes.DeadlineExceeded},
+		{name: "named caller cancellation", workload: "same", caller: true, wantCode: codes.Canceled},
+		{name: "ordinary configured deadline", wantCode: codes.DeadlineExceeded},
+		{name: "ordinary caller cancellation", caller: true, wantCode: codes.Canceled},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, root, mgr := newProxyArrivalSessionWithTimeouts(t, 60*time.Millisecond, 60*time.Millisecond)
+			root.networkBlocked = true
+			root.connectOrdinary = true
+			close(mgr.release)
+			parent, stop := context.WithCancel(t.Context())
+			defer stop()
+			nc := proxyArrivalNetwork(tt.workload)
+			ctx, cancel := s.rootDaemonConnectTimeout(parent, nc)
+			defer cancel()
+			result := make(chan error, 1)
+			go func() { result <- s.connectRootDaemon(ctx, nc, nil, false) }()
+			receiveProxyEvent(t, root.networkStarted)
+			if tt.caller {
+				stop()
+			}
+			err := receiveProxyEvent(t, result)
+			receiveProxyEvent(t, root.networkCanceled)
+			require.Equal(t, tt.wantCode, status.Code(err))
+			require.ErrorContains(t, err, "failed to connect to root daemon")
+			if tt.workload != "" && !tt.caller {
+				require.ErrorContains(t, err, "1 distinct workload(s) (60ms total agent allowance)")
+			} else {
+				require.NotContains(t, err.Error(), "total agent allowance")
+			}
+		})
+	}
+}
+
+func TestNativeProxyViaTimeoutReportsDistinctCountAndTotal(t *testing.T) {
+	s, _, _ := newProxyArrivalSessionWithTimeouts(t, 10*time.Millisecond, 10*time.Millisecond)
+	nc := proxyArrivalNetwork("first")
+	nc.SubnetViaWorkloads = append(nc.SubnetViaWorkloads,
+		&rootdRpc.SubnetViaWorkload{Workload: "first", Subnet: "10.8.0.2/32"},
+		&rootdRpc.SubnetViaWorkload{Workload: "second", Subnet: "10.8.0.3/32"},
+		&rootdRpc.SubnetViaWorkload{Workload: "local", Subnet: "10.8.0.4/32"})
+	ctx, cancel := s.rootDaemonConnectTimeout(t.Context(), nc)
+	defer cancel()
+	<-ctx.Done()
+	err := rootDaemonConnectError(ctx, status.Error(codes.DeadlineExceeded, "root timed out"))
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	require.ErrorContains(t, err, "2 distinct workload(s) (20ms total agent allowance)")
+}
+
 func proxyArrivalNetwork(workload string) *rootdRpc.NetworkConfig {
 	nc := &rootdRpc.NetworkConfig{Namespace: "default", Session: &manager.SessionInfo{SessionId: "proxy-session"}}
 	if workload != "" {
@@ -255,9 +427,15 @@ func newProxyArrivalSessionWithTimeouts(t *testing.T, localManager, localAgent t
 		config.Timeouts().PrivateIntercept = localAgent
 	}
 	ctx, cancel := context.WithCancel(client.WithConfig(t.Context(), config))
-	mgr := &proxyArrivalManagerServer{started: make(chan proxyArrivalRequest, 1), release: make(chan struct{}), canceled: make(chan struct{}, 1)}
+	mgr := &proxyArrivalManagerServer{
+		started: make(chan proxyArrivalRequest, 8), release: make(chan struct{}), canceled: make(chan struct{}, 8),
+		watchStarted: make(chan struct{}, 8), watchStopped: make(chan struct{}, 8),
+	}
 	mgrConn := dialProxyArrivalManager(t, mgr)
-	root := &proxyArrivalRootServer{manager: manager.NewManagerClient(mgrConn), standardStarted: make(chan time.Time, 1), standardCanceled: make(chan struct{}, 1)}
+	root := &proxyArrivalRootServer{
+		manager: manager.NewManagerClient(mgrConn), standardStarted: make(chan time.Time, 1), standardCanceled: make(chan struct{}, 1),
+		networkStarted: make(chan struct{}, 1), networkCanceled: make(chan struct{}, 1),
+	}
 	rootConn, cleanup, err := dialTestRootDaemon(root)
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
@@ -292,7 +470,10 @@ type proxyArrivalManagerServer struct {
 	manager.UnimplementedManagerServer
 	started        chan proxyArrivalRequest
 	release        chan struct{}
+	releases       map[string]chan struct{}
 	canceled       chan struct{}
+	watchStarted   chan struct{}
+	watchStopped   chan struct{}
 	configRequests atomic.Int32
 	agentRequests  atomic.Int32
 }
@@ -306,8 +487,12 @@ func (s *proxyArrivalManagerServer) EnsureAgent(ctx context.Context, request *ma
 	s.agentRequests.Add(1)
 	deadline, _ := ctx.Deadline()
 	s.started <- proxyArrivalRequest{workload: request.Name, deadline: deadline, received: time.Now()}
+	release := s.release
+	if forWorkload, ok := s.releases[request.Name]; ok {
+		release = forWorkload
+	}
 	select {
-	case <-s.release:
+	case <-release:
 		return &manager.AgentInfoSnapshot{Agents: []*manager.AgentInfo{{Name: request.Name}}}, nil
 	case <-ctx.Done():
 		s.canceled <- struct{}{}
@@ -315,22 +500,40 @@ func (s *proxyArrivalManagerServer) EnsureAgent(ctx context.Context, request *ma
 	}
 }
 
+func (s *proxyArrivalManagerServer) WatchAgentPodsInNamespacesDelta(_ *manager.AgentsRequest, stream grpc.ServerStreamingServer[manager.AgentPodInfoDelta]) error {
+	s.watchStarted <- struct{}{}
+	defer func() { s.watchStopped <- struct{}{} }()
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
 type proxyArrivalRootServer struct {
 	rootdRpc.UnimplementedDaemonServer
 	manager          manager.ManagerClient
 	standardStarted  chan time.Time
 	standardCanceled chan struct{}
+	connectOrdinary  bool
+	networkBlocked   bool
+	networkStarted   chan struct{}
+	networkCanceled  chan struct{}
 	networkRequests  atomic.Int32
 }
 
 func (s *proxyArrivalRootServer) Connect(ctx context.Context, nc *rootdRpc.NetworkConfig) (*rootdRpc.DaemonStatus, error) {
+	ensured := make(map[string]struct{})
 	for _, via := range nc.SubnetViaWorkloads {
 		if name := via.GetWorkload(); name != "" && name != "local" {
+			if _, ok := ensured[name]; ok {
+				continue
+			}
+			ensured[name] = struct{}{}
 			if _, err := s.manager.EnsureAgent(ctx, &manager.EnsureAgentRequest{Session: nc.Session, Name: name}); err != nil {
 				return nil, err
 			}
-			return &rootdRpc.DaemonStatus{OutboundConfig: nc}, nil
 		}
+	}
+	if len(ensured) > 0 || s.connectOrdinary {
+		return &rootdRpc.DaemonStatus{OutboundConfig: nc}, nil
 	}
 	deadline, _ := ctx.Deadline()
 	s.standardStarted <- deadline
@@ -339,8 +542,14 @@ func (s *proxyArrivalRootServer) Connect(ctx context.Context, nc *rootdRpc.Netwo
 	return nil, status.FromContextError(ctx.Err()).Err()
 }
 
-func (s *proxyArrivalRootServer) WaitForNetwork(context.Context, *emptypb.Empty) (*emptypb.Empty, error) {
+func (s *proxyArrivalRootServer) WaitForNetwork(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
 	s.networkRequests.Add(1)
+	if s.networkBlocked {
+		s.networkStarted <- struct{}{}
+		<-ctx.Done()
+		s.networkCanceled <- struct{}{}
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
 	return &emptypb.Empty{}, nil
 }
 

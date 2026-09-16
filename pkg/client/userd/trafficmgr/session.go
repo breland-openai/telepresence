@@ -1392,23 +1392,35 @@ func (s *session) getNetworkInfo(cr *rpc.ConnectRequest) *rootdRpc.NetworkConfig
 }
 
 type proxyViaStartupTimeoutError struct {
-	managerConnect, agentArrival time.Duration
+	managerConnect, agentArrival, totalAgentArrival time.Duration
+	workloadCount                                   int
 }
 
 func (e proxyViaStartupTimeoutError) Error() string {
-	return fmt.Sprintf("proxy-via startup exceeded trafficManagerConnect (%s) plus intercept (%s) for agent arrival", e.managerConnect, e.agentArrival)
+	return fmt.Sprintf(
+		"proxy-via startup exceeded trafficManagerConnect (%s) plus intercept (%s) for agent arrival in %d distinct workload(s) (%s total agent allowance)",
+		e.managerConnect, e.agentArrival, e.workloadCount, e.totalAgentArrival,
+	)
 }
 
 func (s *session) rootDaemonConnectTimeout(ctx context.Context, nc *rootdRpc.NetworkConfig) (context.Context, context.CancelFunc) {
 	tos := client.GetConfig(s).Timeouts()
+	workloads := make(map[string]struct{})
 	for _, via := range nc.GetSubnetViaWorkloads() {
 		if name := via.GetWorkload(); name != "" && name != "local" {
-			// Named proxy workloads can require agent injection during root startup.
-			managerConnect := tos.Get(client.TimeoutTrafficManagerConnect)
-			agentArrival := tos.Get(client.TimeoutIntercept)
-			deadline := time.Now().Add(managerConnect).Add(agentArrival)
-			return context.WithDeadlineCause(ctx, deadline, proxyViaStartupTimeoutError{managerConnect, agentArrival})
+			workloads[name] = struct{}{}
 		}
+	}
+	if count := len(workloads); count > 0 {
+		// The root requests agent injection serially for distinct named workloads.
+		managerConnect := tos.Get(client.TimeoutTrafficManagerConnect)
+		agentArrival := tos.Get(client.TimeoutIntercept)
+		deadline := time.Now().Add(managerConnect)
+		agentStart := deadline
+		for range count {
+			deadline = deadline.Add(agentArrival)
+		}
+		return context.WithDeadlineCause(ctx, deadline, proxyViaStartupTimeoutError{managerConnect, agentArrival, deadline.Sub(agentStart), count})
 	}
 	return tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
 }
@@ -1452,20 +1464,21 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 		}()
 
 		g := log.NewGroup(rootSession)
-		if err = rootSession.Start(g, svc.TeleroutePort()); err != nil {
-			return err
+		defer func() {
+			// Register after Start has added workers, including on failed startup.
+			if wg != nil {
+				wg.Go(func() {
+					err := g.Wait()
+					if err != nil && !errors.Is(err, context.Canceled) {
+						clog.Errorf(s, "root session exited with error: %v", err)
+					}
+				})
+			}
+		}()
+		if err = rootSession.StartWithContext(timeoutCtx, g, svc.TeleroutePort()); err != nil {
+			return rootDaemonConnectError(timeoutCtx, err)
 		}
 		rd = rootSession
-
-		// Give in-proc root session services a chance to clean up.
-		if wg != nil {
-			wg.Go(func() {
-				err := g.Wait()
-				if err != nil && !errors.Is(err, context.Canceled) {
-					clog.Errorf(s, "root session exited with error: %v", err)
-				}
-			})
-		}
 	} else {
 		dialRootDaemon := s.dialRootDaemon
 		if dialRootDaemon == nil {
@@ -1515,7 +1528,7 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 		if se, ok := status.FromError(err); ok {
 			err = se.Err()
 		}
-		return fmt.Errorf("failed to connect to root daemon: %v", rootDaemonConnectError(timeoutCtx, err))
+		return fmt.Errorf("failed to connect to root daemon: %w", rootDaemonConnectError(timeoutCtx, err))
 	}
 	generation := s.setRootDaemon(rd, conn, nc, isPodDaemon)
 	if !svc.RootSessionInProcess() {
