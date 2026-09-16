@@ -19,29 +19,32 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/agentpf"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
+	"github.com/telepresenceio/telepresence/v2/pkg/errcat"
 	"github.com/telepresenceio/telepresence/v2/pkg/log"
 )
 
 type embeddedProxyRequest struct {
-	name     string
-	deadline time.Time
+	name      string
+	namespace string
+	deadline  time.Time
 }
 
 type embeddedProxyManager struct {
 	manager.UnimplementedManagerServer
-	gates        map[string]chan struct{}
-	started      chan embeddedProxyRequest
-	canceled     chan string
-	watchStarted chan struct{}
-	watchStopped chan struct{}
-	watchDeltas  chan *manager.AgentPodInfoDelta
-	watchScopes  chan []string
-	watchFailure chan struct{}
+	gates            map[string]chan struct{}
+	started          chan embeddedProxyRequest
+	canceled         chan string
+	watchStarted     chan struct{}
+	watchStopped     chan struct{}
+	watchDeltas      chan *manager.AgentPodInfoDelta
+	watchScopes      chan []string
+	watchFailure     chan struct{}
+	legacyAgentWatch bool
 }
 
 func (m *embeddedProxyManager) EnsureAgent(ctx context.Context, req *manager.EnsureAgentRequest) (*manager.AgentInfoSnapshot, error) {
 	dl, _ := ctx.Deadline()
-	m.started <- embeddedProxyRequest{req.Name, dl}
+	m.started <- embeddedProxyRequest{name: req.Name, namespace: req.Namespace, deadline: dl}
 	select {
 	case <-m.gates[req.Name]:
 		return &manager.AgentInfoSnapshot{}, nil
@@ -54,6 +57,19 @@ func (m *embeddedProxyManager) EnsureAgent(ctx context.Context, req *manager.Ens
 func (m *embeddedProxyManager) WatchAgentPodsInNamespacesDelta(req *manager.AgentsRequest, stream grpc.ServerStreamingServer[manager.AgentPodInfoDelta]) error {
 	m.watchStarted <- struct{}{}
 	m.watchScopes <- req.Namespaces
+	if m.legacyAgentWatch {
+		return status.Error(codes.Unimplemented, "legacy manager only supports connected-namespace agent watches")
+	}
+	return m.streamAgentPods(stream)
+}
+
+func (m *embeddedProxyManager) WatchAgentPodsDelta(_ *manager.SessionInfo, stream grpc.ServerStreamingServer[manager.AgentPodInfoDelta]) error {
+	m.watchStarted <- struct{}{}
+	m.watchScopes <- []string{"default"}
+	return m.streamAgentPods(stream)
+}
+
+func (m *embeddedProxyManager) streamAgentPods(stream grpc.ServerStreamingServer[manager.AgentPodInfoDelta]) error {
 	defer func() { m.watchStopped <- struct{}{} }()
 	for {
 		select {
@@ -79,14 +95,23 @@ func newEmbeddedProxyManager() *embeddedProxyManager {
 
 func newEmbeddedProxyFixture(t *testing.T, names ...string) (*InProcSession, *embeddedProxyManager, context.CancelFunc) {
 	t.Helper()
+	return newEmbeddedProxyFixtureForAgentNamespaces(t, []string{"default"}, false, false, names...)
+}
+
+func newEmbeddedProxyFixtureForAgentNamespaces(t *testing.T, namespaces []string, external, legacy bool, names ...string) (*InProcSession, *embeddedProxyManager, context.CancelFunc) {
+	t.Helper()
 	config := client.GetDefaultConfig()
 	config.DNS().PreserveLocalClusterDNS = false
 	config.DNS().UseComplexLookup = true
 	config.Cluster().AgentPortForward = true
+	if external {
+		config.Cluster().ManagerAddress = "tls://traffic-manager.example.com:8443"
+	}
 	config.Grpc().WatchRetryInterval = 10 * time.Millisecond
 	persistent, stop := context.WithCancel(client.WithConfig(t.Context(), config))
 	t.Cleanup(stop)
 	mgr := newEmbeddedProxyManager()
+	mgr.legacyAgentWatch = legacy
 	for _, name := range names {
 		if name != "" && name != "local" {
 			mgr.gates[name] = make(chan struct{})
@@ -95,14 +120,128 @@ func newEmbeddedProxyFixture(t *testing.T, names ...string) (*InProcSession, *em
 	conn := newWorkloadLookupConnection(t, func(s *grpc.Server) { manager.RegisterManagerServer(s, mgr) })
 	cluster := &k8s.Cluster{Kubeconfig: &k8s.Kubeconfig{Context: persistent, Namespace: "default"}}
 	nc := &rpc.NetworkConfig{
-		Namespace: "default", Session: &manager.SessionInfo{SessionId: "embedded-proxy"}, AgentPodNamespaces: []string{"default"},
+		Namespace: "default", Session: &manager.SessionInfo{SessionId: "embedded-proxy"}, AgentPodNamespaces: namespaces,
 	}
 	for _, name := range names {
 		nc.SubnetViaWorkloads = append(nc.SubnetViaWorkloads, &rpc.SubnetViaWorkload{Workload: name, Subnet: "10.8.0.1/32"})
 	}
-	rd, err := NewInProcSession(cluster, nc, conn, semver.MustParse("2.32.0"), nil, true)
+	version := "2.32.0"
+	if legacy {
+		version = "2.27.9"
+	}
+	rd, err := NewInProcSession(cluster, nc, conn, semver.MustParse(version), nil, true)
 	require.NoError(t, err)
 	return rd, mgr, stop
+}
+
+func TestEmbeddedNamedProxyRejectsUnwatchedConnectedNamespaceBeforeManagerInjection(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		external, legacy bool
+	}{
+		{name: "direct"},
+		{name: "external", external: true},
+		{name: "direct legacy", legacy: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rd, mgr, stopSession := newEmbeddedProxyFixtureForAgentNamespaces(t, []string{"other"}, tt.external, tt.legacy, "proxy")
+			g := log.NewGroup(rd)
+			defer func() {
+				stopSession()
+				require.NoError(t, g.Wait())
+			}()
+			startup, stopStartup := context.WithTimeout(t.Context(), 5*time.Second)
+			defer stopStartup()
+			finished := make(chan error, 1)
+			go func() { finished <- rd.StartWithContext(startup, g, 0) }()
+
+			select {
+			case request := <-mgr.started:
+				t.Fatalf("named proxy asked the real manager to inject into its unwatched connected namespace: %#v", request)
+			case err := <-finished:
+				require.Error(t, err)
+				require.Equal(t, errcat.User, errcat.GetCategory(err))
+				require.ErrorContains(t, err, `--proxy-via cannot use traffic-agents in the connected namespace "default"`)
+				require.ErrorContains(t, err, `this session does not watch its traffic-agents`)
+				require.ErrorContains(t, err, `--mapped-namespaces including "default"`)
+				if tt.external {
+					require.NotContains(t, err.Error(), "kubectl")
+				} else {
+					require.ErrorContains(t, err, `kubectl auth can-i create pods/portforward --namespace default`)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("unwatched named proxy did not reject before its five-second agent arrival deadline")
+			}
+			select {
+			case request := <-mgr.started:
+				t.Fatalf("unwatched named proxy injected after rejecting: %#v", request)
+			default:
+			}
+			select {
+			case scope := <-mgr.watchScopes:
+				t.Fatalf("unwatched named proxy started an unusable direct manager watch: %v", scope)
+			default:
+			}
+		})
+	}
+}
+
+func TestEmbeddedNamedProxyWatchedConnectedNamespaceReachesManagerAndNativeWatch(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		external, legacy bool
+	}{
+		{name: "direct"},
+		{name: "external", external: true},
+		{name: "direct legacy", legacy: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rd, mgr, stopSession := newEmbeddedProxyFixtureForAgentNamespaces(t, []string{"other", "default"}, tt.external, tt.legacy, "proxy")
+			g := log.NewGroup(rd)
+			defer func() {
+				stopSession()
+				require.NoError(t, g.Wait())
+			}()
+			close(mgr.gates["proxy"])
+			require.NoError(t, rd.StartWithContext(t.Context(), g, 0))
+			request := embeddedProxyReceive(t, mgr.started)
+			require.Equal(t, "proxy", request.name)
+			require.Empty(t, request.namespace, "EnsureAgent uses the connected namespace from this real session")
+			require.ElementsMatch(t, []string{"default", "other"}, embeddedProxyReceive(t, mgr.watchScopes))
+			if tt.legacy {
+				require.Equal(t, []string{"default"}, embeddedProxyReceive(t, mgr.watchScopes), "native older manager fallback retains the connected namespace")
+			}
+		})
+	}
+}
+
+func TestEmbeddedOrdinaryAndLocalProxyDoNotRequireConnectedAgentWatch(t *testing.T) {
+	for _, tt := range []struct {
+		name, workload string
+		external       bool
+	}{
+		{name: "direct ordinary"},
+		{name: "direct local", workload: "local"},
+		{name: "external ordinary", external: true},
+		{name: "external local", workload: "local", external: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rd, mgr, stopSession := newEmbeddedProxyFixtureForAgentNamespaces(t, []string{"other"}, tt.external, false, tt.workload)
+			g := log.NewGroup(rd)
+			defer func() {
+				stopSession()
+				require.NoError(t, g.Wait())
+			}()
+			require.NoError(t, rd.StartWithContext(t.Context(), g, 0))
+			select {
+			case request := <-mgr.started:
+				t.Fatalf("ordinary or local proxy requested a manager agent: %#v", request)
+			case scope := <-mgr.watchScopes:
+				t.Fatalf("ordinary or local proxy started a direct manager watch: %v", scope)
+			case <-time.After(30 * time.Millisecond):
+			}
+		})
+	}
 }
 
 func embeddedProxyReceive[T any](t *testing.T, ch <-chan T) T {
