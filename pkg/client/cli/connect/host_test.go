@@ -521,7 +521,7 @@ func TestHostStaleRequiresHardRefusalAndUnchangedHeartbeat(t *testing.T) {
 				require.Error(t, initial)
 			}
 			stale, staleErr := hostDefinitelyStale(ctx, host, initial, 80*time.Millisecond)
-			require.Equal(t, tc.wantStale, stale)
+			require.Equal(t, tc.wantStale, stale, "initial probe: %T %v; stale check: %T %v", initial, initial, staleErr, staleErr)
 			if tc.wantStale {
 				require.NoError(t, staleErr)
 			} else {

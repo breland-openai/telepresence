@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"net"
 	"regexp"
-	"syscall" //nolint:depguard // ECONNREFUSED is used on all supported platforms.
 	"time"
 
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -123,7 +122,7 @@ func hostUncertain(host *daemon.HostInfo, err error) error {
 }
 
 func probeHostPort(ctx context.Context, port uint16) error {
-	d := net.Dialer{Timeout: 500 * time.Millisecond}
+	d := net.Dialer{Timeout: hostPortProbeTimeout}
 	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err == nil {
 		_ = conn.Close()
@@ -132,7 +131,7 @@ func probeHostPort(ctx context.Context, port uint16) error {
 }
 
 func hostDefinitelyStale(ctx context.Context, host *daemon.HostInfo, initialErr error, grace time.Duration) (bool, error) {
-	if !errors.Is(initialErr, syscall.ECONNREFUSED) || time.Since(host.Stat.ModTime()) <= grace {
+	if !hostPortConnectionRefused(initialErr) || time.Since(host.Stat.ModTime()) <= grace {
 		return false, initialErr
 	}
 	ticker := time.NewTicker(min(200*time.Millisecond, grace))
@@ -155,7 +154,7 @@ func hostDefinitelyStale(ctx context.Context, host *daemon.HostInfo, initialErr 
 		if !host.SameOwner(current) || !host.Stat.ModTime().Equal(current.Stat.ModTime()) {
 			return false, errors.New("host daemon ownership or heartbeat changed")
 		}
-		if err = probeHostPort(ctx, host.Info.DaemonPort); !errors.Is(err, syscall.ECONNREFUSED) {
+		if err = probeHostPort(ctx, host.Info.DaemonPort); !hostPortConnectionRefused(err) {
 			return false, err
 		}
 		if final {
