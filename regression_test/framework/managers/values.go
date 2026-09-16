@@ -549,6 +549,9 @@ func mergeClient(base, over Client) Client {
 	if over.DNS.IncludeSuffixes != nil {
 		base.DNS.IncludeSuffixes = over.DNS.IncludeSuffixes
 	}
+	if over.DNS.PreserveLocalClusterDNSNames != nil {
+		base.DNS.PreserveLocalClusterDNSNames = over.DNS.PreserveLocalClusterDNSNames
+	}
 	return base
 }
 

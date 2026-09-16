@@ -65,6 +65,11 @@ func concurrentList(
 	return <-hostCh, <-dockerCh
 }
 
+func (s *Coexist) resetConnections() {
+	t := s.T()
+	rt.Mutate(t, rt.ConnectionFixture(s.AppNamespace())).Disconnect(t)
+}
+
 // Test_HostThenDocker establishes the named host connection first, then the
 // named docker connection second. Both list their namespace concurrently,
 // each --use-scoped to its own name so the call stays unambiguous with two
@@ -75,6 +80,7 @@ func (s *Coexist) Test_HostThenDocker() {
 	ctx := s.Ctx()
 	ns := s.AppNamespace()
 	wl := s.Workload(workloads.Echo("coexist-echo"))
+	s.resetConnections()
 
 	host := rt.Mutate(t, rt.ConnectionFixture(ns, rt.ConnNamed(coexistHostName)))
 	defer host.Disconnect(t)
@@ -102,6 +108,7 @@ func (s *Coexist) Test_DockerThenHost() {
 	ctx := s.Ctx()
 	ns := s.AppNamespace()
 	wl := s.Workload(workloads.Echo("coexist-echo"))
+	s.resetConnections()
 
 	docker := rt.Mutate(t, rt.ConnectionFixture(ns, rt.ConnNamed(coexistDockerName), rt.ConnDocker()))
 
