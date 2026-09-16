@@ -721,13 +721,18 @@ func (s *session) simpleLookup(ctx context.Context, question *dns2.Question) (dn
 	if ags := s.agentClients; ags != nil {
 		lookupClient = ags.GetRandomAgent(ctx)
 	}
-	if lookupClient == nil {
+	usingAgent := lookupClient != nil
+	if usingAgent {
+		clog.Debugf(ctx, "Using traffic-agent for lookup %q", question.Name)
+	} else {
 		clog.Debugf(ctx, "Using traffic-manager for lookup %q", question.Name)
 		lookupClient = s.managerClient()
-	} else {
-		clog.Debugf(ctx, "Using traffic-agent for lookup %q", question.Name)
 	}
 	resp, err := lookupClient.Lookup(ctx, request)
+	if usingAgent && status.Code(err) == codes.Unavailable && ctx.Err() == nil {
+		clog.Debugf(ctx, "Traffic-agent unavailable for lookup %q; using traffic-manager: %v", question.Name, err)
+		resp, err = s.managerClient().Lookup(ctx, request)
+	}
 	if status.Code(err) == codes.Unimplemented {
 		return s.complexClusterLookup(ctx, question)
 	}
@@ -1002,6 +1007,7 @@ func (s *session) networkReady(ctx context.Context) <-chan error {
 			} else {
 				select {
 				case <-ctx.Done():
+					rdy <- ctx.Err()
 				case <-s.dnsServer.Ready():
 				}
 			}
@@ -1272,7 +1278,7 @@ func (s *session) reconcileSubnets(mgrInfo *manager.ClusterInfo, subnets []netip
 				})
 			}
 		}
-		if aErr := s.activateProxyViaWorkloads(); aErr != nil {
+		if aErr := s.activateProxyViaWorkloads(s); aErr != nil {
 			clog.Errorf(s, "activateProxyViaWorkloads: %v", aErr)
 			return err
 		}
@@ -1587,11 +1593,16 @@ func (s *session) runWithStart(initErrs chan<- error, cancel context.CancelCause
 }
 
 func (s *session) Start(g log.Group, teleroutePort uint16) error {
+	return s.start(s, g, teleroutePort)
+}
+
+func (s *session) start(startupCtx context.Context, g log.Group, teleroutePort uint16) error {
+	if err := startupCtx.Err(); err != nil {
+		return err
+	}
 	clusterCfg := client.GetConfig(s).Cluster()
 	if clusterCfg.AgentPortForward {
-		// Relay mode: the user daemon has already computed the namespace set (the
-		// same one it requests from the traffic-manager) and pushes deltas via
-		// WatchAgentPods instead of this daemon watching the traffic-manager itself.
+		// The user daemon supplies the namespace set it requests from the manager.
 		relayMode := len(s.agentPodNamespaces) > 0
 		var agentNamespaces []string
 		switch {
@@ -1603,8 +1614,20 @@ func (s *session) Start(g log.Group, teleroutePort uint16) error {
 			// transport, and CanPortForward would be a Kubernetes API call.
 		default:
 			agentNamespaces = slices.DeleteFunc(s.GetCurrentNamespaces(true), func(ns string) bool {
-				return !k8s.CanPortForward(s, ns)
+				return !k8s.CanPortForward(startupCtx, ns)
 			})
+		}
+		if s.hasNamedProxyViaWorkloads() && !slices.Contains(agentNamespaces, s.Namespace) {
+			if clusterCfg.UsesExternalManager() {
+				return errcat.User.Newf(
+					"--proxy-via cannot use traffic-agents in the connected namespace %q: this session does not watch its traffic-agents. "+
+						"Reconnect with --mapped-namespaces including %q.", s.Namespace, s.Namespace)
+			}
+			return errcat.User.Newf(
+				"--proxy-via cannot use traffic-agents in the connected namespace %q: this session does not watch its traffic-agents. "+
+					"Verify your Kubernetes permission with `kubectl auth can-i create pods/portforward --namespace %s` "+
+					"using the same kubeconfig context, then reconnect with --mapped-namespaces including %q.",
+				s.Namespace, s.Namespace, s.Namespace)
 		}
 		if len(agentNamespaces) > 0 {
 			s.agentClients = agentpf.NewClients(s.Cluster, s.session, agentNamespaces, s.sessionCredentialToken)
@@ -1626,7 +1649,8 @@ func (s *session) Start(g log.Group, teleroutePort uint16) error {
 				}
 				return ""
 			})
-			if relayMode {
+			// Named proxy startup waits for agents before the user daemon starts its relay.
+			if relayMode && !s.hasNamedProxyViaWorkloads() {
 				g.Go("agentPods", func(ctx context.Context) error {
 					return s.agentClients.RunDeltaSink(s.managerClient())
 				})
@@ -1639,7 +1663,10 @@ func (s *session) Start(g log.Group, teleroutePort uint16) error {
 			clog.Infof(s, "Agent port-forwards are disabled. Client is not permitted to do port-forward to any mapped namespace")
 		}
 	}
-	if err := s.activateProxyViaWorkloads(); err != nil {
+	if err := startupCtx.Err(); err != nil {
+		return err
+	}
+	if err := s.activateProxyViaWorkloads(startupCtx); err != nil {
 		return err
 	}
 	if s.podDaemon {
@@ -1682,7 +1709,7 @@ func (s *session) Start(g log.Group, teleroutePort uint16) error {
 	// the first ClusterInfo is received from the traffic-manager. A timeout
 	// is needed so that we don't wait forever on a traffic-manager that has
 	// been terminated for some reason.
-	wc, cancel := client.GetConfig(s).Timeouts().TimeoutContext(s, client.TimeoutTrafficManagerConnect)
+	wc, cancel := client.GetConfig(s).Timeouts().TimeoutContext(startupCtx, client.TimeoutTrafficManagerConnect)
 	defer cancel()
 	select {
 	case <-wc.Done():
@@ -1716,7 +1743,7 @@ func (s *session) Start(g log.Group, teleroutePort uint16) error {
 
 	if s.tunVif != nil {
 		g.Go("vif", s.tunVif.Run)
-		err := s.waitForProxyViaWorkloads()
+		err := s.waitForProxyViaWorkloads(startupCtx)
 		if err != nil {
 			return err
 		}
@@ -1770,7 +1797,7 @@ func (s *session) stop() {
 	}
 }
 
-func (s *session) activateProxyViaWorkloads() error {
+func (s *session) activateProxyViaWorkloads(ctx context.Context) error {
 	sl := len(s.subnetViaWorkloads)
 	if sl == 0 {
 		return nil
@@ -1805,7 +1832,7 @@ func (s *session) activateProxyViaWorkloads() error {
 		clog.Debugf(s, "Ensuring proxy-via agent in %s", wlName)
 		// wlName has no associated kind here; an ambiguous name is rejected
 		// by the manager rather than resolved on this path.
-		_, err := s.managerClient().EnsureAgent(s, &manager.EnsureAgentRequest{
+		_, err := s.managerClient().EnsureAgent(ctx, &manager.EnsureAgentRequest{
 			Session: s.session,
 			Name:    wlName,
 		})
@@ -1825,6 +1852,9 @@ func (s *session) consolidateProxyViaWorkloads() []string {
 	desiredVips := make(map[string][]netip.Prefix)
 	snCount := 0
 	for _, pvx := range s.subnetViaWorkloads {
+		if pvx == nil {
+			continue
+		}
 		switch pvx.Subnet {
 		case "also":
 			desiredVips[pvx.Workload] = append(desiredVips[pvx.Workload], s.alsoProxySubnets...)
@@ -1851,7 +1881,7 @@ func (s *session) consolidateProxyViaWorkloads() []string {
 	for wlName, sns := range desiredVips {
 		if wlName == "local" {
 			wlName = ""
-		} else {
+		} else if wlName != "" {
 			wlNames = append(wlNames, wlName)
 		}
 		for _, sn := range sns {
@@ -1863,37 +1893,50 @@ func (s *session) consolidateProxyViaWorkloads() []string {
 	return wlNames
 }
 
-func (s *session) waitForProxyViaWorkloads() error {
+func (s *session) hasNamedProxyViaWorkloads() bool {
+	return slices.ContainsFunc(s.subnetViaWorkloads, func(via *rpc.SubnetViaWorkload) bool {
+		name := via.GetWorkload()
+		return name != "" && name != "local"
+	})
+}
+
+func (s *session) waitForProxyViaWorkloads(ctx context.Context) error {
 	wc := len(s.subnetViaWorkloads)
 	if wc == 0 {
 		return nil
 	}
 	to := client.GetConfig(s).Timeouts().Get(client.TimeoutIntercept)
-	waitCh := make(chan error)
 
 	// Need unique workload names
 	ws := make([]string, 0, len(s.subnetViaWorkloads))
 	for _, svw := range s.subnetViaWorkloads {
-		if svw.Workload != "local" {
-			ws = slice.AppendUnique(ws, svw.Workload)
+		if name := svw.GetWorkload(); name != "" && name != "local" {
+			ws = slice.AppendUnique(ws, name)
 		}
 	}
+	type result struct {
+		workload string
+		err      error
+	}
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	waitCh := make(chan result, len(ws))
 	for _, wl := range ws {
 		s.agentClients.SetProxyVia(wl)
 		clog.Debugf(s, "Waiting for proxy-via agent in %s", wl)
 		go func(wl string) {
-			waitCh <- s.agentClients.WaitForWorkload(to, wl)
+			waitCh <- result{wl, s.agentClients.WaitForWorkload(waitCtx, to, wl)}
 		}(wl)
 	}
-	for _, wl := range ws {
+	for range ws {
 		select {
-		case <-s.Done():
-			return nil
-		case err := <-waitCh:
-			if err != nil {
-				return fmt.Errorf("proxy-via agent in %s failed: %w", wl, err)
+		case <-ctx.Done():
+			return ctx.Err()
+		case r := <-waitCh:
+			if r.err != nil {
+				return fmt.Errorf("proxy-via agent in %s failed: %w", r.workload, r.err)
 			}
-			clog.Debugf(s, "Wait succeeded for proxy-via agent in %s", wl)
+			clog.Debugf(s, "Wait succeeded for proxy-via agent in %s", r.workload)
 		}
 	}
 	return nil
@@ -1978,6 +2021,10 @@ func (s *session) waitForAgentIP(ctx context.Context, request *rpc.WaitForAgentI
 func (s *session) applyAgentPodsDelta(delta *rpc.AgentPodsDelta) error {
 	if s.agentClients == nil {
 		return status.Error(codes.FailedPrecondition, "no agent-pod client set for this session")
+	}
+	if s.hasNamedProxyViaWorkloads() {
+		// A named-proxy session uses its direct manager watch as its only source.
+		return nil
 	}
 	return s.agentClients.ApplyPodsDelta(delta.Reset_, delta.Upserts, delta.Removals)
 }

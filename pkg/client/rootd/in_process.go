@@ -2,6 +2,7 @@ package rootd
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/blang/semver/v4"
@@ -15,6 +16,8 @@ import (
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
+	"github.com/telepresenceio/telepresence/v2/pkg/grpc/server"
+	"github.com/telepresenceio/telepresence/v2/pkg/log"
 	"github.com/telepresenceio/telepresence/v2/pkg/types"
 )
 
@@ -22,6 +25,11 @@ import (
 // in-process from the user daemon without starting the root daemon gRPC service.
 type InProcSession struct {
 	*session
+}
+
+// StartWithContext bounds startup without tying the running root session to the caller.
+func (rd *InProcSession) StartWithContext(ctx context.Context, g log.Group, teleroutePort uint16) error {
+	return rd.start(server.NewCombinedContext(rd, ctx), g, teleroutePort)
 }
 
 func (rd *InProcSession) Version(ctx context.Context, _ *empty.Empty, _ ...grpc.CallOption) (*common.VersionInfo, error) {
@@ -84,6 +92,9 @@ func (rd *InProcSession) TranslateEnvIPs(_ context.Context, in *rpc.Environment,
 
 func (rd *InProcSession) WaitForNetwork(ctx context.Context, _ *empty.Empty, _ ...grpc.CallOption) (*empty.Empty, error) {
 	if err, ok := <-rd.networkReady(ctx); ok {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return &empty.Empty{}, status.FromContextError(err).Err()
+		}
 		return &empty.Empty{}, status.Error(codes.Unavailable, err.Error())
 	}
 	return &empty.Empty{}, nil

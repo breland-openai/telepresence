@@ -76,6 +76,7 @@ type service struct {
 
 	// The TCP address that the daemon listens to. Will be nil if the daemon listens to a unix socket.
 	daemonAddress netip.AddrPort
+	hostID        string
 
 	// Port where root daemon (or rather the embedded root daemon) starts the teleroute service.
 	teleroutePort uint16
@@ -164,6 +165,7 @@ func (s *service) Server() *grpc.Server {
 const (
 	nameFlag          = "name"
 	addressFlag       = "address"
+	hostIDFlag        = "host-id"
 	embedNetworkFlag  = "embed-network"
 	pprofFlag         = "pprof"
 	teleroutePortFlag = "teleroute-port"
@@ -185,6 +187,8 @@ func Command(ctx context.Context) *cobra.Command {
 	flags.String(logfileFlag, filepath.Join(filelocation.AppUserLogDir(ctx), "connector.log"),
 		`Log file to write to { <path to a file> | "stdout" | "stderr" | "-" (same as "stderr") }`)
 	flags.String(addressFlag, "", "TCP Address to listen to")
+	flags.String(hostIDFlag, "", "Host daemon cache ownership identifier")
+	_ = flags.MarkHidden(hostIDFlag)
 	flags.Bool(embedNetworkFlag, false, "Embed network functionality in the user daemon. Requires capability NET_ADMIN")
 	flags.Uint16(pprofFlag, 0, "start pprof server on the given port")
 	flags.Uint16(teleroutePortFlag, 0, "start teleroute server on the given port")
@@ -206,11 +210,17 @@ func (s *service) configReload(c context.Context) error {
 	})
 }
 
-func runAliveAndCancellationSession(ctx context.Context, cancel context.CancelFunc, daemonID *daemon.Identifier, wg *sync.WaitGroup) {
+func runAliveAndCancellationSession(ctx context.Context, cancel context.CancelFunc, daemonID *daemon.Identifier, address netip.AddrPort, hostID string, wg *sync.WaitGroup) {
 	wg.Add(1)
 	defer wg.Done()
 	g := log.NewGroup(ctx)
-	runAliveAndCancellation(g, cancel, daemonID.InfoFileName(), "-"+daemonID.String())
+	if hostID == "" {
+		runAliveAndCancellation(g, cancel, daemonID.InfoFileName(), "-"+daemonID.String())
+	} else {
+		g.Go("info-kicker-"+daemonID.String(), func(ctx context.Context) error {
+			return daemon.KeepHostInfoAlive(ctx, address.Port(), hostID, cancel)
+		})
+	}
 	if err := g.Wait(); err != nil {
 		clog.Error(ctx, err)
 	}
@@ -330,6 +340,7 @@ func internalRun(c context.Context, flags *pflag.FlagSet) error {
 
 	s.rootSessionInProc = rootSessionInProc
 	s.daemonAddress = daemonAddress
+	s.hostID, _ = flags.GetString(hostIDFlag)
 	if tp, err := flags.GetUint16(teleroutePortFlag); err == nil && tp > 0 {
 		clog.Debugf(c, "Using teleroute %d", tp)
 		s.teleroutePort = tp
@@ -342,7 +353,9 @@ func internalRun(c context.Context, flags *pflag.FlagSet) error {
 	g.Go("config-reload", s.configReload)
 	if !rootSessionInProc {
 		// User daemon process survives multiple sessions.
-		runAliveAndCancellation(g, svcCancel, daemon.InfoFileName, "")
+		g.Go("info-kicker", func(ctx context.Context) error {
+			return daemon.KeepHostInfoAlive(ctx, daemonAddress.Port(), s.hostID, svcCancel)
+		})
 	}
 
 	// Start the anonymous usage sender. The user daemon is the long-lived

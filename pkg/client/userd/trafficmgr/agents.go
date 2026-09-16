@@ -2,7 +2,9 @@ package trafficmgr
 
 import (
 	"context"
-	"slices"
+	"fmt"
+	"net/netip"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -22,6 +24,8 @@ type agentPod struct {
 	workload  string
 	namespace string
 	podName   string
+	podUID    string
+	podIP     netip.Addr
 	version   string
 	nodeAgent bool
 }
@@ -29,10 +33,13 @@ type agentPod struct {
 // agentPodFromPodInfo builds an agentPod from the manager's AgentPodInfo
 // projection (combined mode).
 func agentPodFromPodInfo(ap *manager.AgentPodInfo) agentPod {
+	ip, _ := netip.AddrFromSlice(ap.PodIp)
 	return agentPod{
 		workload:  ap.WorkloadName,
 		namespace: ap.Namespace,
 		podName:   ap.PodName,
+		podUID:    ap.PodId,
+		podIP:     ip.Unmap(),
 		version:   ap.Version,
 		nodeAgent: ap.NodeAgent,
 	}
@@ -41,13 +48,64 @@ func agentPodFromPodInfo(ap *manager.AgentPodInfo) agentPod {
 // agentPodFromAgentInfo builds an agentPod from the manager's AgentInfo
 // (legacy fallback mode).
 func agentPodFromAgentInfo(ai *manager.AgentInfo) agentPod {
+	ip, _ := netip.ParseAddr(ai.PodIp)
 	return agentPod{
 		workload:  ai.Name,
 		namespace: ai.Namespace,
 		podName:   ai.PodName,
+		podUID:    ai.PodUid,
+		podIP:     ip.Unmap(),
 		version:   ai.Version,
 		nodeAgent: ai.NodeAgent,
 	}
+}
+
+type ingestPodIdentity struct {
+	namespace string
+	name      string
+	uid       string
+	ip        netip.Addr
+}
+
+func (ap agentPod) identity() ingestPodIdentity {
+	return ingestPodIdentity{namespace: ap.namespace, name: ap.podName, uid: ap.podUID, ip: ap.podIP}
+}
+
+func agentInfoPodIdentity(ai *manager.AgentInfo) ingestPodIdentity {
+	ip, _ := netip.ParseAddr(ai.GetPodIp())
+	return ingestPodIdentity{namespace: ai.GetNamespace(), name: ai.GetPodName(), uid: ai.GetPodUid(), ip: ip.Unmap()}
+}
+
+const (
+	ingestPodConflict = iota - 1
+	ingestPodUnknown
+	ingestPodName
+	ingestPodIP
+	ingestPodUID
+)
+
+func (p ingestPodIdentity) sameNamespace(other ingestPodIdentity) bool {
+	return p.namespace == "" || other.namespace == "" || p.namespace == other.namespace
+}
+
+// match ranks comparable identities; a conflict belongs to the same pod name.
+func (p ingestPodIdentity) match(other ingestPodIdentity) int {
+	if !p.sameNamespace(other) || p.name == "" || p.name != other.name {
+		return ingestPodUnknown
+	}
+	if p.uid != "" && other.uid != "" {
+		if p.uid == other.uid {
+			return ingestPodUID
+		}
+		return ingestPodConflict
+	}
+	if p.ip.IsValid() && other.ip.IsValid() {
+		if p.ip == other.ip {
+			return ingestPodIP
+		}
+		return ingestPodConflict
+	}
+	return ingestPodName
 }
 
 // watchAgentsLoop drives the legacy WatchAgentsDelta/WatchAgents watcher, used
@@ -70,7 +128,9 @@ func (s *session) watchAgentsLoop(ctx context.Context) error {
 		},
 		func(delta *manager.AgentInfoDelta) error {
 			maps.DeltaUpdate(snapMap, delta.Upserts, delta.Removals)
-			s.handleAgentPodSnapshot(ctx, toPods(), covered)
+			pods := toPods()
+			s.setCurrentAgentPods(pods)
+			s.handleAgentPodSnapshot(ctx, pods, covered)
 			return nil
 		}, func() error {
 			clear(snapMap)
@@ -88,17 +148,19 @@ func (s *session) watchAgentsLoop(ctx context.Context) error {
 				for i, ai := range snapshot.Agents {
 					pods[i] = agentPodFromAgentInfo(ai)
 				}
+				s.setCurrentAgentPods(pods)
 				s.handleAgentPodSnapshot(ctx, pods, covered)
 				return nil
 			}, nil)
 	}
 	// Handle as if we had an empty snapshot. This will ensure that port forwards and volume mounts are canceled correctly.
+	s.setCurrentAgentPods(nil)
 	s.handleAgentPodSnapshot(ctx, nil, covered)
 	return err
 }
 
 // ingestPodDecision is the outcome of matching one ingest's key and current
-// pod name against a fresh agent-pod snapshot.
+// physical pod against a fresh agent-pod snapshot.
 type ingestPodDecision int
 
 const (
@@ -110,56 +172,154 @@ const (
 	// matching pods; its mounts/port-forwards stay alive.
 	ingestPodKeepAlive
 	// ingestPodReplaced: matching pods exist, but not under the ingest's
-	// current pod name; its agent must be refetched.
+	// current physical pod; its agent must be refetched.
 	ingestPodReplaced
 )
 
 // decideIngestPod matches key (workload+namespace; container matching is not
 // needed since membership was already validated when the ingest was
-// created) and the ingest's current pod name against pods, a fresh
+// created) and the ingest's current physical pod against pods, a fresh
 // agent-pod snapshot. matching is the set of pods sharing key's workload and
 // namespace -- non-empty exactly when the decision isn't ingestPodNoMatch.
-func decideIngestPod(pods []agentPod, key ingestKey, currentPodName string) (decision ingestPodDecision, matching []agentPod) {
+func decideIngestPod(pods []agentPod, key ingestKey, current ingestPodIdentity) (decision ingestPodDecision, matching []agentPod) {
+	weakMatch, conflict := false, false
 	for _, ap := range pods {
 		if ap.workload == key.workload && ap.namespace == key.namespace {
 			matching = append(matching, ap)
+			switch ap.identity().match(current) {
+			case ingestPodUID, ingestPodIP:
+				decision = ingestPodKeepAlive
+			case ingestPodName:
+				weakMatch = true
+			case ingestPodConflict:
+				conflict = true
+			}
 		}
 	}
 	if len(matching) == 0 {
 		return ingestPodNoMatch, nil
 	}
-	if slices.ContainsFunc(matching, func(ap agentPod) bool { return ap.podName == currentPodName }) {
+	if decision == ingestPodKeepAlive || weakMatch && !conflict {
 		return ingestPodKeepAlive, matching
 	}
 	return ingestPodReplaced, matching
 }
 
 // selectReplacementAgent picks the AgentInfo to adopt for a replaced ingest
-// pod: the first candidate whose PodName is among matching, or (when none
-// matches, which should not normally happen) the first candidate. Returns
-// nil when candidates is empty.
+// pod. An unlisted candidate is usable only when the watch supplies no
+// physical identifiers; a known conflicting generation is never adopted.
 func selectReplacementAgent(candidates []*manager.AgentInfo, matching []agentPod) *manager.AgentInfo {
-	for _, cand := range candidates {
-		if slices.ContainsFunc(matching, func(ap agentPod) bool { return ap.podName == cand.PodName }) {
-			return cand
+	var best, unlisted *manager.AgentInfo
+	bestMatch := ingestPodUnknown
+	snapshotHasPhysicalIdentity := false
+	for _, ap := range matching {
+		if ap.podUID != "" || ap.podIP.IsValid() {
+			snapshotHasPhysicalIdentity = true
+			break
 		}
 	}
-	if len(candidates) > 0 {
-		return candidates[0]
+	for _, cand := range candidates {
+		candidate := agentInfoPodIdentity(cand)
+		listed, sameNamespace := false, false
+		for _, ap := range matching {
+			pod := ap.identity()
+			if !pod.sameNamespace(candidate) {
+				continue
+			}
+			sameNamespace = true
+			match := pod.match(candidate)
+			if match != ingestPodUnknown {
+				listed = true
+			}
+			if match > bestMatch {
+				best, bestMatch = cand, match
+			}
+		}
+		if unlisted == nil && !listed && sameNamespace && candidate.name != "" {
+			unlisted = cand
+		}
 	}
-	return nil
+	if best != nil {
+		return best
+	}
+	if snapshotHasPhysicalIdentity {
+		return nil
+	}
+	return unlisted
 }
 
-// handleAgentPodSnapshot updates the internal agent-pod cache and drives the
-// ingest keep-alive/replacement lifecycle from a fresh agent-pod snapshot,
-// then cancels port-forwards and mounts left over from pods that are no
-// longer present, scoped to the namespaces this snapshot actually covers.
+func (s *session) watchedIngestPods(key ingestKey) []agentPod {
+	_, pods := decideIngestPod(s.getCurrentAgentPods(), key, ingestPodIdentity{})
+	return pods
+}
+
+func (s *session) refetchIngestAgent(ctx context.Context, ig *ingest, nodeAgent bool) (*manager.AgentInfo, error) {
+	ctx, cancel := client.GetConfig(ctx).Timeouts().TimeoutContext(ctx, client.TimeoutTrafficManagerAPI)
+	stop := context.AfterFunc(ig.ctx, cancel)
+	defer func() { stop(); cancel() }()
+	rq := &manager.EnsureAgentRequest{
+		Session: s.sessionInfo, Name: ig.workload, Namespace: ig.namespace, NodeAgent: nodeAgent,
+	}
+	backoff := 100 * time.Millisecond
+	for {
+		if len(s.watchedIngestPods(ig.ingestKey)) == 0 {
+			return nil, nil
+		}
+		as, err := s.ManagerClient().EnsureAgent(ctx, rq)
+		if err != nil {
+			return nil, err
+		}
+		pods := s.watchedIngestPods(ig.ingestKey)
+		if len(pods) == 0 {
+			return nil, nil
+		}
+		if ai := selectReplacementAgent(as.Agents, pods); ai != nil {
+			if _, ok := ai.Containers[ig.container]; !ok {
+				return nil, fmt.Errorf("workload %s has no container named %s after replacement", ig.workload, ig.container)
+			}
+			if err = s.translateContainerEnv(ctx, ai, ig.container); err != nil {
+				return nil, fmt.Errorf("failed to translate container env: %w", err)
+			}
+			pods = s.watchedIngestPods(ig.ingestKey)
+			if len(pods) == 0 {
+				return nil, nil
+			}
+			if selectReplacementAgent([]*manager.AgentInfo{ai}, pods) == ai {
+				return ai, nil
+			}
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		backoff = min(2*backoff, time.Second)
+	}
+}
+
+func (s *session) keepIngestPodAccess(key ingestKey) {
+	tracker := s.ingestTracker
+	tracker.Lock()
+	defer tracker.Unlock()
+	for podKey, pod := range tracker.alivePods {
+		if pod.workload == key.workload && podKey.namespace == key.namespace && podKey.container == key.container {
+			tracker.snapshot[podKey] = struct{}{}
+		}
+	}
+}
+
+// handleAgentPodSnapshot reconciles ingest pod access within covered namespaces.
 func (s *session) handleAgentPodSnapshot(ctx context.Context, pods []agentPod, covered func(namespace string) bool) {
 	s.ingestTracker.initSnapshot()
-	s.setCurrentAgentPods(pods)
 
 	s.currentIngests.Range(func(key ingestKey, ig *ingest) bool {
-		decision, matching := decideIngestPod(pods, key, ig.PodName)
+		if ig.ctx.Err() != nil {
+			return true
+		}
+		currentAgent := ig.getAgentInfo()
+		decision, _ := decideIngestPod(pods, key, agentInfoPodIdentity(currentAgent))
 		switch decision {
 		case ingestPodNoMatch:
 			// Not covered by this snapshot; cancelUnwanted below decides its fate.
@@ -169,34 +329,18 @@ func (s *session) handleAgentPodSnapshot(ctx context.Context, pods []agentPod, c
 			return true
 		}
 
-		// ingestPodReplaced: the pod backing this ingest is gone; refetch its
-		// AgentInfo so replacement failover works for cross-namespace ingests too.
-		timeoutCtx, cancel := client.GetConfig(s).Timeouts().TimeoutContext(s, client.TimeoutTrafficManagerAPI)
-		as, err := s.ManagerClient().EnsureAgent(timeoutCtx, &manager.EnsureAgentRequest{
-			Session:   s.sessionInfo,
-			Name:      key.workload,
-			Namespace: key.namespace,
-			NodeAgent: ig.NodeAgent,
-		})
-		cancel()
+		ai, err := s.refetchIngestAgent(ctx, ig, currentAgent.GetNodeAgent())
 		if err != nil {
 			clog.Errorf(ctx, "failed to refetch agent for ingest %s: %v", key, err)
+			if ig.ctx.Err() == nil {
+				s.keepIngestPodAccess(key)
+			}
 			return true
 		}
-		ai := selectReplacementAgent(as.Agents, matching)
-		if ai == nil {
-			clog.Errorf(ctx, "EnsureAgent returned no agents for ingest %s", key)
+		if ai == nil || ig.ctx.Err() != nil {
 			return true
 		}
-		if _, ok := ai.Containers[ig.container]; !ok {
-			clog.Errorf(ctx, "workload %s has no container named %s after replacement", key.workload, ig.container)
-			return true
-		}
-		if err := s.translateContainerEnv(ctx, ai, ig.container); err != nil {
-			clog.Errorf(ctx, "failed to translate container env: %v", err)
-			return true
-		}
-		ig.AgentInfo = ai
+		ig.setAgentInfo(ai)
 		s.startIngestPodAccess(ctx, ig, false)
 		return true
 	})

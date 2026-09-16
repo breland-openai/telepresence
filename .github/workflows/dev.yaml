@@ -43,6 +43,129 @@ concurrency:
 # re-run ("Re-run all jobs") is how a maintainer vouches for a pull
 # request from a fork.
 jobs:
+  # The fork uses a distinct native check so it cannot replace upstream's
+  # external DCO application verdict under the literal name "DCO".
+  fork_dco:
+    name: DCO (fork)
+    if: github.repository == 'breland-openai/telepresence'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Verify signoffs throughout the exact pull request
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # fork-dco-verifier-begin
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+
+          def git(*args, input=None):
+              return subprocess.run(
+                  ["git", "-c", "i18n.logOutputEncoding=UTF-8", *args],
+                  input=input, check=True, capture_output=True, text=True,
+                  encoding="utf-8", errors="strict",
+                  env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+              ).stdout
+
+
+          def valid_email(email):
+              if len(email) > 254 or email.count("@") != 1:
+                  return False
+              local, domain = email.split("@")
+              if len(local) > 64 or not re.fullmatch(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+", local):
+                  return False
+              if local.startswith(".") or local.endswith(".") or ".." in local:
+                  return False
+              labels = domain.split(".")
+              if len(labels) < 2 or not all(
+                  re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                  for label in labels
+              ):
+                  return False
+              return bool(re.fullmatch(r"(?:[A-Za-z]{2,63}|xn--[A-Za-z0-9-]{2,59})", labels[-1], re.IGNORECASE))
+
+
+          def matching_identity(name, email, trailers):
+              if not name.strip() or not valid_email(email):
+                  return False
+              expected = (name.strip().casefold(), email.casefold())
+              for line in trailers.splitlines():
+                  trailer = re.fullmatch(
+                      r"Signed-off-by:\s+([^<>\r\n]+)\s+<([^<>\s]+)>\s*", line, re.IGNORECASE,
+                  )
+                  if trailer and (trailer[1].strip().casefold(), trailer[2].casefold()) == expected:
+                      return True
+              return False
+
+
+          def main():
+              base, head = os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
+              if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (base, head)):
+                  raise ValueError("invalid event commit SHA")
+              if git("rev-parse", "--is-shallow-repository").strip() != "false":
+                  raise ValueError("a complete checkout is required")
+              if git("rev-parse", "HEAD").strip() != head:
+                  raise ValueError("the checkout is not the exact event pull request head")
+              for sha in (base, head):
+                  if git("rev-parse", "--verify", f"{sha}^{{commit}}").strip() != sha:
+                      raise ValueError("unable to resolve both exact event commits")
+              git("merge-base", base, head)
+              commits = git("rev-list", "--reverse", f"{base}..{head}").splitlines()
+              if not commits or head not in commits or len(commits) != len(set(commits)):
+                  raise ValueError("the full unique contribution range must include the exact head")
+              failed, checked, merges = [], 0, 0
+              for sha in commits:
+                  parents = git("show", "-s", "--format=%P", sha).split()
+                  if len(parents) > 1:
+                      merges += 1
+                      continue
+                  checked += 1
+                  name, email = git("show", "-s", "--format=%an%x00%ae", sha).rstrip("\n").split("\x00")
+                  message = git("show", "-s", "--format=%B", sha)
+                  trailers = git("-c", "trailer.separators=:", "interpret-trailers", "--parse", input=message)
+                  if not matching_identity(name, email, trailers):
+                      failed.append(sha)
+              if failed:
+                  for sha in failed:
+                      print(f"{sha}: missing a valid Git trailer signed off by its commit author", file=sys.stderr)
+                  return 1
+              print(f"DCO verified for {checked} contribution commits; enumerated {len(commits)} total including {merges} merge commits")
+              return 0
+
+
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main())
+              except (KeyError, ValueError, subprocess.CalledProcessError, UnicodeError) as error:
+                  print(f"Unable to verify the complete pull request: {error}", file=sys.stderr)
+                  sys.exit(1)
+          PY
+          # fork-dco-verifier-end
+
+  fork_dco_tests:
+    name: DCO verifier tests (fork)
+    if: github.repository == 'breland-openai/telepresence'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Test the embedded verifier against real Git histories
+        run: python3 .github/scripts/test_fork_dco.py
+
   # Gatekeeper for the expensive jobs: decides whether the shards run, and
   # waits for the other required checks so a DCO or unit-test failure is
   # never followed by a pointless integration run.
@@ -161,22 +284,35 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -eu
+          dco='DCO'
+          if [ "$GITHUB_REPOSITORY" = breland-openai/telepresence ]; then
+            dco='DCO (fork)'
+          fi
           required=(
-            'DCO'
+            "$dco"
             'Linux: Verify use of forbidden licenses'
             'unit (ubuntu-latest)'
             'unit (macos-latest)'
             'unit (windows-latest)'
           )
+          if [ "$GITHUB_REPOSITORY" = breland-openai/telepresence ]; then
+            required+=('DCO verifier tests (fork)')
+          fi
           deadline=$((SECONDS + 2100))
           while :; do
             runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?per_page=100" \
-              --jq '[.check_runs[] | {name, status, conclusion, started_at, created_at}] | group_by(.name) | map(max_by(.started_at // .created_at))')
+              --jq '[.check_runs[] | select((.name != "DCO (fork)" and .name != "DCO verifier tests (fork)") or .app.slug == "github-actions") | {name, status, conclusion, started_at, created_at}] | group_by(.name) | map(max_by(.started_at // .created_at))')
             pending=()
             for name in "${required[@]}"; do
               row=$(jq -r --arg n "$name" '.[] | select(.name == $n) | "\(.status)/\(.conclusion)"' <<<"$runs")
               case "$row" in
-                completed/success|completed/neutral|completed/skipped) ;;
+                completed/success) ;;
+                completed/neutral|completed/skipped)
+                  if [ "$name" = 'DCO (fork)' ] || [ "$name" = 'DCO verifier tests (fork)' ]; then
+                    echo "fork DCO prerequisite '$name' did not verify the commits: $row"
+                    exit 1
+                  fi
+                  ;;
                 completed/*)
                   echo "prerequisite check '$name' concluded: ${row#completed/}"
                   exit 1

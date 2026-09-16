@@ -5,9 +5,9 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/telepresenceio/clog"
@@ -17,149 +17,244 @@ import (
 // NewStreamConn returns a net.Conn that reads and writes messages from the given stream.
 // The read and write probes are optional.
 func NewStreamConn(ctx context.Context, s Stream, readProbe, writeProbe *CounterProbe) net.Conn {
+	ioCtx, cancelIO := context.WithCancel(ctx)
 	return &streamConn{
 		ctx:           ctx,
+		ioCtx:         ioCtx,
+		cancelIO:      cancelIO,
 		stream:        s,
 		readProbe:     readProbe,
 		writeProbe:    writeProbe,
-		readCancelCh:  make(chan struct{}),
-		writeCancelCh: make(chan struct{}),
+		closed:        make(chan struct{}),
+		incoming:      make(chan connIncoming),
+		outgoing:      make(chan connOutgoing),
+		readDeadline:  newConnDeadline(),
+		writeDeadline: newConnDeadline(),
 	}
 }
 
 type streamConn struct {
-	ctx           context.Context
-	stream        Stream
-	readCancelCh  chan struct{}
-	writeCancelCh chan struct{}
-	readProbe     *CounterProbe
-	writeProbe    *CounterProbe
+	ctx        context.Context
+	ioCtx      context.Context
+	cancelIO   context.CancelFunc
+	stream     Stream
+	readProbe  *CounterProbe
+	writeProbe *CounterProbe
+
+	stateLock     sync.Mutex
+	closed        chan struct{}
+	readDeadline  connDeadline
+	writeDeadline connDeadline
+
+	receiveOnce sync.Once
+	sendOnce    sync.Once
+	incoming    chan connIncoming
+	outgoing    chan connOutgoing
 
 	// The lastIncoming message and the offset into it are protected by readLock.
 	readLock     sync.Mutex
 	offset       int
 	lastIncoming Message
-
-	// Using atomic.LoadInt64/atomic.StoreInt64 to avoid locking
-	readDeadline  int64
-	writeDeadline int64
 }
 
-func (c *streamConn) readMore() (err error) {
-	c.offset = 0
-	ctx := c.ctx
-	if rdl := atomic.LoadInt64(&c.readDeadline); rdl != 0 {
-		dl := time.Unix(0, rdl)
-		if dl.Before(time.Now()) {
-			return context.DeadlineExceeded
+type connIncoming struct {
+	message Message
+	err     error
+}
+
+type connOutgoing struct {
+	ctx      context.Context
+	deadline <-chan struct{}
+	message  Message
+	result   chan error
+}
+
+func (c *streamConn) receive() {
+	defer close(c.incoming)
+	for {
+		if connSignalClosed(c.closed) || c.ioCtx.Err() != nil {
+			return
 		}
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, dl)
-		defer cancel()
+		m, err := c.stream.Receive(c.ioCtx)
+		if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
+			err = io.EOF
+		}
+		// Keep the result until a public Read takes it or the connection closes.
+		select {
+		case <-c.ioCtx.Done():
+			return
+		case c.incoming <- connIncoming{message: m, err: err}:
+		}
+		if err != nil {
+			return
+		}
 	}
-
-	// We must have a separate goroutine to do the read because cancelling the context is not respected by the grpc Recv function.
-	type msgAndErr struct {
-		msg Message
-		err error
-	}
-	msgCh := make(chan msgAndErr, 1)
-	go func() {
-		var me msgAndErr
-		me.msg, me.err = c.stream.Receive(ctx)
-		msgCh <- me
-	}()
-	select {
-	case <-ctx.Done():
-		err = ctx.Err()
-	case <-c.readCancelCh:
-		err = context.DeadlineExceeded
-	case me := <-msgCh:
-		c.lastIncoming = me.msg
-		err = me.err
-	}
-	if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
-		err = io.EOF
-	}
-	return err
 }
 
-func (c *streamConn) Read(data []byte) (bytesRead int, err error) {
-	bytesRead = 0
+func (c *streamConn) Read(data []byte) (n int, err error) {
 	c.readLock.Lock()
-	defer func() {
-		if c.readProbe != nil && bytesRead > 0 {
-			c.readProbe.Increment(uint64(bytesRead))
-		}
-		c.readLock.Unlock()
-	}()
+	defer c.readLock.Unlock()
 
-	if c.lastIncoming == nil {
-		err = c.readMore()
-		if err != nil {
-			return bytesRead, err
-		}
-	}
-	pl := c.lastIncoming.Payload()
-	if len(pl)-c.offset <= 0 {
-		err = c.readMore()
-		if err != nil {
-			return bytesRead, err
-		}
-		pl = c.lastIncoming.Payload()
-	}
-	bytesCopied := copy(data[bytesRead:], pl[c.offset:])
-	c.offset += bytesCopied
-	bytesRead += bytesCopied
-	if c.offset == len(pl) {
-		c.lastIncoming = nil
-	}
-	return bytesRead, err
-}
-
-func (c *streamConn) Write(b []byte) (n int, err error) {
-	ctx := c.ctx
-	if wdl := atomic.LoadInt64(&c.writeDeadline); wdl != 0 {
-		dl := time.Unix(0, wdl)
-		if dl.Before(time.Now()) {
-			return 0, context.DeadlineExceeded
-		}
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, dl)
-		defer cancel()
-	}
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- c.stream.Send(ctx, NewMessage(Normal, b))
-	}()
-	select {
-	case <-ctx.Done():
-		err = ctx.Err()
-	case <-c.writeCancelCh:
-		err = context.DeadlineExceeded
-	case err = <-errCh:
-	}
-	if err != nil {
+	deadline := c.readDeadline.wait()
+	if err = c.operationError(deadline); err != nil {
 		return 0, err
 	}
-	n = len(b)
-	if c.writeProbe != nil {
-		c.writeProbe.Increment(uint64(n))
+	if len(data) == 0 {
+		return 0, nil
 	}
-	clog.Debugf(c.ctx, "Write %d bytes", n)
+	c.receiveOnce.Do(func() { go c.receive() })
+	for c.lastIncoming == nil {
+		select {
+		case <-c.closed:
+			return 0, net.ErrClosed
+		case <-c.ctx.Done():
+			return 0, c.ctx.Err()
+		case <-deadline:
+			return 0, os.ErrDeadlineExceeded
+		case incoming, ok := <-c.incoming:
+			if !ok {
+				if err = c.operationError(deadline); err != nil {
+					return 0, err
+				}
+				return 0, io.EOF
+			}
+			if incoming.err != nil {
+				if err = c.operationError(deadline); err != nil {
+					return 0, err
+				}
+				return 0, incoming.err
+			}
+			if incoming.message != nil && len(incoming.message.Payload()) != 0 {
+				c.lastIncoming = incoming.message
+				c.offset = 0
+			}
+		}
+	}
+	payload := c.lastIncoming.Payload()
+	n = copy(data, payload[c.offset:])
+	c.offset += n
+	if c.offset == len(payload) {
+		c.lastIncoming = nil
+	}
+	if c.readProbe != nil {
+		c.readProbe.Increment(uint64(n))
+	}
 	return n, nil
 }
 
-func (c *streamConn) Close() error {
-	select {
-	case <-c.readCancelCh:
-		// Already closed.
-		return nil
-	default:
+func (c *streamConn) send() {
+	// This goroutine owns both native payload sends and native close.
+	defer func() {
+		if err := c.stream.CloseSend(c.ctx); err != nil {
+			clog.Debugf(c.ctx, "Close stream send: %v", err)
+		}
+	}()
+	for {
+		if connSignalClosed(c.closed) || c.ioCtx.Err() != nil {
+			return
+		}
+		select {
+		case <-c.ioCtx.Done():
+			return
+		case outgoing := <-c.outgoing:
+			err := c.operationError(outgoing.deadline)
+			if err == nil {
+				err = outgoing.ctx.Err()
+			}
+			if err == nil {
+				err = c.stream.Send(outgoing.ctx, outgoing.message)
+			}
+			if err != nil {
+				if interrupted := c.operationError(outgoing.deadline); interrupted != nil {
+					err = interrupted
+				}
+			}
+			outgoing.result <- err
+		}
 	}
-	close(c.readCancelCh)
-	close(c.writeCancelCh)
-	return c.stream.CloseSend(c.ctx)
+}
+
+func (c *streamConn) Write(b []byte) (int, error) {
+	deadline := c.writeDeadline.wait()
+	if err := c.operationError(deadline); err != nil {
+		return 0, err
+	}
+	if len(b) == 0 {
+		return 0, nil
+	}
+	ctx, cancel := context.WithCancel(c.ioCtx)
+	defer cancel()
+	outgoing := connOutgoing{
+		ctx: ctx, deadline: deadline, message: NewMessage(Normal, b), result: make(chan error, 1),
+	}
+	c.sendOnce.Do(func() { go c.send() })
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
+	case <-deadline:
+		return 0, os.ErrDeadlineExceeded
+	case c.outgoing <- outgoing:
+	}
+
+	finish := func(err error) (int, error) {
+		if err != nil {
+			return 0, err
+		}
+		n := len(b)
+		if c.writeProbe != nil {
+			c.writeProbe.Increment(uint64(n))
+		}
+		clog.Debugf(c.ctx, "Write %d bytes", n)
+		return n, nil
+	}
+	interrupted := func(err error) (int, error) {
+		select {
+		case completed := <-outgoing.result:
+			return finish(completed)
+		default:
+			return 0, err
+		}
+	}
+	select {
+	case err := <-outgoing.result:
+		return finish(err)
+	case <-c.closed:
+		return interrupted(net.ErrClosed)
+	case <-c.ctx.Done():
+		return interrupted(c.ctx.Err())
+	case <-deadline:
+		return interrupted(os.ErrDeadlineExceeded)
+	}
+}
+
+func (c *streamConn) Close() error {
+	c.stateLock.Lock()
+	if connSignalClosed(c.closed) {
+		c.stateLock.Unlock()
+		return nil
+	}
+	close(c.closed)
+	c.readDeadline.set(time.Time{})
+	c.writeDeadline.set(time.Time{})
+	c.stateLock.Unlock()
+	c.cancelIO()
+	c.sendOnce.Do(func() { go c.send() })
+	return nil
+}
+
+func (c *streamConn) operationError(deadline <-chan struct{}) error {
+	switch {
+	case connSignalClosed(c.closed):
+		return net.ErrClosed
+	case c.ctx.Err() != nil:
+		return c.ctx.Err()
+	case connSignalClosed(deadline):
+		return os.ErrDeadlineExceeded
+	default:
+		return nil
+	}
 }
 
 func addFromAP(ap netip.AddrPort, proto types.Proto) net.Addr {
@@ -180,35 +275,79 @@ func (c *streamConn) RemoteAddr() net.Addr {
 }
 
 func (c *streamConn) SetDeadline(t time.Time) error {
-	err := c.SetReadDeadline(t)
-	if err == nil {
-		err = c.SetWriteDeadline(t)
+	c.stateLock.Lock()
+	defer c.stateLock.Unlock()
+	if connSignalClosed(c.closed) {
+		return net.ErrClosed
 	}
-	return err
+	c.readDeadline.set(t)
+	c.writeDeadline.set(t)
+	return nil
 }
 
 func (c *streamConn) SetReadDeadline(t time.Time) error {
-	var un int64 = 0
-	if !t.IsZero() {
-		un = t.UnixNano()
+	c.stateLock.Lock()
+	defer c.stateLock.Unlock()
+	if connSignalClosed(c.closed) {
+		return net.ErrClosed
 	}
-	atomic.StoreInt64(&c.readDeadline, un)
-	select {
-	case c.readCancelCh <- struct{}{}:
-	default:
-	}
+	c.readDeadline.set(t)
 	return nil
 }
 
 func (c *streamConn) SetWriteDeadline(t time.Time) error {
-	var un int64 = 0
-	if !t.IsZero() {
-		un = t.UnixNano()
+	c.stateLock.Lock()
+	defer c.stateLock.Unlock()
+	if connSignalClosed(c.closed) {
+		return net.ErrClosed
 	}
-	atomic.StoreInt64(&c.writeDeadline, un)
-	select {
-	case c.writeCancelCh <- struct{}{}:
-	default:
-	}
+	c.writeDeadline.set(t)
 	return nil
+}
+
+type connDeadline struct {
+	lock   sync.Mutex
+	signal chan struct{}
+	timer  *time.Timer
+}
+
+func newConnDeadline() connDeadline {
+	return connDeadline{signal: make(chan struct{})}
+}
+
+func (d *connDeadline) wait() <-chan struct{} {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	return d.signal
+}
+
+func (d *connDeadline) set(t time.Time) {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	if d.timer != nil {
+		if !d.timer.Stop() {
+			<-d.signal
+		}
+		d.timer = nil
+	}
+	if t.IsZero() || time.Until(t) > 0 {
+		if connSignalClosed(d.signal) {
+			d.signal = make(chan struct{})
+		}
+		if !t.IsZero() {
+			signal := d.signal
+			d.timer = time.AfterFunc(time.Until(t), func() { close(signal) })
+		}
+	} else if !connSignalClosed(d.signal) {
+		close(d.signal)
+	}
+}
+
+func connSignalClosed(signal <-chan struct{}) bool {
+	select {
+	case <-signal:
+		return true
+	default:
+		return false
+	}
 }

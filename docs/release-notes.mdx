@@ -9,6 +9,18 @@ import { Note, Title, Body } from '@site/src/components/ReleaseNotes'
 # Telepresence Release Notes
 ## Version 2.32.0
 <Note>
+	<Title type="bugfix">Reject intercepts without a reverse connection to the traffic-agent</Title>
+	<Body>
+The client now refuses to create an intercept, replacement, or wiretap if it cannot watch traffic-agents in the target namespace. It explains how to reconnect and, for connections through Kubernetes, how to check port-forward permission. Traffic-managers older than version 2.28 can watch only the connected namespace.
+  </Body>
+</Note>
+<Note>
+	<Title type="bugfix">Give cold named proxy agents time to start</Title>
+	<Body>
+Initial connections and reconnections using <code>--proxy-via</code> now allow each distinct named workload the configured <code>timeouts.intercept</code> for its traffic-agent to start. Named proxy connections also fail early with reconnect guidance if agents in the connected namespace cannot be watched.
+  </Body>
+</Note>
+<Note>
 	<Title type="bugfix">Recover DNS after interrupted root daemon sessions</Title>
 	<Body>
 On Linux, root daemon startup removes recognized stale DNS redirects to unused local UDP endpoints before cluster authentication needs DNS. Reconnecting also waits for the previous session's workers and routing cleanup to finish, including when session initialization fails.

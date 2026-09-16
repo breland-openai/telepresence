@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -524,6 +525,36 @@ func requireQuicTunnelAvailable(ctx context.Context, mc quicTunnelEndpointGetter
 	return nil
 }
 
+// An intercept needs the root daemon's reverse-dial watcher for the target agents.
+func (s *session) requireInterceptAgentWatch(kind, namespace string) error {
+	attachment := kind
+	if kind == "replace" {
+		attachment = "replacement"
+	}
+	if !slices.Contains(s.agentPodWatchNamespaces(), namespace) {
+		if client.GetConfig(s).Cluster().UsesExternalManager() {
+			return errcat.User.Newf(
+				"%s cannot receive traffic from namespace %q: this session does not watch its traffic-agents. "+
+					"Reconnect with --mapped-namespaces including %q. No %s was created.",
+				kind, namespace, namespace, attachment)
+		}
+		return errcat.User.Newf(
+			"%s cannot receive traffic from namespace %q: this session does not watch its traffic-agents. "+
+				"Verify your Kubernetes permission with `kubectl auth can-i create pods/portforward --namespace %s` "+
+				"using the same kubeconfig context, then reconnect with --mapped-namespaces including %q. "+
+				"No %s was created.",
+			kind, namespace, namespace, namespace, attachment)
+	}
+	if namespace != s.Namespace && s.compareFinalizedManagerVersion(2, 28, 0) < 0 {
+		return errcat.User.Newf(
+			"%s cannot receive traffic from namespace %q: traffic-manager version %s only watches traffic-agents "+
+				"in the connected namespace %q. Reconnect with --namespace %q, or upgrade the traffic-manager to "+
+				"version 2.28 or newer. No %s was created.",
+			kind, namespace, s.ManagerVersion(), s.Namespace, namespace, attachment)
+	}
+	return nil
+}
+
 func (s *session) CanIntercept(ctx context.Context, ir *rpc.CreateInterceptRequest) (userd.InterceptInfo, error) {
 	spec := ir.Spec
 	kind := "intercept"
@@ -546,6 +577,12 @@ func (s *session) CanIntercept(ctx context.Context, ir *rpc.CreateInterceptReque
 		)
 	} else {
 		spec.Namespace = ns
+	}
+	if spec.Wiretap {
+		kind = "wiretap"
+	}
+	if err := s.requireInterceptAgentWatch(kind, spec.Namespace); err != nil {
+		return nil, err
 	}
 
 	if er := s.ensureNoInterceptConflict(ir); er != nil {

@@ -234,6 +234,13 @@ func (ac *client) connected() bool {
 	return ok
 }
 
+func (ac *client) podInfo() *manager.AgentPodInfo {
+	ac.RLock()
+	info := ac.info
+	ac.RUnlock()
+	return info
+}
+
 func (ac *client) intercepted() bool {
 	ac.RLock()
 	ret := ac.info.Intercepted
@@ -404,7 +411,7 @@ type Clients interface {
 	RunDeltaSink(rmc manager.ManagerClient) error
 
 	WaitForIP(ctx context.Context, timeout time.Duration, namespace string, ip netip.Addr) error
-	WaitForWorkload(timeout time.Duration, name string) error
+	WaitForWorkload(ctx context.Context, timeout time.Duration, name string) error
 	GetWorkloadClient(workload string) (ag tunnel.Provider)
 	SetProxyVia(workload string)
 
@@ -456,6 +463,22 @@ type ipWaitKey struct {
 	ip        netip.Addr
 }
 
+func agentPodKey(ai *manager.AgentPodInfo) string {
+	name := ai.PodName + "." + ai.Namespace
+	if ai.PodId != "" {
+		return name + "/uid:" + ai.PodId
+	}
+	if ip, ok := agentPodIP(ai); ok {
+		return name + "/ip:" + ip.String()
+	}
+	return name
+}
+
+func agentPodIP(ai *manager.AgentPodInfo) (netip.Addr, bool) {
+	ip, ok := netip.AddrFromSlice(ai.PodIp)
+	return ip.Unmap(), ok
+}
+
 type clients struct {
 	*k8s.Cluster
 	session      *manager.SessionInfo
@@ -467,10 +490,8 @@ type clients struct {
 	namespaces   map[string]struct{}
 	disabled     atomic.Bool
 
-	// snapshot is the set of agent pods most recently reported by the watch, keyed by
-	// "<podName>.<namespace>". Unlike the live clients map, it is not mutated by failed dial
-	// attempts, so WaitForIP can consult it to tell whether an agent still exists and should be
-	// retried. Guarded by snapshotMu.
+	// snapshot retains the physical pods most recently reported by the watch even after a dial
+	// removes their live clients. Guarded by snapshotMu.
 	snapshotMu sync.RWMutex
 	snapshot   map[string]*manager.AgentPodInfo
 
@@ -598,9 +619,10 @@ func (s *clients) GetClient(ip netip.Addr) (pvd tunnel.Provider) {
 	if s.disabled.Load() {
 		return nil
 	}
+	ip = ip.Unmap()
 	var primary, secondary, ternary tunnel.Provider
 	s.clients.Range(func(_ string, c *client) bool {
-		podIP, ok := netip.AddrFromSlice(c.info.PodIp)
+		podIP, ok := agentPodIP(c.podInfo())
 		switch {
 		case ok && ip == podIP:
 			primary = c
@@ -629,20 +651,17 @@ func (s *clients) GetClient(ip netip.Addr) (pvd tunnel.Provider) {
 // lookup's whole deadline. An agent that no traffic has needed yet is therefore left to
 // the dial watcher and the ip-waiter loop, which connect on the session's own context.
 //
-// Node-agent sessions are never returned. A node-agent's pod runs in the
-// traffic-manager's namespace rather than the workload's, so its resolv.conf
-// search path qualifies bare (single-label) names against the wrong
-// namespace and DNS lookups delegated to it would incorrectly fail. When no
-// eligible (non-node-agent) client remains, this function returns nil and
-// the caller falls back to querying the traffic-manager directly, which
-// qualifies single-label names against the client's connected namespace
-// itself.
+// Only sidecars in the connected namespace are eligible. Other mapped namespaces
+// and node-agent pods have a different resolv.conf search path and can resolve
+// bare names in the wrong namespace. With no eligible client, the caller queries
+// the traffic-manager, which qualifies bare names against the connected namespace.
 //
-// The function returns nil when no agent is connected.
+// The function returns nil when no eligible agent is connected.
 func (s *clients) GetRandomAgent(context.Context) (aa agent.AgentClient) {
 	var connected *client
 	s.clients.Range(func(_ string, ac *client) bool {
-		if ac.info.NodeAgent {
+		ai := ac.podInfo()
+		if ai.NodeAgent || ai.Namespace == "" || ai.Namespace != s.Namespace {
 			return true
 		}
 		if ac.connected() {
@@ -666,7 +685,20 @@ func (s *clients) GetAgentForWorkload(ctx context.Context, workload string) agen
 	if workload == "" || s.disabled.Load() {
 		return nil
 	}
+	selected := s.workloadClient(workload)
+	if selected == nil {
+		return nil
+	}
 
+	agentClient, err := selected.ensureConnect(ctx)
+	if err != nil {
+		clog.Warn(s, err)
+		return nil
+	}
+	return agentClient
+}
+
+func (s *clients) workloadClient(workload string) *client {
 	var connected, other *client
 	var connectedKey, otherKey string
 	s.clients.Range(func(key string, ac *client) bool {
@@ -691,36 +723,25 @@ func (s *clients) GetAgentForWorkload(ctx context.Context, workload string) agen
 		return true
 	})
 
-	selected := connected
-	if selected == nil {
-		selected = other
+	if connected != nil {
+		return connected
 	}
-	if selected == nil {
-		return nil
-	}
-
-	agentClient, err := selected.ensureConnect(ctx)
-	if err != nil {
-		clog.Warn(s, err)
-		return nil
-	}
-	return agentClient
+	return other
 }
 
 // GetWorkloadClient returns tunnel.Provider that opens a tunnel to a traffic-agent that
 // belongs to a pod created for the given workload.
 //
-// Proxy-via routing remains scoped to the connected namespace. The function returns nil
-// when there are no agents for the given workload in that namespace.
-func (s *clients) GetWorkloadClient(workload string) (pvd tunnel.Provider) {
-	s.clients.Range(func(_ string, ac *client) bool {
-		if ac.info.WorkloadName == workload && ac.info.Namespace == s.Namespace {
-			pvd = ac
-			return false
-		}
-		return true
-	})
-	return pvd
+// Proxy-via routing uses a connected agent when available and is scoped to the connected
+// namespace. The function returns nil when the namespace has no agent for the workload.
+func (s *clients) GetWorkloadClient(workload string) tunnel.Provider {
+	if workload == "" || s.disabled.Load() {
+		return nil
+	}
+	if selected := s.workloadClient(workload); selected != nil {
+		return selected
+	}
+	return nil
 }
 
 func (s *clients) SetProxyVia(workload string) {
@@ -758,18 +779,23 @@ func (s *clients) notifyChanged() {
 }
 
 func (s *clients) isProxyVIA(info *manager.AgentPodInfo) bool {
+	if info.Namespace != s.Namespace || info.NodeAgent {
+		return false
+	}
 	_, isPV := s.proxyVias.Load(info.WorkloadName)
 	return isPV
 }
 
 func (s *clients) hasWaiterFor(info *manager.AgentPodInfo) bool {
-	if podIP, ok := netip.AddrFromSlice(info.PodIp); ok {
+	if podIP, ok := agentPodIP(info); ok {
 		if _, isW := s.ipWaiters.Load(ipWaitKey{namespace: info.Namespace, ip: podIP}); isW {
 			return true
 		}
 	}
-	if _, isW := s.wlWaiters.Load(info.WorkloadName); isW {
-		return true
+	if info.Namespace == s.Namespace && !info.NodeAgent {
+		if _, isW := s.wlWaiters.Load(info.WorkloadName); isW {
+			return true
+		}
 	}
 	return false
 }
@@ -902,35 +928,27 @@ func (s *clients) teardown() {
 func (ac *client) notify(waiter chan struct{}) {
 	// a client must be connected to be able to notify
 	if _, err := ac.ensureConnect(ac); err != nil {
-		clog.Errorf(ac, "notifyWaiters %s (%s), ensureConnect failed: %v", ac.info.WorkloadName, net.IP(ac.info.PodIp), err)
+		ai := ac.podInfo()
+		clog.Errorf(ac, "notifyWaiters %s (%s), ensureConnect failed: %v", ai.WorkloadName, net.IP(ai.PodIp), err)
 	}
 	close(waiter)
 }
 
 func (s *clients) notifyWaiters() {
 	s.clients.Range(func(name string, ac *client) bool {
-		if podIP, ok := netip.AddrFromSlice(ac.info.PodIp); ok {
-			if waiter, ok := s.ipWaiters.LoadAndDelete(ipWaitKey{namespace: ac.info.Namespace, ip: podIP}); ok {
+		ai := ac.podInfo()
+		if podIP, ok := agentPodIP(ai); ok {
+			if waiter, ok := s.ipWaiters.LoadAndDelete(ipWaitKey{namespace: ai.Namespace, ip: podIP}); ok {
 				ac.notify(waiter)
 			}
 		}
-		if waiter, ok := s.wlWaiters.LoadAndDelete(ac.info.WorkloadName); ok {
-			ac.notify(waiter)
+		if ai.Namespace == s.Namespace && !ai.NodeAgent {
+			if waiter, ok := s.wlWaiters.LoadAndDelete(ai.WorkloadName); ok {
+				close(waiter)
+			}
 		}
 		return true
 	})
-}
-
-func (s *clients) waitWithTimeout(timeout time.Duration, waitOn <-chan struct{}) error {
-	s.notifyWaiters()
-	ctx, cancel := context.WithTimeout(s, timeout)
-	defer cancel()
-	select {
-	case <-waitOn:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // snapshotInfoForIP returns the AgentPodInfo for the given namespace and pod IP from the latest
@@ -938,8 +956,9 @@ func (s *clients) waitWithTimeout(timeout time.Duration, waitOn <-chan struct{})
 func (s *clients) snapshotInfoForIP(namespace string, ip netip.Addr) *manager.AgentPodInfo {
 	s.snapshotMu.RLock()
 	defer s.snapshotMu.RUnlock()
+	ip = ip.Unmap()
 	for _, ai := range s.snapshot {
-		if podIP, ok := netip.AddrFromSlice(ai.PodIp); ok && ai.Namespace == namespace && ip == podIP {
+		if podIP, ok := agentPodIP(ai); ok && ai.Namespace == namespace && ip == podIP {
 			return ai
 		}
 	}
@@ -951,8 +970,9 @@ func (s *clients) snapshotInfoForIP(namespace string, ip netip.Addr) *manager.Ag
 func (s *clients) WorkloadForIP(ip netip.Addr) (workload, namespace string, ok bool) {
 	s.snapshotMu.RLock()
 	defer s.snapshotMu.RUnlock()
+	ip = ip.Unmap()
 	for _, ai := range s.snapshot {
-		if podIP, aok := netip.AddrFromSlice(ai.PodIp); aok && podIP == ip {
+		if podIP, aok := agentPodIP(ai); aok && podIP == ip {
 			return ai.WorkloadName, ai.Namespace, true
 		}
 	}
@@ -964,23 +984,37 @@ func (s *clients) WorkloadForIP(ip netip.Addr) (workload, namespace string, ok b
 // the watch only emits on change it may not re-add it; this lets WaitForIP retry the dial for an
 // agent that still exists in the watch snapshot.
 func (s *clients) loadOrAddClient(ai *manager.AgentPodInfo) *client {
-	k := ai.PodName + "." + ai.Namespace
-	ac, _ := s.clients.LoadOrCompute(k, func() (*client, bool) {
-		return &client{
+	ac, _ := s.loadAgentClient(ai)
+	return ac
+}
+
+func (s *clients) loadAgentClient(ai *manager.AgentPodInfo) (*client, bool) {
+	k := agentPodKey(ai)
+	return s.clients.LoadOrCompute(k, func() (*client, bool) {
+		ac := &client{
 			Cluster: s.Cluster,
 			session: s.session,
-			remove:  func() { s.clients.Delete(k) },
 			owner:   s,
 			info:    ai,
-		}, false
+		}
+		ac.remove = func() {
+			s.clients.Compute(k, func(current *client, loaded bool) (*client, xsync.ComputeOp) {
+				if loaded && current == ac {
+					return nil, xsync.DeleteOp
+				}
+				return nil, xsync.CancelOp
+			})
+		}
+		clog.Debugf(s, "Adding agent pod %s (%s)", k, net.IP(ai.PodIp))
+		return ac, false
 	})
-	return ac
 }
 
 func (s *clients) WaitForIP(ctx context.Context, timeout time.Duration, namespace string, ip netip.Addr) error {
 	if s.disabled.Load() {
 		return status.Error(codes.Unavailable, "")
 	}
+	ip = ip.Unmap()
 	if namespace == "" {
 		namespace = s.Namespace
 	}
@@ -1031,31 +1065,73 @@ func (s *clients) WaitForIP(ctx context.Context, timeout time.Duration, namespac
 	}
 }
 
-func (s *clients) WaitForWorkload(timeout time.Duration, name string) error {
-	if s.disabled.Load() {
-		return nil
-	}
-
-	// Create a channel to subscribe to, but only if the agent doesn't already exist.
-	waitOn, ok := s.wlWaiters.LoadOrCompute(name, func() (chan struct{}, bool) {
-		found := false
-		s.clients.Range(func(k string, ac *client) bool {
-			if ac.info.WorkloadName == name {
-				found = true
-				return false
-			}
-			return true
-		})
-		if found {
-			return nil, true
+func (s *clients) WaitForWorkload(ctx context.Context, timeout time.Duration, name string) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	newWaiter := func() (chan struct{}, bool) { return make(chan struct{}), false }
+	waitOn, _ := s.wlWaiters.LoadOrCompute(name, newWaiter)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		return make(chan struct{}), false
-	})
-	if ok {
-		return s.waitWithTimeout(timeout, waitOn)
+		if s.disabled.Load() {
+			return status.Errorf(codes.Unavailable, "agent port-forwards are unavailable in namespace %s", s.Namespace)
+		}
+		if s.waitForWorkloadAgents(ctx, s.snapshotInfosForWorkload(name)) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if waiter, ok := s.wlWaiters.LoadAndDelete(name); ok {
+				close(waiter)
+			}
+			return nil
+		}
+		select {
+		case <-waitOn:
+			waitOn, _ = s.wlWaiters.LoadOrCompute(name, newWaiter)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(connectRetryInterval):
+		}
 	}
-	// No chan created because the agent already exists
-	return nil
+}
+
+func (s *clients) snapshotInfosForWorkload(name string) []*manager.AgentPodInfo {
+	s.snapshotMu.RLock()
+	defer s.snapshotMu.RUnlock()
+	var agents []*manager.AgentPodInfo
+	for _, ai := range s.snapshot {
+		if ai.WorkloadName == name && ai.Namespace == s.Namespace && !ai.NodeAgent {
+			agents = append(agents, ai)
+		}
+	}
+	return agents
+}
+
+func (s *clients) waitForWorkloadAgents(ctx context.Context, agents []*manager.AgentPodInfo) bool {
+	if len(agents) == 0 {
+		return false
+	}
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	result := make(chan error, len(agents))
+	for _, ai := range agents {
+		go func() {
+			_, err := s.loadOrAddClient(ai).ensureConnect(dialCtx)
+			result <- err
+		}()
+	}
+	for range agents {
+		select {
+		case err := <-result:
+			if err == nil {
+				return true
+			}
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return false
 }
 
 func (s *clients) updateClients(ais []*manager.AgentPodInfo) error {
@@ -1066,7 +1142,7 @@ func (s *clients) updateClients(ais []*manager.AgentPodInfo) error {
 		aim = make(map[string]*manager.AgentPodInfo, len(ais))
 		for _, ai := range ais {
 			if ai.PodName != "" {
-				aim[ai.PodName+"."+ai.Namespace] = ai
+				aim[agentPodKey(ai)] = ai
 			}
 		}
 		if len(aim) == 0 {
@@ -1115,19 +1191,7 @@ func (s *clients) updateClients(ais []*manager.AgentPodInfo) error {
 	}
 
 	addClient := func(k string, ai *manager.AgentPodInfo) {
-		ac, loaded := s.clients.LoadOrCompute(k, func() (*client, bool) {
-			ac := &client{
-				Cluster: s.Cluster,
-				session: s.session,
-				remove: func() {
-					s.clients.Delete(k)
-				},
-				owner: s,
-				info:  ai,
-			}
-			clog.Debugf(s, "Adding agent pod %s (%s)", k, net.IP(ai.PodIp))
-			return ac, false
-		})
+		ac, loaded := s.loadAgentClient(ai)
 		if !loaded {
 			changed = true
 		}
@@ -1147,7 +1211,8 @@ func (s *clients) updateClients(ais []*manager.AgentPodInfo) error {
 	// Terminate all dormant agents except the last one.
 	dormantCount := 0
 	s.clients.Range(func(k string, ac *client) bool {
-		if ac.dormant() && !s.isProxyVIA(ac.info) && !s.hasWaiterFor(ac.info) {
+		ai := ac.podInfo()
+		if ac.dormant() && !s.isProxyVIA(ai) && !s.hasWaiterFor(ai) {
 			dormantCount++
 			if dormantCount > 1 {
 				clog.Debugf(s, "Deleting dormant agent %s", k)

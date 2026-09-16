@@ -105,6 +105,10 @@ Telepresence has now set up a virtual network interface and a DNS resolver that
 make the cluster's services reachable from your workstation, for every local
 tool — `curl`, your browser, your IDE.
 
+To switch to a different workstation connection, disconnect the current one
+first with `telepresence quit`. See [workstation connections](reference/routing.md#workstation-connections)
+for connection names and using Docker alongside your workstation connection.
+
 ## 4. Reach the service like a pod would
 
 Use the service's cluster DNS name, just as another pod in the namespace would:

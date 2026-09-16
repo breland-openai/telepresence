@@ -2,8 +2,13 @@ package rootd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/netip"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
@@ -107,6 +112,7 @@ func (s *session) streamCreator() tunnel.StreamCreator {
 		}
 
 		var tp tunnel.Provider
+		var optionalServiceAgent bool
 		if a, ok := s.getAgentVIP(destAddr); ok {
 			// s.agentClients is never nil when agentVIPs are used.
 			if a.workload != "" {
@@ -145,23 +151,33 @@ func (s *session) streamCreator() tunnel.StreamCreator {
 				tp = s.managerTunnelProvider()
 				clog.Debugf(c, "Opening traffic-manager tunnel for also-proxy id %s", id)
 			} else if tp = s.getAgentClient(destAddr); tp != nil {
+				optionalServiceAgent = s.isClusterServiceDestination(destAddr)
 				clog.Debugf(c, "Opening traffic-agent tunnel for id %s using agent %s", id, tp)
 			} else {
 				tp = s.managerTunnelProvider()
 				clog.Debugf(c, "Opening traffic-manager tunnel for id %s", id)
 			}
 		}
-		ct, err := tp.Tunnel(c)
-		if err != nil {
-			return nil, err
+		var cs tunnel.Stream
+		var activityMarked bool
+		if optionalServiceAgent {
+			// A sidecar is only a relay for a cluster Service. Retire a failed
+			// setup before asking the manager to reach the same destination. A
+			// confirmed stream stays with its original provider and is never retried.
+			agentCtx, cancelAgent := context.WithCancel(c)
+			stopAgentCancel := context.AfterFunc(c, cancelAgent)
+			cs, err = s.openTunnelStream(agentCtx, tp, id, true, &activityMarked)
+			if err != nil {
+				stopAgentCancel()
+				cancelAgent()
+				if c.Err() == nil && (status.Code(err) == codes.Unavailable || errors.Is(err, io.EOF)) {
+					clog.Debugf(c, "Traffic-agent unavailable for cluster Service id %s; opening traffic-manager tunnel: %v", id, err)
+					cs, err = s.openTunnelStream(c, s.managerTunnelProvider(), id, false, &activityMarked)
+				}
+			}
+		} else {
+			cs, err = s.openTunnelStream(c, tp, id, false, &activityMarked)
 		}
-		if id.Protocol() == types.ProtoTCP {
-			s.MarkActivity()
-		}
-
-		tc := client.GetConfig(c).Timeouts()
-		cs, err := tunnel.NewClientStream(
-			c, tunnel.TunToClient, ct, id, tunnel.SessionID(s.session.SessionId), tc.Get(client.TimeoutRoundtripLatency), tc.Get(client.TimeoutEndpointDial))
 		if err != nil {
 			return nil, err
 		}
@@ -179,6 +195,50 @@ func (s *session) streamCreator() tunnel.StreamCreator {
 		}
 		return cs, nil
 	}
+}
+
+func (s *session) openTunnelStream(c context.Context, tp tunnel.Provider, id tunnel.ConnID, readStatusOnEOF bool, activityMarked *bool) (tunnel.Stream, error) {
+	ct, err := tp.Tunnel(c)
+	if err != nil {
+		return nil, err
+	}
+	if id.Protocol() == types.ProtoTCP && !*activityMarked {
+		s.MarkActivity()
+		*activityMarked = true
+	}
+	tc := client.GetConfig(c).Timeouts()
+	cs, err := tunnel.NewClientStream(c, tunnel.TunToClient, ct, id, tunnel.SessionID(s.session.SessionId),
+		tc.Get(client.TimeoutRoundtripLatency), tc.Get(client.TimeoutEndpointDial))
+	if readStatusOnEOF && errors.Is(err, io.EOF) {
+		// gRPC can return only EOF from Send when the server closed before the
+		// handshake. Recv reveals the actual status, if any, so an explicit
+		// authentication or routing failure does not become a manager retry.
+		if _, finalErr := ct.Recv(); finalErr == nil {
+			// A message may even be StreamOK. The agent received this attempt,
+			// and its result is ambiguous; leave the connection failed rather
+			// than starting another stream through the manager.
+			return nil, status.Error(codes.FailedPrecondition, "traffic-agent responded after the initial tunnel send failed")
+		} else if !errors.Is(finalErr, io.EOF) {
+			return nil, finalErr
+		}
+	}
+	return cs, err
+}
+
+func (s *session) isClusterServiceDestination(ip netip.Addr) bool {
+	// Direct and headless Pod traffic retains its selected physical agent, even
+	// if the reported ranges happen to overlap.
+	for _, sn := range s.podSubnets {
+		if sn.Contains(ip) {
+			return false
+		}
+	}
+	for _, sn := range s.serviceSubnets {
+		if sn.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *session) isAlsoProxyDestination(ip netip.Addr) bool {
