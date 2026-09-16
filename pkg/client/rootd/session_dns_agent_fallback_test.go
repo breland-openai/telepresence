@@ -186,7 +186,7 @@ func TestSimpleDNSRecoversBothFamiliesAfterRetiredAgentTransportEOF(t *testing.T
 
 func TestSimpleDNSKeepsAnswersErrorsAndLegacyRouting(t *testing.T) {
 	const name = "test.ns.svc.cluster.local."
-	complex, err := dnsproxy.ToRPC(dnsproxy.RRs{&dns2.A{Hdr: rrHeader(name, dns2.TypeA), A: net.ParseIP("192.0.2.55").To4()}}, dns2.RcodeSuccess)
+	complexResponse, err := dnsproxy.ToRPC(dnsproxy.RRs{&dns2.A{Hdr: rrHeader(name, dns2.TypeA), A: net.ParseIP("192.0.2.55").To4()}}, dns2.RcodeSuccess)
 	require.NoError(t, err)
 	tests := []struct {
 		name         string
@@ -219,7 +219,7 @@ func TestSimpleDNSKeepsAnswersErrorsAndLegacyRouting(t *testing.T) {
 			if tt.agent != nil {
 				ag = &fallbackDNSAgent{lookup: tt.agent}
 			}
-			mgr := &fallbackDNSManager{lookup: tt.manager, complex: complex}
+			mgr := &fallbackDNSManager{lookup: tt.manager, complex: complexResponse}
 			s, _ := newFallbackDNSSession(t, ag, mgr)
 			records, code, lookupErr := s.simpleLookup(t.Context(), lookupQuestion(name, dns2.TypeA))
 			require.Equal(t, tt.wantError, status.Code(lookupErr))
