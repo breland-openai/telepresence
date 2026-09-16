@@ -104,7 +104,7 @@ func WatchPodsWithClient(
 			}
 			upserts := make(map[string]*manager.AgentPodInfo, len(snapshot.Agents))
 			for _, ai := range snapshot.Agents {
-				upserts[ai.PodName+"."+ai.Namespace] = ai
+				upserts[agentPodKey(ai)] = ai
 			}
 			return onDelta(upserts, nil)
 		}, nil)
