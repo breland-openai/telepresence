@@ -67,20 +67,9 @@ func applyInterceptsDelta(icMap map[string]*manager.InterceptInfo, delta *manage
 	return maps.Values(icMap)
 }
 
-// watchSessionEvents runs the combined manager watcher: it maintains the
-// accumulated agent-pod map fed by delta.AgentPods (driving the ingest
-// lifecycle and the internal agent-pod cache, then forwarding the delta
-// unchanged to the relay), and the intercept map fed by delta.Intercepts
-// (driving handleInterceptSnapshot, unchanged from the legacy watcher).
-//
-// Intercept snapshots are handled on their own goroutine, mirroring the
-// concurrency model of the legacy loops (which run on separate goroutines
-// over separate streams). handleInterceptSnapshot can block in ensureAccess,
-// waiting for the root daemon to learn an agent-pod IP -- and that pod's
-// delta may be queued behind the intercept delta on this very stream, so
-// handling intercepts inline would starve the relay until the wait times
-// out. Snapshots are full, so a newer one supersedes an unprocessed older
-// one (coalesced through a one-slot mailbox).
+// The relay and pod cache are published on receipt. Ingest and intercept
+// reconciliation consume independent, coalesced full snapshots because both
+// can wait for root-daemon readiness supplied by a later delta on this stream.
 func (s *session) watchSessionEvents(ctx context.Context) error {
 	pat := newPodAccessTracker()
 	podMap := make(map[string]*manager.AgentPodInfo)
@@ -88,9 +77,19 @@ func (s *session) watchSessionEvents(ctx context.Context) error {
 	relayEnabled := len(s.agentPodWatchNamespaces()) > 0
 	everReceived := false
 
+	ingestCtx, cancelIngest := context.WithCancel(ctx)
+	defer cancelIngest()
+	podSnapshots := make(chan []agentPod, 1)
+	podDone := make(chan struct{})
 	icSnapshots := make(chan []*manager.InterceptInfo, 1)
 	icDone := make(chan struct{})
 	var managerGeneration uint64
+	go func() {
+		defer close(podDone)
+		for snap := range podSnapshots {
+			s.handleAgentPodSnapshot(ingestCtx, snap, s.coveredCombined)
+		}
+	}()
 	go func() {
 		defer close(icDone)
 		for snap := range icSnapshots {
@@ -110,11 +109,16 @@ func (s *session) watchSessionEvents(ctx context.Context) error {
 		func(delta *manager.SessionEventsDelta) error {
 			everReceived = true
 			if ad := delta.AgentPods; ad != nil {
-				pods := applyAgentPodsDelta(podMap, ad)
-				s.handleAgentPodSnapshot(ctx, pods, s.coveredCombined)
 				if relayEnabled {
 					s.podRelay.apply(ad.Upserts, ad.Removals)
 				}
+				pods := applyAgentPodsDelta(podMap, ad)
+				s.setCurrentAgentPods(pods)
+				select {
+				case <-podSnapshots:
+				default:
+				}
+				podSnapshots <- pods
 			}
 			if id := delta.Intercepts; id != nil {
 				snap := applyInterceptsDelta(icMap, id)
@@ -134,9 +138,11 @@ func (s *session) watchSessionEvents(ctx context.Context) error {
 			return s.reconnectManager(managerGeneration)
 		})
 
-	// Stop the intercept consumer and wait it out, so the final cleanup below
-	// never runs concurrently with a snapshot it is still processing.
+	// Both consumers must stop before final cleanup touches their trackers.
+	cancelIngest()
+	close(podSnapshots)
 	close(icSnapshots)
+	<-podDone
 	<-icDone
 
 	if err != nil && status.Code(err) == codes.Unimplemented && !everReceived {
@@ -144,8 +150,7 @@ func (s *session) watchSessionEvents(ctx context.Context) error {
 		// consumers' lifecycle from here on.
 		return err
 	}
-	// Handle as if we had empty snapshots. This ensures port forwards and volume mounts
-	// are cancelled correctly, exactly as the legacy loops' tails do.
+	s.setCurrentAgentPods(nil)
 	s.handleAgentPodSnapshot(ctx, nil, s.coveredCombined)
 	s.handleInterceptSnapshot(pat, nil)
 	return err
