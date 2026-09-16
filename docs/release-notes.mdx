@@ -15,6 +15,12 @@ The client now refuses to create an intercept, replacement, or wiretap if it can
   </Body>
 </Note>
 <Note>
+	<Title type="bugfix">Give cold named proxy agents time to start</Title>
+	<Body>
+Initial connections and reconnections using <code>--proxy-via</code> now allow each distinct named workload the configured <code>timeouts.intercept</code> for its traffic-agent to start. Named proxy connections also fail early with reconnect guidance if agents in the connected namespace cannot be watched.
+  </Body>
+</Note>
+<Note>
 	<Title type="bugfix">Recover DNS after interrupted root daemon sessions</Title>
 	<Body>
 On Linux, root daemon startup removes recognized stale DNS redirects to unused local UDP endpoints before cluster authentication needs DNS. Reconnecting also waits for the previous session's workers and routing cleanup to finish, including when session initialization fails.

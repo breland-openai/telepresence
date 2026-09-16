@@ -36,6 +36,14 @@ items:
           port-forward permission. Traffic-managers older than version 2.28 can
           watch only the connected namespace.
       - type: bugfix
+        title: Give cold named proxy agents time to start
+        body: >-
+          Initial connections and reconnections using <code>--proxy-via</code> now
+          allow each distinct named workload the configured
+          <code>timeouts.intercept</code> for its traffic-agent to start. Named
+          proxy connections also fail early with reconnect guidance if agents in
+          the connected namespace cannot be watched.
+      - type: bugfix
         title: Recover DNS after interrupted root daemon sessions
         body: >-
           On Linux, root daemon startup removes recognized stale DNS redirects
