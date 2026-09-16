@@ -312,7 +312,7 @@ func NewSession(
 
 	// The root daemon establishes its own manager connection, so give that phase
 	// a fresh timeout instead of reusing the budget spent by the user daemon.
-	rootCtx, rootCancel := tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
+	rootCtx, rootCancel := tmgr.rootDaemonConnectTimeout(ctx, oi)
 	defer rootCancel()
 	if err = tmgr.connectRootDaemon(rootCtx, oi, wg, cr.IsPodDaemon); err != nil {
 		return nil, nil, err
@@ -1391,6 +1391,35 @@ func (s *session) getNetworkInfo(cr *rpc.ConnectRequest) *rootdRpc.NetworkConfig
 	}
 }
 
+type proxyViaStartupTimeoutError struct {
+	managerConnect, agentArrival time.Duration
+}
+
+func (e proxyViaStartupTimeoutError) Error() string {
+	return fmt.Sprintf("proxy-via startup exceeded trafficManagerConnect (%s) plus intercept (%s) for agent arrival", e.managerConnect, e.agentArrival)
+}
+
+func (s *session) rootDaemonConnectTimeout(ctx context.Context, nc *rootdRpc.NetworkConfig) (context.Context, context.CancelFunc) {
+	tos := client.GetConfig(s).Timeouts()
+	for _, via := range nc.GetSubnetViaWorkloads() {
+		if name := via.GetWorkload(); name != "" && name != "local" {
+			// Named proxy workloads can require agent injection during root startup.
+			managerConnect := tos.Get(client.TimeoutTrafficManagerConnect)
+			agentArrival := tos.Get(client.TimeoutIntercept)
+			deadline := time.Now().Add(managerConnect).Add(agentArrival)
+			return context.WithDeadlineCause(ctx, deadline, proxyViaStartupTimeoutError{managerConnect, agentArrival})
+		}
+	}
+	return tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
+}
+
+func rootDaemonConnectError(ctx context.Context, err error) error {
+	if cause, ok := context.Cause(ctx).(proxyViaStartupTimeoutError); ok {
+		return fmt.Errorf("%w (%s)", err, cause)
+	}
+	return err
+}
+
 func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.NetworkConfig, wg *sync.WaitGroup, isPodDaemon bool) (err error) {
 	// establish a connection to the root daemon gRPC grpcService
 	clog.Info(s, "Connecting to root daemon...")
@@ -1457,7 +1486,7 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 			var rootStatus *rootdRpc.DaemonStatus
 			rootStatus, err = rd.Connect(timeoutCtx, nc)
 			if err != nil {
-				return fmt.Errorf("failed to connect to root daemon: %w", err)
+				return fmt.Errorf("failed to connect to root daemon: %w", rootDaemonConnectError(timeoutCtx, err))
 			}
 			oc := rootStatus.OutboundConfig
 			if oc == nil || oc.Session == nil {
@@ -1486,7 +1515,7 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 		if se, ok := status.FromError(err); ok {
 			err = se.Err()
 		}
-		return fmt.Errorf("failed to connect to root daemon: %v", err)
+		return fmt.Errorf("failed to connect to root daemon: %v", rootDaemonConnectError(timeoutCtx, err))
 	}
 	generation := s.setRootDaemon(rd, conn, nc, isPodDaemon)
 	if !svc.RootSessionInProcess() {
@@ -1565,7 +1594,7 @@ func (s *session) reconnectRootDaemon(failedGeneration uint64, cause error) {
 			return
 		}
 
-		timeoutCtx, cancel := client.GetConfig(s).Timeouts().TimeoutContext(s, client.TimeoutTrafficManagerConnect)
+		timeoutCtx, cancel := s.rootDaemonConnectTimeout(s, nc)
 		err := s.connectRootDaemon(timeoutCtx, nc, nil, isPodDaemon)
 		cancel()
 		if err == nil {
