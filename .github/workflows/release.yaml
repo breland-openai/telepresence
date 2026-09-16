@@ -88,6 +88,8 @@ jobs:
           v=${{ github.ref_name }}
           echo "TELEPRESENCE_VERSION=$v" >> "$GITHUB_ENV"
           echo "TELEPRESENCE_SEMVER=${v#v}" >> "$GITHUB_ENV"
+          echo "TELEPRESENCE_SOURCE_URL=${{ github.server_url }}/${{ github.repository }}" >> "$GITHUB_ENV"
+          echo "TELEPRESENCE_SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Setup docker buildx
         uses: docker/setup-buildx-action@v4
         with:
@@ -103,9 +105,7 @@ jobs:
           docker buildx build --platform=linux/amd64,linux/arm64 --build-arg TELEPRESENCE_VERSION=${{env.TELEPRESENCE_SEMVER}} \
           --push --tag ${{env.TELEPRESENCE_REGISTRY}}/telepresence:${{env.TELEPRESENCE_SEMVER}} -f build-aux/docker/images/Dockerfile.client .
       - name: Push tel2 image
-        run: |
-          docker buildx build --platform=linux/amd64,linux/arm64 --build-arg TELEPRESENCE_VERSION=${{env.TELEPRESENCE_SEMVER}} \
-          --push --tag ${{env.TELEPRESENCE_REGISTRY}}/tel2:${{env.TELEPRESENCE_SEMVER}} -f build-aux/docker/images/Dockerfile.traffic .
+        run: make push-tel2-release-image
       - name: Push routeController image
         run: |
           docker buildx build --platform=linux/amd64,linux/arm64 \
