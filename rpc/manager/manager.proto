@@ -1084,6 +1084,51 @@ message NamespaceList {
   repeated string namespaces = 1;
 }
 
+// InterceptRouteWorkload identifies a workload participating in a route.
+message InterceptRouteWorkload {
+  string namespace = 1;
+  string workload_kind = 2;
+  string workload_name = 3;
+}
+
+// InterceptRoute contains only the information needed to configure routing for
+// an intercept. Client, pod, tunnel, mount and environment data are omitted.
+message InterceptRoute {
+  // Stable opaque route identifier; this is not the manager's intercept ID.
+  string id = 1;
+  string name = 2;
+  string namespace = 3;
+  string workload_name = 4;
+  string workload_kind = 5;
+  string mechanism = 6;
+  int32 container_port = 7;
+  InterceptDispositionType disposition = 8;
+  bool wiretap = 9;
+  map<string,string> header_filters = 10;
+  repeated string path_filters = 11;
+  repeated InterceptRouteWorkload service_workloads = 12;
+}
+
+// WatchInterceptRoutesRequest explicitly scopes the routes observed. Every
+// namespace must be authorized; an empty list or more than 256 entries is invalid.
+message WatchInterceptRoutesRequest {
+  repeated string namespaces = 1;
+}
+
+// InterceptRouteSnapshot is the complete set of routes currently known to this
+// manager instance in the requested namespaces. After a manager restart, clients
+// and agents restore routes asynchronously, so the first snapshots can be empty
+// or incomplete. An observer should preserve previously installed routes during
+// recovery when manager_instance_id changes.
+message InterceptRouteSnapshot {
+  repeated InterceptRoute routes = 1;
+
+  // Opaque identifier for this manager process, stable across snapshots and
+  // reopened watches. It changes when the manager restarts; it identifies
+  // neither a client session nor the manager installation.
+  string manager_instance_id = 2;
+}
+
 service Manager {
   // Version returns the version information of the Manager.
   rpc Version(google.protobuf.Empty) returns (VersionInfo2);
@@ -1157,9 +1202,8 @@ service Manager {
   // WatchIntercepts notifies a client or agent of the set of intercepts
   // relevant to that client or agent.
   //
-  // If a session ID is given, then only intercepts associated with
-  // that session are watched.  If no session ID is given, then all
-  // intercepts are watched.
+  // An active session ID is required. Clients see only their own intercepts;
+  // agents see only intercepts associated with their workload.
   rpc WatchIntercepts(SessionInfo) returns (stream InterceptInfoSnapshot);
 
   // WatchInterceptsDelta notifies a client or agent of changes in the set of intercepts
@@ -1279,4 +1323,11 @@ service Manager {
   // UninstallAgents will uninstall the traffic-agent from the given workloads (or all
   // workloads if the list is empty).
   rpc UninstallAgents(UninstallAgentsRequest) returns (google.protobuf.Empty);
+
+  // WatchInterceptRoutes streams full routing snapshots to an authenticated
+  // observer on the internal listener. The caller must be allowed to watch
+  // interceptroutes.telepresence.io in every requested namespace. The stream
+  // closes normally after five minutes; the observer must reconnect. A change
+  // of manager_instance_id indicates that routes may still be recovering.
+  rpc WatchInterceptRoutes(WatchInterceptRoutesRequest) returns (stream InterceptRouteSnapshot);
 }

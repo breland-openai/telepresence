@@ -23,6 +23,7 @@ import (
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/clog/handler"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/auth"
+	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
 )
 
@@ -128,6 +129,70 @@ func TestInterceptor_Stream(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, seen)
 	assert.Equal(t, "u", seen.Username)
+}
+
+func TestInterceptor_InterceptRouteObserverRequiresBearerInEveryMode(t *testing.T) {
+	const method = "/telepresence.manager.Manager/WatchInterceptRoutes"
+	for _, mode := range []auth.Mode{auth.ModeDisabled, auth.ModePermissive, auth.ModeEnforcing} {
+		t.Run(mode.String(), func(t *testing.T) {
+			ci := fake.NewClientset()
+			k8sapi.InstallFakeTokenReviews(ci, func(token string, audiences []string) *authnv1.TokenReviewStatus {
+				if (token == "good" && len(audiences) == 1 && audiences[0] == agentconfig.ManagerTokenAudience) || (token == "api-only" && len(audiences) == 0) {
+					s := authenticatedStatus("system:serviceaccount:routing:observer", "observer-uid")
+					s.Audiences = audiences
+					return s
+				}
+				return &authnv1.TokenReviewStatus{Authenticated: false}
+			})
+			a := auth.NewAuthenticator(ci)
+			ordinary, err := a.Authenticate(context.Background(), "api-only")
+			require.NoError(t, err)
+			require.Equal(t, "observer-uid", ordinary.UID)
+			i := auth.NewInterceptor(a, mode)
+			info := &grpc.StreamServerInfo{FullMethod: method, IsServerStream: true}
+			for _, tc := range []struct {
+				name, credential string
+				want             codes.Code
+			}{
+				{name: "no bearer", want: codes.Unauthenticated},
+				{name: "invalid bearer", credential: "Bearer bad", want: codes.Unauthenticated},
+				{name: "cached ordinary API audience bearer", credential: "Bearer api-only", want: codes.Unauthenticated},
+				{name: "verified bearer", credential: "Bearer good", want: codes.OK},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					ctx := context.Background()
+					if tc.credential != "" {
+						ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("authorization", tc.credential))
+					}
+					called := false
+					err := i.Stream()(nil, &fakeServerStream{ctx: ctx}, info, func(_ any, ss grpc.ServerStream) error {
+						called = true
+						p := auth.PrincipalFrom(ss.Context())
+						require.NotNil(t, p)
+						require.Equal(t, "observer-uid", p.UID)
+						return nil
+					})
+					require.Equal(t, tc.want, status.Code(err))
+					require.Equal(t, tc.want == codes.OK, called)
+				})
+			}
+			t.Run("token review outage", func(t *testing.T) {
+				failed := fake.NewClientset()
+				failed.PrependReactor("create", "tokenreviews", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("Kubernetes unavailable")
+				})
+				i := auth.NewInterceptor(auth.NewAuthenticator(failed), mode)
+				ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer outage"))
+				called := false
+				err := i.Stream()(nil, &fakeServerStream{ctx: ctx}, info, func(any, grpc.ServerStream) error {
+					called = true
+					return nil
+				})
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.False(t, called)
+			})
+		})
+	}
 }
 
 func TestInterceptorExpiredCallerSkipsHandler(t *testing.T) {

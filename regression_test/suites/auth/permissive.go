@@ -12,8 +12,8 @@ import (
 )
 
 // AuthPermissive proves that security.authentication.mode=permissive leaves
-// the standard connect/intercept flow unaffected, and never rejects a call
-// for lacking a bearer token.
+// standard connect/intercept unaffected while protected observers still require
+// a verified identity.
 type AuthPermissive struct {
 	rt.Suite
 }

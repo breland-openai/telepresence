@@ -252,6 +252,46 @@ Without direct `pods/portforward` in the namespace, all attachment traffic
 is routed via the traffic-manager, at a modest throughput cost, unless the
 [QUIC transport](quic-transport.md) provides the direct path instead.
 
+### Routing observers
+
+An in-cluster routing controller can watch the routes for intercepts belonging
+to other clients with the internal `WatchInterceptRoutes` gRPC API. The chart
+does not include this permission in the client roles. Bind a dedicated
+ServiceAccount to this rule in each namespace the controller must observe:
+
+```yaml
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: telepresence-routing-observer
+  namespace: some-namespace
+rules:
+  - apiGroups: ["telepresence.io"]
+    resources: ["interceptroutes"]
+    verbs: ["watch"]
+```
+
+The controller must supply explicit namespaces and a verified Kubernetes bearer
+token, even when general manager authentication is disabled or permissive. Each
+watch can request up to 256 namespaces.
+Use a projected ServiceAccount token with the `traffic-manager` audience and
+an encrypted connection to the internal manager listener. The controller cannot
+use a token intended only for the Kubernetes API or minted by the external
+listener. A request for any unauthorized namespace is rejected in full. The
+resulting snapshots contain route and workload names, port, status, mechanism,
+and HTTP filters; they omit
+client, pod, tunnel, mount, and environment data. Cross-namespace participants
+are visible only when their namespace was also requested and authorized. The
+controller must reconnect after five minutes to renew its token and grant.
+
+Every snapshot includes an opaque manager instance ID. It stays the same across
+watches of the same manager process and changes when the manager restarts.
+Clients and agents restore intercepts asynchronously after a restart, so an
+empty or partial snapshot from a new manager instance does not establish that
+previous routes were removed. A controller should preserve previously installed
+routes during a bounded recovery period before replacing or removing them. The
+API does not indicate when all clients have finished reconnecting.
+
 ### Legacy access
 
 Clients that predate the known-name connection cannot dial
