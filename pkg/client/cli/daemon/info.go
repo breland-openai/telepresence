@@ -32,6 +32,7 @@ type RootInfo struct {
 
 type Info struct {
 	Name         string     `json:"name,omitempty"`
+	HostID       string     `json:"host_id,omitempty"`
 	KubeContext  string     `json:"kube_context,omitempty"`
 	Namespace    string     `json:"namespace,omitempty"`
 	DaemonPort   uint16     `json:"daemon_port,omitempty"`
@@ -258,6 +259,10 @@ func (il *InfoLoader[T]) infoFiles() ([]fs.DirEntry, error) {
 }
 
 func (il *InfoLoader[T]) deleteIfStale(name string, fi fs.FileInfo) error {
+	if il.dirName == daemonsDirName && name == InfoFileName {
+		// Host ownership is checked against its listener before removal.
+		return nil
+	}
 	age := time.Since(fi.ModTime())
 	if age > maxNoSignOfLife {
 		name = filepath.Join(il.dirName, name)
@@ -319,7 +324,7 @@ func (il *InfoLoader[T]) LoadMatchingInfo(match *regexp.Regexp) (*T, error) {
 	}
 	switch len(infos) {
 	case 0:
-		if match == nil {
+		if match != nil {
 			err = fmt.Errorf("unable to find daemon info matching %s: %w", match, os.ErrNotExist)
 		} else {
 			err = fmt.Errorf("unable to find daemon info: %w", os.ErrNotExist)
