@@ -181,11 +181,22 @@ func (n *serviceNativeOpen) open(raw grpc.BidiStreamingServer[manager.TunnelMess
 	}
 }
 
-func (n *serviceNativeOpen) snapshot() ([]tunnel.ConnID, []tunnel.SessionID, []time.Time, []bool, [][]byte) {
+type serviceNativeSnapshot struct {
+	requests         []tunnel.ConnID
+	sessions         []tunnel.SessionID
+	deadlines        []time.Time
+	oldAlreadyEnded  []bool
+	applicationBytes [][]byte
+}
+
+func (n *serviceNativeOpen) snapshot() serviceNativeSnapshot {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return append([]tunnel.ConnID(nil), n.requests...), append([]tunnel.SessionID(nil), n.sessions...),
-		append([]time.Time(nil), n.deadlines...), append([]bool(nil), n.oldAlreadyEnded...), append([][]byte(nil), n.applicationBytes...)
+	return serviceNativeSnapshot{
+		requests: append([]tunnel.ConnID(nil), n.requests...), sessions: append([]tunnel.SessionID(nil), n.sessions...),
+		deadlines: append([]time.Time(nil), n.deadlines...), oldAlreadyEnded: append([]bool(nil), n.oldAlreadyEnded...),
+		applicationBytes: append([][]byte(nil), n.applicationBytes...),
+	}
 }
 
 type serviceNativeAgent struct {
@@ -231,7 +242,15 @@ func serviceNativeConn(t *testing.T, name string, register func(*grpc.Server)) (
 	return conn, stop
 }
 
-func newServiceNativeSession(t *testing.T, ag, mgr *serviceNativeOpen) (*session, *serviceFallbackClients, *observedServiceAgent, *grpc.ClientConn, func()) {
+type serviceNativeFixture struct {
+	session  *session
+	clients  *serviceFallbackClients
+	observed *observedServiceAgent
+	conn     *grpc.ClientConn
+	stop     func()
+}
+
+func newServiceNativeSession(t *testing.T, ag, mgr *serviceNativeOpen) serviceNativeFixture {
 	t.Helper()
 	ctx := client.WithConfig(t.Context(), client.GetDefaultConfig())
 	s := newTestStreamSession(ctx)
@@ -249,7 +268,7 @@ func newServiceNativeSession(t *testing.T, ag, mgr *serviceNativeOpen) (*session
 	mgr.agent = observed
 	clients := &serviceFallbackClients{provider: observed}
 	s.agentClients = clients
-	return s, clients, observed, conn, stop
+	return serviceNativeFixture{session: s, clients: clients, observed: observed, conn: conn, stop: stop}
 }
 
 func serviceFallbackID(destination string) tunnel.ConnID {
@@ -275,22 +294,23 @@ func requireServiceManagerRoundtrip(t *testing.T, s *session, ctx context.Contex
 	response, err := stream.Receive(ctx)
 	require.NoError(t, err)
 	require.Equal(t, request, response.Payload())
-	ids, sessions, deadlines, stopped, payloads := manager.snapshot()
-	require.Equal(t, []tunnel.ConnID{effective}, ids)
-	require.Equal(t, []tunnel.SessionID{"test-session"}, sessions)
+	observed := manager.snapshot()
+	require.Equal(t, []tunnel.ConnID{effective}, observed.requests)
+	require.Equal(t, []tunnel.SessionID{"test-session"}, observed.sessions)
 	deadline, ok := ctx.Deadline()
 	require.True(t, ok)
-	require.Len(t, deadlines, 1)
-	require.WithinDuration(t, deadline, deadlines[0], 100*time.Millisecond)
-	require.Equal(t, []bool{true}, stopped, "failed physical stream context must be canceled before opening the manager stream")
-	require.Equal(t, [][]byte{request}, payloads)
+	require.Len(t, observed.deadlines, 1)
+	require.WithinDuration(t, deadline, observed.deadlines[0], 100*time.Millisecond)
+	require.Equal(t, []bool{true}, observed.oldAlreadyEnded, "failed physical stream context must be canceled before opening the manager stream")
+	require.Equal(t, [][]byte{request}, observed.applicationBytes)
 	require.EqualValues(t, 1, s.outboundTunnels.Load())
 	require.Zero(t, s.outboundTunnelErrors.Load())
 }
 
 func TestOrdinaryServiceFallsBackWhenPhysicalAgentStreamCannotOpen(t *testing.T) {
 	ag, mgr := &serviceNativeOpen{}, &serviceNativeOpen{}
-	s, clients, observed, conn, stop := newServiceNativeSession(t, ag, mgr)
+	fixture := newServiceNativeSession(t, ag, mgr)
+	s, clients, observed, conn, stop := fixture.session, fixture.clients, fixture.observed, fixture.conn, fixture.stop
 	stop()
 	ctx, cancel := context.WithTimeout(s, 5*time.Second)
 	defer cancel()
@@ -326,7 +346,8 @@ func TestOrdinaryServiceFallsBackWhenRetiringPhysicalAgentDiesBeforeStreamOK(t *
 		return raw.Context().Err()
 	}}
 	mgr := &serviceNativeOpen{}
-	s, _, observed, _, stop := newServiceNativeSession(t, ag, mgr)
+	fixture := newServiceNativeSession(t, ag, mgr)
+	s, observed, stop := fixture.session, fixture.observed, fixture.stop
 	ctx, cancel := context.WithTimeout(s, 5*time.Second)
 	defer cancel()
 	go func() {
@@ -350,7 +371,7 @@ func TestOrdinaryServiceEarlyEOFKeepsNativeAgentStatus(t *testing.T) {
 			return err
 		}}
 		mgr := &serviceNativeOpen{}
-		s, _, _, _, _ := newServiceNativeSession(t, ag, mgr)
+		s := newServiceNativeSession(t, ag, mgr).session
 		ctx, cancel := context.WithTimeout(s, 5*time.Second)
 		defer cancel()
 		id := serviceFallbackID("10.96.67.127:8080")
@@ -362,7 +383,8 @@ func TestOrdinaryServiceEarlyEOFKeepsNativeAgentStatus(t *testing.T) {
 			return status.Error(codes.PermissionDenied, "authoritative real agent refusal")
 		}}
 		mgr := &serviceNativeOpen{}
-		s, _, observed, _, _ := newServiceNativeSession(t, ag, mgr)
+		fixture := newServiceNativeSession(t, ag, mgr)
+		s, observed := fixture.session, fixture.observed
 		sent := make(chan error, 1)
 		observed.Provider = terminalBeforeServiceSend{Provider: observed.Provider, sent: sent}
 		ctx, cancel := context.WithTimeout(s, 5*time.Second)
@@ -374,15 +396,16 @@ func TestOrdinaryServiceEarlyEOFKeepsNativeAgentStatus(t *testing.T) {
 		agentCtx, creationErr := observed.first()
 		require.ErrorIs(t, agentCtx.Err(), context.Canceled)
 		require.Equal(t, []error{nil}, creationErr)
-		managerIDs, _, _, _, managerPayload := mgr.snapshot()
-		require.Empty(t, managerIDs)
-		require.Empty(t, managerPayload)
+		managerObserved := mgr.snapshot()
+		require.Empty(t, managerObserved.requests)
+		require.Empty(t, managerObserved.applicationBytes)
 	})
 
 	t.Run("a genuine agent acknowledgment behind Send EOF never retries", func(t *testing.T) {
 		ag := &serviceNativeOpen{}
 		mgr := &serviceNativeOpen{}
-		s, _, observed, _, _ := newServiceNativeSession(t, ag, mgr)
+		fixture := newServiceNativeSession(t, ag, mgr)
+		s, observed := fixture.session, fixture.observed
 		observed.Provider = eofAfterServiceNativeSend{observed.Provider}
 		ctx, cancel := context.WithTimeout(s, 5*time.Second)
 		defer cancel()
@@ -391,16 +414,15 @@ func TestOrdinaryServiceEarlyEOFKeepsNativeAgentStatus(t *testing.T) {
 		require.Nil(t, stream)
 		require.Equal(t, codes.FailedPrecondition, status.Code(err))
 		require.Eventually(t, func() bool {
-			ids, _, _, _, _ := ag.snapshot()
-			return len(ids) == 1
+			return len(ag.snapshot().requests) == 1
 		}, time.Second, 10*time.Millisecond)
-		agentIDs, sessions, _, _, agentPayload := ag.snapshot()
-		require.Equal(t, []tunnel.ConnID{id}, agentIDs, "the real bufconn agent read and confirmed the original stream")
-		require.Equal(t, []tunnel.SessionID{"test-session"}, sessions)
-		require.Empty(t, agentPayload)
-		managerIDs, _, _, _, managerPayload := mgr.snapshot()
-		require.Empty(t, managerIDs)
-		require.Empty(t, managerPayload)
+		agentObserved := ag.snapshot()
+		require.Equal(t, []tunnel.ConnID{id}, agentObserved.requests, "the real bufconn agent read and confirmed the original stream")
+		require.Equal(t, []tunnel.SessionID{"test-session"}, agentObserved.sessions)
+		require.Empty(t, agentObserved.applicationBytes)
+		managerObserved := mgr.snapshot()
+		require.Empty(t, managerObserved.requests)
+		require.Empty(t, managerObserved.applicationBytes)
 	})
 }
 
@@ -423,7 +445,8 @@ func TestOrdinaryServiceTunnelFallbackPreservesMandatoryRoutesAndErrors(t *testi
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			mgr := &serviceNativeOpen{}
-			s, clients, _, _, _ := newServiceNativeSession(t, serviceFallbackAgentEarlyError(test.code), mgr)
+			fixture := newServiceNativeSession(t, serviceFallbackAgentEarlyError(test.code), mgr)
+			s, clients := fixture.session, fixture.clients
 			if test.overlap {
 				s.serviceSubnets = append(s.serviceSubnets, netip.MustParsePrefix("10.244.0.0/16"))
 			}
@@ -439,8 +462,7 @@ func TestOrdinaryServiceTunnelFallbackPreservesMandatoryRoutesAndErrors(t *testi
 			stream, err := s.streamCreator()(ctx, id)
 			require.Nil(t, stream)
 			require.Equal(t, test.code, status.Code(err))
-			ids, _, _, _, _ := mgr.snapshot()
-			require.Empty(t, ids)
+			require.Empty(t, mgr.snapshot().requests)
 			generic, workloads := clients.selected()
 			if test.namedWorkload {
 				require.Empty(t, generic)
@@ -458,7 +480,8 @@ func TestOrdinaryServiceTunnelFallbackPreservesMandatoryRoutesAndErrors(t *testi
 func TestOrdinaryServiceTunnelKeepsExplicitManagerAndDoesNotReplayEstablishedAgent(t *testing.T) {
 	t.Run("also-proxy uses manager without choosing an agent", func(t *testing.T) {
 		mgr := &serviceNativeOpen{}
-		s, clients, _, _, _ := newServiceNativeSession(t, serviceFallbackAgentEarlyError(codes.Unavailable), mgr)
+		fixture := newServiceNativeSession(t, serviceFallbackAgentEarlyError(codes.Unavailable), mgr)
+		s, clients := fixture.session, fixture.clients
 		s.alsoProxySubnets = []netip.Prefix{netip.MustParsePrefix("10.96.0.0/12")}
 		ctx, cancel := context.WithTimeout(s, 5*time.Second)
 		defer cancel()
@@ -468,9 +491,9 @@ func TestOrdinaryServiceTunnelKeepsExplicitManagerAndDoesNotReplayEstablishedAge
 		require.NoError(t, stream.Send(ctx, tunnel.NewMessage(tunnel.Normal, []byte("manager"))))
 		_, err = stream.Receive(ctx)
 		require.NoError(t, err)
-		ids, _, _, _, payloads := mgr.snapshot()
-		require.Equal(t, []tunnel.ConnID{id}, ids)
-		require.Equal(t, [][]byte{[]byte("manager")}, payloads)
+		observed := mgr.snapshot()
+		require.Equal(t, []tunnel.ConnID{id}, observed.requests)
+		require.Equal(t, [][]byte{[]byte("manager")}, observed.applicationBytes)
 		generic, workloads := clients.selected()
 		require.Empty(t, generic)
 		require.Empty(t, workloads)
@@ -484,7 +507,7 @@ func TestOrdinaryServiceTunnelKeepsExplicitManagerAndDoesNotReplayEstablishedAge
 			return status.Error(codes.Unavailable, "physical agent ended after confirming its protocol stream")
 		}}
 		mgr := &serviceNativeOpen{}
-		s, _, _, _, _ := newServiceNativeSession(t, ag, mgr)
+		s := newServiceNativeSession(t, ag, mgr).session
 		ctx, cancel := context.WithTimeout(s, 5*time.Second)
 		defer cancel()
 		id := serviceFallbackID("10.96.67.127:8080")
@@ -492,14 +515,14 @@ func TestOrdinaryServiceTunnelKeepsExplicitManagerAndDoesNotReplayEstablishedAge
 		require.NoError(t, err)
 		_, err = stream.Receive(ctx)
 		require.Equal(t, codes.Unavailable, status.Code(err))
-		managerIDs, _, _, _, managerPayload := mgr.snapshot()
-		require.Empty(t, managerIDs)
-		require.Empty(t, managerPayload)
+		managerObserved := mgr.snapshot()
+		require.Empty(t, managerObserved.requests)
+		require.Empty(t, managerObserved.applicationBytes)
 	})
 
 	t.Run("confirmed stream never replays application bytes", func(t *testing.T) {
 		ag, mgr := &serviceNativeOpen{failAfterPayload: true}, &serviceNativeOpen{}
-		s, _, _, _, _ := newServiceNativeSession(t, ag, mgr)
+		s := newServiceNativeSession(t, ag, mgr).session
 		ctx, cancel := context.WithTimeout(s, 5*time.Second)
 		defer cancel()
 		id := serviceFallbackID("10.96.67.127:8080")
@@ -509,12 +532,12 @@ func TestOrdinaryServiceTunnelKeepsExplicitManagerAndDoesNotReplayEstablishedAge
 		require.NoError(t, stream.Send(ctx, tunnel.NewMessage(tunnel.Normal, payload)))
 		_, err = stream.Receive(ctx)
 		require.Equal(t, codes.Unavailable, status.Code(err))
-		agentIDs, _, _, _, sent := ag.snapshot()
-		require.Equal(t, []tunnel.ConnID{id}, agentIDs)
-		require.Equal(t, [][]byte{payload}, sent)
-		managerIDs, _, _, _, managerPayload := mgr.snapshot()
-		require.Empty(t, managerIDs)
-		require.Empty(t, managerPayload)
+		agentObserved := ag.snapshot()
+		require.Equal(t, []tunnel.ConnID{id}, agentObserved.requests)
+		require.Equal(t, [][]byte{payload}, agentObserved.applicationBytes)
+		managerObserved := mgr.snapshot()
+		require.Empty(t, managerObserved.requests)
+		require.Empty(t, managerObserved.applicationBytes)
 	})
 }
 
@@ -529,7 +552,7 @@ func TestOrdinaryServiceDoesNotFallbackWhenCallerCancelsEarlyAgentStream(t *test
 		return status.Error(codes.Unavailable, "agent ended after caller cancellation")
 	}}
 	mgr := &serviceNativeOpen{}
-	s, _, _, _, _ := newServiceNativeSession(t, ag, mgr)
+	s := newServiceNativeSession(t, ag, mgr).session
 	ctx, cancel := context.WithTimeout(s, 5*time.Second)
 	defer cancel()
 	go func() {
@@ -542,7 +565,7 @@ func TestOrdinaryServiceDoesNotFallbackWhenCallerCancelsEarlyAgentStream(t *test
 	stream, err := s.streamCreator()(ctx, serviceFallbackID("10.96.67.127:8080"))
 	require.Nil(t, stream)
 	require.Equal(t, codes.Canceled, status.Code(err))
-	managerIDs, _, _, _, managerPayload := mgr.snapshot()
-	require.Empty(t, managerIDs)
-	require.Empty(t, managerPayload)
+	managerObserved := mgr.snapshot()
+	require.Empty(t, managerObserved.requests)
+	require.Empty(t, managerObserved.applicationBytes)
 }
