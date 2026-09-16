@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -19,6 +20,213 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
 	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
 )
+
+type workloadReadyTestClient struct{ agent.AgentClient }
+
+func TestWaitForWorkloadFirstCallerWaitsForRealAgentDelta(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cs := newTestClients(tpClient.WithConfig(t.Context(), tpClient.GetDefaultConfig()), "alpha")
+		first, second := make(chan error, 1), make(chan error, 1)
+		go func() { first <- cs.WaitForWorkload(t.Context(), time.Minute, "missing") }()
+		synctest.Wait()
+		waiter, ok := cs.wlWaiters.Load("missing")
+		require.True(t, ok)
+		require.NotNil(t, waiter)
+		select {
+		case err := <-first:
+			t.Fatalf("first wait for an absent workload returned before its agent delta: %v", err)
+		default:
+		}
+		go func() { second <- cs.WaitForWorkload(t.Context(), time.Minute, "missing") }()
+		synctest.Wait()
+		select {
+		case err := <-second:
+			t.Fatalf("second wait for an absent workload returned before its agent delta: %v", err)
+		default:
+		}
+		info := podInfo("missing", "alpha", "10.0.0.1")
+		cs.clients.Store("missing.alpha", &client{Cluster: cs.Cluster, info: info, cli: &workloadReadyTestClient{}})
+		require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"missing.alpha": info}, nil))
+		synctest.Wait()
+		require.NoError(t, <-first)
+		require.NoError(t, <-second)
+		require.NoError(t, cs.WaitForWorkload(t.Context(), time.Minute, "missing"))
+	})
+}
+
+func TestWaitForWorkloadCancellationDoesNotCancelOtherCallersOrSession(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		persistent, stopSession := context.WithCancel(tpClient.WithConfig(t.Context(), tpClient.GetDefaultConfig()))
+		defer stopSession()
+		cs := newTestClients(persistent, "alpha")
+		firstCtx, stopFirst := context.WithCancel(t.Context())
+		defer stopFirst()
+		secondCtx, stopSecond := context.WithCancel(t.Context())
+		defer stopSecond()
+		first, second := make(chan error, 1), make(chan error, 1)
+		go func() { first <- cs.WaitForWorkload(firstCtx, time.Minute, "missing") }()
+		go func() { second <- cs.WaitForWorkload(secondCtx, time.Minute, "missing") }()
+		synctest.Wait()
+		stopFirst()
+		synctest.Wait()
+		require.ErrorIs(t, <-first, context.Canceled)
+		require.NoError(t, persistent.Err())
+		select {
+		case err := <-second:
+			t.Fatalf("another caller's cancellation ended the workload waiter: %v", err)
+		default:
+		}
+		stopSecond()
+		synctest.Wait()
+		require.ErrorIs(t, <-second, context.Canceled)
+		require.NoError(t, persistent.Err())
+	})
+}
+
+func TestWaitForWorkloadFirstCallerUsesConfiguredDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cs := newTestClients(tpClient.WithConfig(t.Context(), tpClient.GetDefaultConfig()), "alpha")
+		start := time.Now()
+		err := cs.WaitForWorkload(t.Context(), 20*time.Millisecond, "missing")
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Equal(t, 20*time.Millisecond, time.Since(start))
+	})
+}
+
+func TestWaitForWorkloadSameNameInOtherMappedNamespaceCannotRelease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cs := newTestClients(tpClient.WithConfig(t.Context(), tpClient.GetDefaultConfig()), "alpha")
+		cs.setNamespaces([]string{"alpha", "other"})
+		cs.SetProxyVia("same")
+		result := make(chan error, 1)
+		go func() { result <- cs.WaitForWorkload(t.Context(), time.Minute, "same") }()
+		synctest.Wait()
+		otherInfo := podInfo("same", "other", "10.0.0.1")
+		cs.clients.Store("same.other", &client{Cluster: cs.Cluster, info: otherInfo, cli: &workloadReadyTestClient{}})
+		require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"same.other": otherInfo}, nil))
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("connected matching workload in a different namespace released primary readiness: %v", err)
+		default:
+		}
+		_, waiterStillStored := cs.wlWaiters.Load("same")
+		require.True(t, waiterStillStored)
+		require.False(t, cs.isProxyVIA(otherInfo))
+		require.False(t, cs.hasWaiterFor(otherInfo))
+		primaryInfo := podInfo("same", "alpha", "10.0.0.2")
+		cs.clients.Store("same.alpha", &client{Cluster: cs.Cluster, info: primaryInfo, cli: &workloadReadyTestClient{}})
+		require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"same.alpha": primaryInfo}, nil))
+		synctest.Wait()
+		require.NoError(t, <-result)
+		require.True(t, cs.isProxyVIA(primaryInfo))
+		require.NotNil(t, cs.GetWorkloadClient("same"))
+	})
+}
+
+func TestWaitForWorkloadRetriesFailedNativeDialWithoutAnotherAgentDelta(t *testing.T) {
+	config := tpClient.GetDefaultConfig()
+	config.Timeouts().PrivateTrafficAgentConnect = 30 * time.Millisecond
+	ctx := k8sapi.WithK8sInterface(tpClient.WithConfig(t.Context(), config), fake.NewClientset())
+	cs := newTestClients(ctx, "alpha")
+	cs.SetProxyVia("same")
+	info := podInfo("same", "alpha", "10.0.0.1")
+	info.PodId, info.ApiPort = "native-dial", 9900
+	require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"same.alpha": info}, nil))
+	_, exists := cs.clients.Load("same.alpha")
+	require.True(t, exists)
+	result := make(chan error, 1)
+	go func() { result <- cs.WaitForWorkload(ctx, time.Second, "same") }()
+	require.Eventually(t, func() bool {
+		_, stillPresent := cs.clients.Load("same.alpha")
+		return !stillPresent
+	}, time.Second, 5*time.Millisecond, "native gRPC route failure must remove its failed live client")
+	select {
+	case err := <-result:
+		t.Fatalf("a registered agent with a failed native route marked workload readiness: %v", err)
+	default:
+	}
+	_, _, snapshotStillPresent := cs.WorkloadForIP(netip.MustParseAddr("10.0.0.1"))
+	require.True(t, snapshotStillPresent, "the only manager delta stays authoritative after the dial failure")
+	cs.clients.Store("same.alpha", &client{
+		Cluster: cs.Cluster, owner: cs, info: info, cli: &workloadReadyTestClient{}, remove: func() { cs.clients.Delete("same.alpha") },
+	})
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("the periodic workload retry did not use the same manager snapshot once the agent became reachable")
+	}
+	require.NoError(t, ctx.Err())
+}
+
+func TestWaitForWorkloadRegisteredButUnreachableNativeAgentExhaustsDeadline(t *testing.T) {
+	config := tpClient.GetDefaultConfig()
+	config.Timeouts().PrivateTrafficAgentConnect = 20 * time.Millisecond
+	ctx := k8sapi.WithK8sInterface(tpClient.WithConfig(t.Context(), config), fake.NewClientset())
+	cs := newTestClients(ctx, "alpha")
+	info := podInfo("same", "alpha", "10.0.0.1")
+	info.PodId, info.ApiPort = "native-dial", 9900
+	require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"same.alpha": info}, nil))
+	start := time.Now()
+	err := cs.WaitForWorkload(ctx, 100*time.Millisecond, "same")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.GreaterOrEqual(t, time.Since(start), 100*time.Millisecond)
+	require.NoError(t, ctx.Err())
+}
+
+func TestWaitForWorkloadDisabledByAgentMetadataCannotReportReady(t *testing.T) {
+	ctx := tpClient.WithConfig(t.Context(), tpClient.GetDefaultConfig())
+	cs := newTestClients(ctx, "alpha")
+	old := &manager.AgentPodInfo{Namespace: "alpha", WorkloadName: "same"}
+	require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"same.alpha": old}, nil))
+	err := cs.WaitForWorkload(ctx, time.Second, "same")
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.ErrorContains(t, err, "agent port-forwards are unavailable in namespace alpha")
+}
+
+func TestWaitForWorkloadHealthyReplicaDoesNotWaitBehindUnreachableReplica(t *testing.T) {
+	config := tpClient.GetDefaultConfig()
+	config.Timeouts().PrivateTrafficAgentConnect = 500 * time.Millisecond
+	ctx := k8sapi.WithK8sInterface(tpClient.WithConfig(t.Context(), config), fake.NewClientset())
+	cs := newTestClients(ctx, "alpha")
+	cs.SetProxyVia("same")
+	stale := podInfo("a-stale", "alpha", "10.0.0.1")
+	stale.PodId, stale.ApiPort, stale.WorkloadName = "stale-native-dial", 9900, "same"
+	healthy := podInfo("z-healthy", "alpha", "10.0.0.2")
+	healthy.PodId, healthy.ApiPort, healthy.WorkloadName = "healthy-native-dial", 9900, "same"
+	healthyLive := &client{
+		Cluster: cs.Cluster, owner: cs, info: healthy, cli: &workloadReadyTestClient{}, remove: func() { cs.clients.Delete("z-healthy.alpha") },
+	}
+	cs.clients.Store("z-healthy.alpha", healthyLive)
+	require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"a-stale.alpha": stale, "z-healthy.alpha": healthy}, nil))
+	start := time.Now()
+	require.NoError(t, cs.WaitForWorkload(ctx, 250*time.Millisecond, "same"))
+	require.Less(t, time.Since(start), 250*time.Millisecond)
+	for range 10 {
+		require.Same(t, healthyLive, cs.GetWorkloadClient("same"), "the real outbound proxy must select the replica startup proved reachable")
+	}
+}
+
+func TestGetWorkloadClientPrefersReachablePrimaryReplicaAndExcludesNodeAgents(t *testing.T) {
+	cs := newTestClients(t.Context(), "alpha")
+	addWorkloadLookupClient(t, cs, "first-unreachable", "alpha", "target", false, false)
+	addWorkloadLookupClient(t, cs, "first-outside", "other", "target", false, true)
+	addWorkloadLookupClient(t, cs, "first-node", "alpha", "target", true, true)
+	later, _ := addWorkloadLookupClient(t, cs, "later", "alpha", "target", false, true)
+	last, _ := addWorkloadLookupClient(t, cs, "last", "alpha", "target", false, true)
+	for range 10 {
+		require.Same(t, last, cs.GetWorkloadClient("target"))
+	}
+	cs.clients.Delete("last.alpha")
+	require.Same(t, later, cs.GetWorkloadClient("target"))
+	cs.clients.Delete("later.alpha")
+	unreachable, exists := cs.clients.Load("first-unreachable.alpha")
+	require.True(t, exists)
+	require.Same(t, unreachable, cs.GetWorkloadClient("target"))
+	cs.clients.Delete("first-unreachable.alpha")
+	require.Nil(t, cs.GetWorkloadClient("target"))
+}
 
 func TestWaitForIPUnavailableForUnwatchedNamespace(t *testing.T) {
 	cl := &k8s.Cluster{
