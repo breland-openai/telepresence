@@ -283,7 +283,7 @@ endif
 .PHONY: setup-build-dir
 setup-build-dir:
 	mkdir -p $(BUILDDIR)
-	printf $(TELEPRESENCE_VERSION) > $(BUILDDIR)/version.txt ## Pass version in a file instead of a --build-arg to maximize cache usage
+	printf $(TELEPRESENCE_VERSION) > $(BUILDDIR)/version.txt ## Client and route-controller images still read the version file
 	printf $(HELM_VERSION) > $(BUILDDIR)/helm-version.txt
 
 TELEPRESENCE_SEMVER=$(patsubst v%,%,$(TELEPRESENCE_VERSION))
@@ -297,7 +297,21 @@ images-deps: build-deps setup-build-dir
 tel2-image: images-deps
 	$(eval PLATFORM_ARG := $(if $(TELEPRESENCE_TEL2_IMAGE_PLATFORM), --platform=$(TELEPRESENCE_TEL2_IMAGE_PLATFORM),))
 	$(eval COVER_BUILD_ARG := $(if $(TELEPRESENCE_COVER), --build-arg TEL_COVER=-cover,))
-	docker build $(PLATFORM_ARG) $(COVER_BUILD_ARG) --target tel2 --tag tel2 --tag $(TEL2_IMAGE_FQN) -f build-aux/docker/images/Dockerfile.traffic .
+	docker build $(PLATFORM_ARG) $(COVER_BUILD_ARG) --build-arg TELEPRESENCE_VERSION=$(TELEPRESENCE_VERSION) --target tel2 --tag tel2 --tag $(TEL2_IMAGE_FQN) -f build-aux/docker/images/Dockerfile.traffic .
+
+TELEPRESENCE_SOURCE_URL ?= https://github.com/telepresenceio/telepresence
+.PHONY: push-tel2-release-image
+push-tel2-release-image: ## (Build) Push both manager/agent architectures from the exact remote Git commit with full provenance
+	@case "$(TELEPRESENCE_SOURCE_URL)" in https://*.git|https://*/) printf '%s\n' 'TELEPRESENCE_SOURCE_URL must omit .git and the trailing slash' >&2; exit 1 ;; https://*) ;; *) printf '%s\n' 'TELEPRESENCE_SOURCE_URL must be an HTTPS repository URL' >&2; exit 1 ;; esac; \
+	  printf '%s\n' "$(TELEPRESENCE_SOURCE_URL)" | grep -Eq '^https://[A-Za-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$$' || { printf '%s\n' 'TELEPRESENCE_SOURCE_URL must name one HTTPS host/owner/repository without credentials, query or fragment' >&2; exit 1; }; \
+	  printf '%s\n' "$(TELEPRESENCE_SOURCE_COMMIT)" | grep -Eq '^[0-9a-f]{40}$$' || { printf '%s\n' 'the full verified TELEPRESENCE_SOURCE_COMMIT is required' >&2; exit 1; }
+	docker buildx build --platform=linux/amd64,linux/arm64 --target tel2 --provenance=mode=max \
+	  --build-arg "TELEPRESENCE_VERSION=$(TELEPRESENCE_VERSION)" \
+	  --label "org.opencontainers.image.source=$(TELEPRESENCE_SOURCE_URL).git" \
+	  --label "org.opencontainers.image.revision=$(TELEPRESENCE_SOURCE_COMMIT)" \
+	  --label "org.opencontainers.image.version=$(TELEPRESENCE_SEMVER)" \
+	  --push --tag "$(TEL2_IMAGE_FQN)" -f build-aux/docker/images/Dockerfile.traffic \
+	  "$(TELEPRESENCE_SOURCE_URL).git#$(TELEPRESENCE_SOURCE_COMMIT)"
 
 .PHONY: client-image
 client-image: images-deps
