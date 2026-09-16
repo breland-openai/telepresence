@@ -217,6 +217,10 @@ func (s *externalService) WatchInterceptsDelta(session *rpc.SessionInfo, stream 
 	return s.inner.WatchInterceptsDelta(session, stream)
 }
 
+func (s *externalService) WatchInterceptRoutes(_ *rpc.WatchInterceptRoutesRequest, _ grpc.ServerStreamingServer[rpc.InterceptRouteSnapshot]) error {
+	return internalOnly("WatchInterceptRoutes")
+}
+
 func (s *externalService) WatchSessionEvents(request *rpc.SessionEventsRequest, stream grpc.ServerStreamingServer[rpc.SessionEventsDelta]) error {
 	if err := requireAuthenticated(stream.Context()); err != nil {
 		return err

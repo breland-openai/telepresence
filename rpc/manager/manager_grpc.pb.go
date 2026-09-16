@@ -67,6 +67,7 @@ const (
 	Manager_WatchQuicBackends_FullMethodName               = "/telepresence.manager.Manager/WatchQuicBackends"
 	Manager_ReportMetrics_FullMethodName                   = "/telepresence.manager.Manager/ReportMetrics"
 	Manager_UninstallAgents_FullMethodName                 = "/telepresence.manager.Manager/UninstallAgents"
+	Manager_WatchInterceptRoutes_FullMethodName            = "/telepresence.manager.Manager/WatchInterceptRoutes"
 )
 
 // ManagerClient is the client API for Manager service.
@@ -127,9 +128,8 @@ type ManagerClient interface {
 	// WatchIntercepts notifies a client or agent of the set of intercepts
 	// relevant to that client or agent.
 	//
-	// If a session ID is given, then only intercepts associated with
-	// that session are watched.  If no session ID is given, then all
-	// intercepts are watched.
+	// An active session ID is required. Clients see only their own intercepts;
+	// agents see only intercepts associated with their workload.
 	WatchIntercepts(ctx context.Context, in *SessionInfo, opts ...grpc.CallOption) (grpc.ServerStreamingClient[InterceptInfoSnapshot], error)
 	// WatchInterceptsDelta notifies a client or agent of changes in the set of intercepts
 	// relevant to that client or agent.
@@ -225,6 +225,11 @@ type ManagerClient interface {
 	// UninstallAgents will uninstall the traffic-agent from the given workloads (or all
 	// workloads if the list is empty).
 	UninstallAgents(ctx context.Context, in *UninstallAgentsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// WatchInterceptRoutes streams full routing snapshots to an authenticated
+	// observer on the internal listener. The caller must be allowed to watch
+	// interceptroutes.telepresence.io in every requested namespace. The stream
+	// closes normally after five minutes; the observer must reconnect.
+	WatchInterceptRoutes(ctx context.Context, in *WatchInterceptRoutesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[InterceptRouteSnapshot], error)
 }
 
 type managerClient struct {
@@ -794,6 +799,25 @@ func (c *managerClient) UninstallAgents(ctx context.Context, in *UninstallAgents
 	return out, nil
 }
 
+func (c *managerClient) WatchInterceptRoutes(ctx context.Context, in *WatchInterceptRoutesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[InterceptRouteSnapshot], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Manager_ServiceDesc.Streams[15], Manager_WatchInterceptRoutes_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchInterceptRoutesRequest, InterceptRouteSnapshot]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Manager_WatchInterceptRoutesClient = grpc.ServerStreamingClient[InterceptRouteSnapshot]
+
 // ManagerServer is the server API for Manager service.
 // All implementations must embed UnimplementedManagerServer
 // for forward compatibility.
@@ -852,9 +876,8 @@ type ManagerServer interface {
 	// WatchIntercepts notifies a client or agent of the set of intercepts
 	// relevant to that client or agent.
 	//
-	// If a session ID is given, then only intercepts associated with
-	// that session are watched.  If no session ID is given, then all
-	// intercepts are watched.
+	// An active session ID is required. Clients see only their own intercepts;
+	// agents see only intercepts associated with their workload.
 	WatchIntercepts(*SessionInfo, grpc.ServerStreamingServer[InterceptInfoSnapshot]) error
 	// WatchInterceptsDelta notifies a client or agent of changes in the set of intercepts
 	// relevant to that client or agent.
@@ -950,6 +973,11 @@ type ManagerServer interface {
 	// UninstallAgents will uninstall the traffic-agent from the given workloads (or all
 	// workloads if the list is empty).
 	UninstallAgents(context.Context, *UninstallAgentsRequest) (*emptypb.Empty, error)
+	// WatchInterceptRoutes streams full routing snapshots to an authenticated
+	// observer on the internal listener. The caller must be allowed to watch
+	// interceptroutes.telepresence.io in every requested namespace. The stream
+	// closes normally after five minutes; the observer must reconnect.
+	WatchInterceptRoutes(*WatchInterceptRoutesRequest, grpc.ServerStreamingServer[InterceptRouteSnapshot]) error
 	mustEmbedUnimplementedManagerServer()
 }
 
@@ -1088,6 +1116,9 @@ func (UnimplementedManagerServer) ReportMetrics(context.Context, *TunnelMetrics)
 }
 func (UnimplementedManagerServer) UninstallAgents(context.Context, *UninstallAgentsRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method UninstallAgents not implemented")
+}
+func (UnimplementedManagerServer) WatchInterceptRoutes(*WatchInterceptRoutesRequest, grpc.ServerStreamingServer[InterceptRouteSnapshot]) error {
+	return status.Error(codes.Unimplemented, "method WatchInterceptRoutes not implemented")
 }
 func (UnimplementedManagerServer) mustEmbedUnimplementedManagerServer() {}
 func (UnimplementedManagerServer) testEmbeddedByValue()                 {}
@@ -1775,6 +1806,17 @@ func _Manager_UninstallAgents_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Manager_WatchInterceptRoutes_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchInterceptRoutesRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ManagerServer).WatchInterceptRoutes(m, &grpc.GenericServerStream[WatchInterceptRoutesRequest, InterceptRouteSnapshot]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Manager_WatchInterceptRoutesServer = grpc.ServerStreamingServer[InterceptRouteSnapshot]
+
 // Manager_ServiceDesc is the grpc.ServiceDesc for Manager service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1970,6 +2012,11 @@ var Manager_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "WatchQuicBackends",
 			Handler:       _Manager_WatchQuicBackends_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "WatchInterceptRoutes",
+			Handler:       _Manager_WatchInterceptRoutes_Handler,
 			ServerStreams: true,
 		},
 	},

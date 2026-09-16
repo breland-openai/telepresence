@@ -130,6 +130,63 @@ func TestInterceptor_Stream(t *testing.T) {
 	assert.Equal(t, "u", seen.Username)
 }
 
+func TestInterceptor_InterceptRouteObserverRequiresBearerInEveryMode(t *testing.T) {
+	const method = "/telepresence.manager.Manager/WatchInterceptRoutes"
+	for _, mode := range []auth.Mode{auth.ModeDisabled, auth.ModePermissive, auth.ModeEnforcing} {
+		t.Run(mode.String(), func(t *testing.T) {
+			ci := fake.NewClientset()
+			k8sapi.InstallFakeTokenReviews(ci, func(token string, _ []string) *authnv1.TokenReviewStatus {
+				if token == "good" {
+					return authenticatedStatus("system:serviceaccount:routing:observer", "observer-uid")
+				}
+				return &authnv1.TokenReviewStatus{Authenticated: false}
+			})
+			i := auth.NewInterceptor(auth.NewAuthenticator(ci), mode)
+			info := &grpc.StreamServerInfo{FullMethod: method, IsServerStream: true}
+			for _, tc := range []struct {
+				name, credential string
+				want             codes.Code
+			}{
+				{name: "no bearer", want: codes.Unauthenticated},
+				{name: "invalid bearer", credential: "Bearer bad", want: codes.Unauthenticated},
+				{name: "verified bearer", credential: "Bearer good", want: codes.OK},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					ctx := context.Background()
+					if tc.credential != "" {
+						ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("authorization", tc.credential))
+					}
+					called := false
+					err := i.Stream()(nil, &fakeServerStream{ctx: ctx}, info, func(_ any, ss grpc.ServerStream) error {
+						called = true
+						p := auth.PrincipalFrom(ss.Context())
+						require.NotNil(t, p)
+						require.Equal(t, "observer-uid", p.UID)
+						return nil
+					})
+					require.Equal(t, tc.want, status.Code(err))
+					require.Equal(t, tc.want == codes.OK, called)
+				})
+			}
+			t.Run("token review outage", func(t *testing.T) {
+				failed := fake.NewClientset()
+				failed.PrependReactor("create", "tokenreviews", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("Kubernetes unavailable")
+				})
+				i := auth.NewInterceptor(auth.NewAuthenticator(failed), mode)
+				ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer outage"))
+				called := false
+				err := i.Stream()(nil, &fakeServerStream{ctx: ctx}, info, func(any, grpc.ServerStream) error {
+					called = true
+					return nil
+				})
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.False(t, called)
+			})
+		})
+	}
+}
+
 func TestInterceptorExpiredCallerSkipsHandler(t *testing.T) {
 	for _, mode := range []auth.Mode{auth.ModeDisabled, auth.ModePermissive, auth.ModeEnforcing} {
 		for _, rpcType := range []string{"unary", "stream"} {

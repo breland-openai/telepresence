@@ -9,13 +9,13 @@ import (
 type Mode string
 
 const (
-	// ModeDisabled performs no token validation at all: the interceptor never
-	// reads metadata or calls TokenReview, and every call proceeds without a
-	// Principal.
+	// ModeDisabled bypasses general token validation. Internal routing observers
+	// still require a verified bearer.
 	ModeDisabled Mode = "disabled"
 
 	// ModePermissive validates bearer tokens and records the resulting
-	// Principal, but never rejects a call on account of authentication.
+	// Principal, but bypasses general authentication denials. Internal routing
+	// observers still require a verified bearer.
 	ModePermissive Mode = "permissive"
 
 	// ModeEnforcing validates bearer tokens and rejects calls that arrive

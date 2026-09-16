@@ -17,11 +17,12 @@ const (
 	versionMethod = "/telepresence.manager.Manager/Version"
 	// watchQuicBackendsMethod is consumed by the quic-forwarder, which runs without
 	// cluster credentials.
-	watchQuicBackendsMethod = "/telepresence.manager.Manager/WatchQuicBackends"
-	healthMethodPrefix      = "/grpc.health.v1.Health/"
-	authorizationHeader     = "authorization"
-	bearerPrefix            = "bearer "
-	bearerPrefixLen         = len(bearerPrefix)
+	watchQuicBackendsMethod    = "/telepresence.manager.Manager/WatchQuicBackends"
+	watchInterceptRoutesMethod = "/telepresence.manager.Manager/WatchInterceptRoutes"
+	healthMethodPrefix         = "/grpc.health.v1.Health/"
+	authorizationHeader        = "authorization"
+	bearerPrefix               = "bearer "
+	bearerPrefixLen            = len(bearerPrefix)
 )
 
 // unauthenticatedMessage is returned to callers rejected in ModeEnforcing for
@@ -29,9 +30,10 @@ const (
 const unauthenticatedMessage = "this traffic-manager requires an authenticated caller; the telepresence client must present a Kubernetes bearer token"
 
 // Interceptor authenticates bearer tokens on incoming gRPC calls. Its behavior is
-// governed by a Mode: ModeDisabled skips authentication entirely, ModePermissive
-// authenticates without rejecting failed authentication, and ModeEnforcing rejects
-// calls that lack a valid token. Canceled calls never reach application handlers.
+// governed by a Mode: ModeDisabled skips general authentication, ModePermissive
+// authenticates without generally rejecting failures, and ModeEnforcing rejects
+// calls that lack a valid token. Internal routing observers always require a valid
+// token. Canceled calls never reach application handlers.
 type Interceptor struct {
 	auth *Authenticator
 	mode Mode
@@ -49,7 +51,7 @@ func (i *Interceptor) Unary() grpc.UnaryServerInterceptor {
 		if err := ctx.Err(); err != nil {
 			return nil, status.FromContextError(err).Err()
 		}
-		if i.mode == ModeDisabled || skipAuth(info.FullMethod) {
+		if skipAuth(info.FullMethod) || i.mode == ModeDisabled && !alwaysAuthenticate(info.FullMethod) {
 			return handler(ctx, req)
 		}
 		ctx, err := i.authenticate(ctx, info.FullMethod)
@@ -66,7 +68,7 @@ func (i *Interceptor) Stream() grpc.StreamServerInterceptor {
 		if err := ss.Context().Err(); err != nil {
 			return status.FromContextError(err).Err()
 		}
-		if i.mode == ModeDisabled || skipAuth(info.FullMethod) {
+		if skipAuth(info.FullMethod) || i.mode == ModeDisabled && !alwaysAuthenticate(info.FullMethod) {
 			return handler(srv, ss)
 		}
 		ctx, err := i.authenticate(ss.Context(), info.FullMethod)
@@ -81,12 +83,17 @@ func skipAuth(method string) bool {
 	return method == versionMethod || method == watchQuicBackendsMethod || strings.HasPrefix(method, healthMethodPrefix)
 }
 
+func alwaysAuthenticate(method string) bool {
+	return method == watchInterceptRoutesMethod
+}
+
 // authenticate reads the bearer token from ctx's incoming metadata and returns a context carrying
 // the resulting Principal. In ModePermissive, authentication failures are logged but allowed.
-// In ModeEnforcing, missing or invalid tokens are rejected and infrastructure failures return
-// Unavailable. A canceled authentication wait returns the caller's context status in either mode.
+// In ModeEnforcing and for routing observers, missing or invalid tokens are rejected and
+// infrastructure failures return Unavailable. A canceled authentication wait returns the
+// caller's context status in either mode.
 func (i *Interceptor) authenticate(ctx context.Context, method string) (context.Context, error) {
-	enforcing := i.mode == ModeEnforcing
+	enforcing := i.mode == ModeEnforcing || alwaysAuthenticate(method)
 	token, present := bearerTokenFrom(ctx)
 	if token == "" {
 		if present {

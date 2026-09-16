@@ -23,6 +23,10 @@ RBAC.
 - **Intercept creation is authorized.** Creating an intercept requires the
   caller's Kubernetes identity to actually have RBAC access to the target
   namespace.
+- **Routing observers are authorized separately.** An in-cluster routing
+  controller needs a verified bearer token and a dedicated namespace grant to
+  observe routing data for other clients' intercepts. Client and agent watches
+  require a session and remain limited to their own intercepts or workload.
 
 The net effect: a workload with mere network reachability to the
 traffic-manager can no longer intercept arbitrary namespaces or act on other
@@ -97,8 +101,8 @@ The traffic-manager's authentication posture is controlled by the Helm value
 
 | Mode | Behavior |
 |------|----------|
-| `disabled` | No token validation at all. |
-| `permissive` (default) | Tokens are validated and used for authorization checks and session binding, but no call is ever rejected for lacking or failing authentication. Decisions are logged for audit. |
+| `disabled` | No general token validation. The routing observer still requires a verified token and its separate grant. |
+| `permissive` (default) | Tokens are validated and used for authorization checks and session binding; generally, calls lacking or failing authentication are accepted and decisions are logged for audit. The routing observer still requires a verified token and its separate grant. |
 | `enforcing` | Calls without a valid bearer token are rejected (`Unauthenticated`), and an unauthorized intercept is rejected (`PermissionDenied`). |
 
 Set it at install or upgrade time:
@@ -130,6 +134,13 @@ unreachable — for example, the API server is down — the traffic-manager
 reports `Unavailable` rather than rejecting the call as unauthenticated or
 unauthorized, so an infrastructure outage is distinguishable from an actual
 denial.
+
+The internal `WatchInterceptRoutes` API requires a verified Kubernetes bearer
+and the `watch interceptroutes.telepresence.io` grant in every explicitly
+requested namespace in all three modes. It returns only routing fields and
+closes after five minutes so the controller reconnects with its current token
+and repeats authorization. The external listener does not serve this API. See
+[Routing observers](rbac.md#routing-observers) for the dedicated RBAC.
 
 ### Staged rollout
 
