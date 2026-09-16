@@ -82,8 +82,8 @@ intercepted
 ## Intercepting a Service shared by multiple workloads
 
 A Service can select pods owned by more than one workload, such as stable and canary
-Deployments behind one traffic-splitting Service. For an HTTP intercept without
-`--replace`, Telepresence lets every selected workload participate in one logical
+Deployments behind one traffic-splitting Service. For an HTTP intercept,
+Telepresence lets every selected workload participate in one logical
 intercept. Filtered requests then reach the same local handler regardless of which
 selected workload receives the request.
 
@@ -93,8 +93,8 @@ those agents; use the normal uninstall command when they are no longer wanted. I
 participating workload has no available agent, for example while it is scaled to zero,
 the whole intercept moves to `NO_AGENT` until that participant returns.
 
-Shared expansion is intentionally limited to HTTP intercepts without `--replace`.
-For TCP, `--replace`, older traffic-agents that do not advertise Service targets, or
+Shared expansion is limited to HTTP intercepts. For TCP intercepts, container
+replacements, older traffic-agents that do not advertise Service targets, or
 Service selectors that cannot be resolved safely, Telepresence logs a warning and
 uses only the workload named by the user.
 
@@ -289,4 +289,4 @@ container within the pod, and the original container is automatically restored o
 > Sidecars will not be stopped. Only the targeted container will be removed from the pod.
 
 > [!NOTE]
-> The `--replace` flag of `telepresence intercept` is deprecated; use the `telepresence replace` command.
+> The former `--replace` flag of `telepresence intercept` was removed in 2.32.0; use the `telepresence replace` command.

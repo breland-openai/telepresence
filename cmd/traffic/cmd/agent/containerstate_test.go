@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
@@ -114,4 +116,90 @@ func Test_newPortHandler_passThroughTarget(t *testing.T) {
 		wantPort := cs.AgentConfig().ProxyPort(cs.container.Intercepts[0].AgentPort)
 		require.Equal(t, netip.AddrPortFrom(ipv4, wantPort), ph.Target())
 	})
+}
+
+func Test_newPortHandler_udpPassThrough(t *testing.T) {
+	loopback := netip.MustParseAddr("127.0.0.1")
+	app, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(loopback, 0)))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = app.Close() })
+	go func() {
+		var payload [256]byte
+		for {
+			n, peer, readErr := app.ReadFromUDP(payload[:])
+			if readErr != nil {
+				return
+			}
+			_, _ = app.WriteToUDP(append([]byte("app:"), payload[:n]...), peer)
+		}
+	}()
+
+	appAddr := app.LocalAddr().(*net.UDPAddr).AddrPort()
+	cs := newTestContainerState(t, loopback, false)
+	ic := cs.container.Intercepts[0]
+	ic.Protocol = types.ProtoUDP
+	ic.ContainerPort = appAddr.Port()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ph := cs.newPortHandler(ctx, types.PortAndProto{Proto: types.ProtoUDP}, cs.container.Intercepts)
+	// Reject the old discard target before starting its close/rebind loop.
+	require.Equal(t, appAddr, ph.Target())
+
+	ready := make(chan netip.AddrPort, 1)
+	done := make(chan error, 1)
+	go func() { done <- ph.Serve(ctx, ready) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case serveErr := <-done:
+			require.NoError(t, serveErr)
+		case <-time.After(2 * time.Second):
+			t.Error("agent UDP handler did not stop")
+		}
+	})
+	var listen netip.AddrPort
+	select {
+	case listen = <-ready:
+	case <-ctx.Done():
+		t.Fatal("agent UDP handler did not listen")
+	}
+	client, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(loopback, listen.Port())))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	require.NoError(t, client.SetDeadline(time.Now().Add(2*time.Second)))
+	for _, payload := range [][]byte{[]byte("ordinary-service-datagram"), {0, 1, 2, 0, 255}} {
+		_, err = client.Write(payload)
+		require.NoError(t, err)
+		var reply [256]byte
+		n, readErr := client.Read(reply[:])
+		require.NoError(t, readErr)
+		require.Equal(t, append([]byte("app:"), payload...), reply[:n])
+	}
+}
+
+func Test_newPortHandler_udpPassThroughRouting(t *testing.T) {
+	for _, ip := range []string{"192.168.50.34", "fd00::34"} {
+		podIP := netip.MustParseAddr(ip)
+		t.Run(ip, func(t *testing.T) {
+			cs := newTestContainerState(t, podIP, false)
+			ic := cs.container.Intercepts[0]
+			ic.Protocol = types.ProtoUDP
+			pp := types.PortAndProto{Proto: types.ProtoUDP, Port: ic.AgentPort}
+			handler := func() netip.AddrPort {
+				return cs.newPortHandler(context.Background(), pp, cs.container.Intercepts[:1]).Target()
+			}
+			require.Equal(t, netip.AddrPortFrom(podIP, ic.ContainerPort), handler())
+
+			cs.container.Intercepts = append(cs.container.Intercepts, &agentconfig.Intercept{
+				Protocol: types.ProtoTCP, AgentPort: 9901, ContainerPort: 8081, TargetPortNumeric: true,
+			})
+			require.Equal(t, netip.AddrPortFrom(agentconfig.LoopbackFor(podIP), ic.ContainerPort), handler())
+
+			ic.TargetPortNumeric = true
+			require.Equal(t, netip.AddrPortFrom(podIP, cs.AgentConfig().ProxyPort(ic.AgentPort)), handler())
+
+			cs.container.Replace = agentconfig.ReplacePolicyContainer
+			require.False(t, handler().IsValid(), "a container replacement must not forward to the original app")
+		})
+	}
 }

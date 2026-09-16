@@ -600,13 +600,7 @@
         {
           "name": "index",
           "type": "int",
-          "description": "Index of the container if service has multiple replicas"
-        },
-        {
-          "name": "no-tty",
-          "shorthand": "T",
-          "type": "bool",
-          "description": "Disable pseudo-TTY allocation. By default 'docker compose exec' allocates a TTY. (default true)"
+          "description": "Index of the container if service has multiple replicas -T, --no-TTY docker compose exec   Disable pseudo-TTY allocation. By default docker compose exec allocates a TTY. (default true)"
         },
         {
           "name": "privileged",
@@ -881,11 +875,6 @@
       "description": "Publish compose application",
       "flags": [
         {
-          "name": "app",
-          "type": "bool",
-          "description": "Published compose application (includes referenced images)"
-        },
-        {
           "name": "dry-run",
           "type": "bool",
           "description": "Execute command in dry run mode"
@@ -1097,15 +1086,15 @@
           "description": "Assign a name to the container"
         },
         {
-          "name": "no-deps",
-          "type": "bool",
-          "description": "Don't start linked services"
-        },
-        {
-          "name": "no-tty",
+          "name": "no-TTY",
           "shorthand": "T",
           "type": "bool",
           "description": "Disable pseudo-TTY allocation (default: auto-detected) (default true)"
+        },
+        {
+          "name": "no-deps",
+          "type": "bool",
+          "description": "Don't start linked services"
         },
         {
           "name": "publish",
@@ -1201,16 +1190,6 @@
           "name": "dry-run",
           "type": "bool",
           "description": "Execute command in dry run mode"
-        },
-        {
-          "name": "wait",
-          "type": "bool",
-          "description": "Wait for services to be running|healthy. Implies detached mode."
-        },
-        {
-          "name": "wait-timeout",
-          "type": "int",
-          "description": "Maximum duration in seconds to wait for the project to be running|healthy"
         }
       ]
     },

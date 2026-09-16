@@ -44,7 +44,9 @@ type Session interface {
 	AddIntercept(context.Context, *rpc.CreateInterceptRequest) (*manager.InterceptInfo, error)
 	AddInterceptor(string, *rpc.Interceptor) error
 	CanIntercept(context.Context, *rpc.CreateInterceptRequest) (InterceptInfo, error)
-	ClearIngestsAndIntercepts() error
+	ClearIngestsAndIntercepts(context.Context) error
+	// Close releases a session that will not be started.
+	Close()
 	GatherLogs(context.Context, *rpc.LogsRequest) (*rpc.LogsResponse, error)
 	GetConfig() (*client.SessionConfig, error)
 	GetCurrentNamespaces(forClientAccess bool) []string
@@ -62,6 +64,7 @@ type Session interface {
 	RemoveIntercept(string) error
 	RemoveInterceptor(string) error
 	RerouteLocalPort(ap types.AddrPortProto, srcPort uint16)
+	ResolvePort(ctx context.Context, host, port string) (types.AddrPortProto, error)
 
 	// WithRootClient calls the given function with a gRPC-cancel sensitive context and the root daemon client.
 	// This function is intended to facilitate gRPC calls to the root daemon that are sensitive to both the session

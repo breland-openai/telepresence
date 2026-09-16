@@ -5,13 +5,25 @@
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Reject intercepts without a reverse connection to the traffic-agent</div></div>
 <div style="margin-left: 15px">
 
-The client now refuses to create an intercept or replacement if the session does not watch traffic-agents in the target namespace. It explains how to check Kubernetes port-forward permission and reconnect, instead of redirecting requests that cannot reach the local service.
+The client now refuses to create an intercept, replacement, or wiretap if it cannot watch traffic-agents in the target namespace. It explains how to reconnect and, for connections through Kubernetes, how to check port-forward permission. Traffic-managers older than version 2.28 can watch only the connected namespace.
 </div>
 
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Recover DNS after interrupted root daemon sessions</div></div>
 <div style="margin-left: 15px">
 
 On Linux, root daemon startup removes recognized stale DNS redirects to unused local UDP endpoints before cluster authentication needs DNS. Reconnecting also waits for the previous session's workers and routing cleanup to finish, including when session initialization fails.
+</div>
+
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Route Kubernetes pod DNS through Telepresence on Linux</div></div>
+<div style="margin-left: 15px">
+
+Kubernetes pod addresses now use Telepresence DNS when the machine's physical network also advertises the Kubernetes DNS domain. This keeps pod names reachable when virtual network address translation is enabled.
+</div>
+
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Reuse connections with the same mapped namespaces</div></div>
+<div style="margin-left: 15px">
+
+Repeating <code>telepresence connect</code> with the same mapped namespaces now reuses the existing connection regardless of their order or duplicates. Previously, a non-alphabetical list could be mistaken for a configuration change and ask the user to reconnect.
 </div>
 
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Recover promptly from stalled manager sessions</div></div>
@@ -35,7 +47,7 @@ The agent injector reused a cached sidecar config across concurrent pod admissio
 ## <div style="display:flex;"><img src="images/feature.png" alt="feature" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[HTTP intercepts can follow every workload selected by one Service](reference/attachments/cli)</div></div>
 <div style="margin-left: 15px">
 
-A Kubernetes Service can route requests to more than one workload, such as stable and canary Deployments, while an intercept previously followed only the workload named by the user. HTTP intercepts without <code>--replace</code> now let each selected workload participate in one logical intercept, so filtered traffic reaches the same local handler regardless of which selected workload receives it. If the selected workloads or their traffic-agents cannot support shared interception, Telepresence warns and keeps the historical single-workload behavior instead of failing the intercept.
+A Kubernetes Service can route requests to more than one workload, such as stable and canary Deployments, while an intercept previously followed only the workload named by the user. HTTP intercepts now let each selected workload participate in one logical intercept, so filtered traffic reaches the same local handler regardless of which selected workload receives it. If the selected workloads or their traffic-agents cannot support shared interception, Telepresence warns and keeps the historical single-workload behavior instead of failing the intercept.
 </div>
 
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Improve selected-intercept tunnel stability</div></div>
@@ -60,6 +72,48 @@ With <code>agentInjector.enabled=false</code>, the traffic-manager only watched 
 <div style="margin-left: 15px">
 
 A <code>helm upgrade</code> that added or removed the <code>namespaceSelector</code> of a live installation kept the running pod, which continued with the informer topology of its old scope and left workload watching -- and with it <code>telepresence list</code> and agent-config generation -- broken until a manual restart. The scope is now stamped into the pod template, so an upgrade crossing that boundary rolls the deployment, exactly as a change to the static <code>namespaces</code> list always has. Changes within a selector are still picked up live, without a restart.
+</div>
+
+## <div style="display:flex;"><img src="images/feature.png" alt="feature" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[Required grant for Telepresence-specific RBAC authorization](reference/rbac)</div></div>
+<div style="margin-left: 15px">
+
+The new Helm setting <code>security.authorization.requiredGrant</code> (<code>portforward</code>, <code>telepresence</code>, or <code>any</code>; default <code>any</code>) selects which RBAC grant the traffic-manager requires when it authorizes a caller: the legacy <code>pods/portforward</code> permission, Telepresence's own policy attributes -- <code>create</code> on <code>connections.telepresence.io</code> to connect, and <code>create</code> or <code>get</code> on <code>attachments.telepresence.io</code> to intercept or ingest a named workload -- or either. The chart renders client Roles to match, the manager logs a migration warning whenever a caller authorizes only via the legacy grant, and sessions and intercepts restored after a manager restart are re-authorized and rebuilt from their specifications.
+</div>
+
+## <div style="display:flex;"><img src="images/change.png" alt="change" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Ambiguous workload names must state their kind</div></div>
+<div style="margin-left: 15px">
+
+When several enabled workload kinds have a workload with the same name in a namespace, the traffic-manager now rejects an agent request that does not state the intended kind instead of silently picking one in priority order. <code>telepresence ingest</code> gained a <code>--workload-kind</code> flag to qualify such names.
+</div>
+
+## <div style="display:flex;"><img src="images/feature.png" alt="feature" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[Log gathering and namespace discovery through the traffic-manager](reference/rbac)</div></div>
+<div style="margin-left: 15px">
+
+<code>telepresence gather-logs</code> now streams traffic-manager and traffic-agent logs (and, with <code>--get-pod-yaml</code>, pod manifests) through the traffic-manager, which reads them on the client's behalf, and a client watching all namespaces receives the manager's managed-namespace list the same way. A client therefore no longer needs Kubernetes permissions to list pods, read <code>pods/log</code>, or list namespaces; log access is instead authorized by <code>get</code> on the <code>logs</code> and <code>logs/yaml</code> resources in <code>telepresence.io</code>, which the chart's client Roles grant. The streaming bounds are tunable through the new Helm setting <code>logStreaming</code>, and both features fall back to the old direct Kubernetes API access when the traffic-manager predates them.
+</div>
+
+## <div style="display:flex;"><img src="images/change.png" alt="change" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">The traffic-manager runs as a StatefulSet with a fixed pod name</div></div>
+<div style="margin-left: 15px">
+
+The traffic-manager Deployment is now a single-replica StatefulSet whose pod is always named <code>traffic-manager-0</code>. A pre-upgrade hook migrates an existing Deployment install automatically; rolling back to an older chart requires uninstall and reinstall. Because a one-replica StatefulSet cannot surge a replacement pod, an image update includes a brief window with no ready manager -- client sessions survive it and re-establish with their intercepts intact.
+</div>
+
+## <div style="display:flex;"><img src="images/feature.png" alt="feature" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[Clients connect to the traffic-manager by its fixed pod name](reference/rbac)</div></div>
+<div style="margin-left: 15px">
+
+The client now port-forwards directly to the <code>traffic-manager-0</code> pod, so the only Kubernetes permission a connection needs is <code>create</code> on <code>pods/portforward</code> for that one pod name. The previous discovery grants (get services, list pods) remain available as a fallback and are rendered while the new Helm setting <code>clientRbac.legacyAccess</code> is true (the default); pre-2.33 clients and installs that override <code>apiPort</code> still need them.
+</div>
+
+## <div style="display:flex;"><img src="images/feature.png" alt="feature" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[External control endpoint for clients without Kubernetes API access](reference/external-endpoint)</div></div>
+<div style="margin-left: 15px">
+
+The new Helm setting <code>externalEndpoint</code> publishes a TLS gRPC listener that serves only the traffic-manager's client-facing RPC surface, with per-method session-ownership enforcement and admission controls in front of token validation. A client configured with <code>cluster.managerAddress</code> (and optionally <code>cluster.managerServerCA</code>) dials it directly and makes no Kubernetes API requests at all; it authenticates with its kubeconfig's bearer token, or with its client certificate directly in the TLS handshake when no bearer source exists. Publishing the endpoint requires <code>security.authentication.mode: enforcing</code> and a persisted server certificate, from an existing TLS Secret or cert-manager.
+</div>
+
+## <div style="display:flex;"><img src="images/change.png" alt="change" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">The deprecated --replace flag has been removed</div></div>
+<div style="margin-left: 15px">
+
+The <code>--replace</code> flag of <code>telepresence intercept</code>, deprecated since 2.22.0, has been removed. Use the <code>telepresence replace</code> command instead. The traffic-manager now ignores HTTP filters that older clients send along with a replace request.
 </div>
 
 ## Version 2.31.2 <span style="font-size: 16px;">(August  2)</span>
@@ -96,7 +150,7 @@ The SFTP server that backs <code>telepresence mount</code> resolved absolute pat
 ## <div style="display:flex;"><img src="images/security.png" alt="security" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[Changing the log level requires an owned session](reference/authentication.md)</div></div>
 <div style="margin-left: 15px">
 
-The traffic-manager's <code>SetLogLevel</code> call accepted any caller, although the new level propagated to the manager and every traffic-agent. The request now carries the client's session, whose ownership the manager verifies. Requests from older clients without a session are still honored unless <code>security.authentication.mode=enforcing</code>.
+The traffic-manager accepted a log-level change from any caller, although the new level propagated to the manager and every traffic-agent. The request now carries the client's session, whose ownership the manager verifies. Requests from older clients without a session are still honored unless <code>security.authentication.mode=enforcing</code>.
 </div>
 
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">The QUIC forwarder becomes ready under enforcing authentication</div></div>
@@ -2480,3 +2534,4 @@ The helm chart now correctly handles custom agentInjector.webhook.port that was 
 
 Params .intercept.disableGlobal and .timeouts.agentArrival are now correctly honored.
 </div>
+

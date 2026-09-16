@@ -177,11 +177,39 @@ type ipResolver interface {
 	LookupIP(context.Context, string, string) ([]net.IP, error)
 }
 
+func lookupIPFamily(ctx context.Context, network, name string, r ipResolver) ([]net.IP, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ips, err := r.LookupIP(ctx, "ip", name)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
+	}
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) || !dnsErr.IsTemporary {
+		return ips, err
+	}
+	requested, requestedErr := r.LookupIP(ctx, network, name)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if errors.Is(requestedErr, context.Canceled) || errors.Is(requestedErr, context.DeadlineExceeded) {
+		return nil, requestedErr
+	}
+	if requestedErr == nil {
+		return requested, nil
+	}
+	return ips, err
+}
+
 func lookupIPName(ctx context.Context, network, name, qName string, final bool, r ipResolver) ([]net.IP, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	ips, err := r.LookupIP(ctx, network, name)
+	ips, err := lookupIPFamily(ctx, network, name, r)
 	if err != nil && !final {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -190,7 +218,7 @@ func lookupIPName(ctx context.Context, network, name, qName string, final bool, 
 			return nil, err
 		}
 		clog.Debugf(ctx, "LookupIP %q failed, trying LookupIP %q", name, qName)
-		ips, err = r.LookupIP(ctx, network, qName)
+		ips, err = lookupIPFamily(ctx, network, qName, r)
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
@@ -208,19 +236,10 @@ func lookupIP(ctx context.Context, network, qName, noSearchDomain string, r ipRe
 			IsNotFound: true,
 		}
 	}
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-		otherNetwork := "ip4"
-		if network == "ip4" {
-			otherNetwork = "ip6"
-		}
-		otherIPs, otherErr := lookupIPName(ctx, otherNetwork, name, qName, final, r)
-		if otherErr != nil && (!errors.As(otherErr, &dnsErr) || !dnsErr.IsNotFound) {
-			return nil, otherErr
-		}
-		if len(otherIPs) > 0 {
-			return nil, nil
-		}
+	if err == nil {
+		ips = slices.DeleteFunc(ips, func(ip net.IP) bool {
+			return (ip.To4() != nil) != (network == "ip4")
+		})
 	}
 	return ips, err
 }

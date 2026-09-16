@@ -728,15 +728,12 @@ func TestSessionPreservedDNSLookupTimeout(t *testing.T) {
 			require.Equal(t, tt.wantTimeout, statusConfig.DNS().LookupTimeout)
 			require.Equal(t, s.dnsServer.GetConfig().Mappings, statusConfig.DNS().Mappings)
 
-			resolved, err := s.resolvePort(ctx, hostname, "8080")
+			resolved, err := s.lookupIP(&rpc.LookupIPRequest{Name: dns2.Fqdn(hostname)})
 			require.NoError(t, err)
-			require.Equal(t, netip.AddrPortFrom(address, 8080), resolved.AddrPort)
-			require.Equal(t, types.ProtoTCP, resolved.Proto)
+			var resolvedAddress netip.Addr
+			require.NoError(t, resolvedAddress.UnmarshalBinary(resolved.Ip))
+			require.Equal(t, address, resolvedAddress)
 			require.Positive(t, queries.Load())
-
-			resolved, err = s.resolvePort(ctx, "203.0.113.9", "8443")
-			require.NoError(t, err)
-			require.Equal(t, netip.MustParseAddrPort("203.0.113.9:8443"), resolved.AddrPort)
 		})
 	}
 }

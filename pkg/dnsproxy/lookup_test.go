@@ -74,11 +74,12 @@ func TestLookupIPAddressFamilies(t *testing.T) {
 	ctx := testutil.NewContext(t, false)
 
 	tests := []struct {
-		name       string
-		network    string
-		hostname   string
-		wantIPs    []string
-		wantAbsent bool
+		name          string
+		network       string
+		hostname      string
+		wantIPs       []string
+		wantAbsent    bool
+		wantTemporary bool
 	}{
 		{
 			name:     "AAAA lookup for IPv4-only hostname returns no data",
@@ -115,6 +116,30 @@ func TestLookupIPAddressFamilies(t *testing.T) {
 			wantIPs:  []string{"2001:db8::20"},
 		},
 		{
+			name:     "A lookup recovers when the AAAA query fails temporarily",
+			network:  "ip4",
+			hostname: "ipv4-partial.example.",
+			wantIPs:  []string{"192.0.2.10"},
+		},
+		{
+			name:     "AAAA lookup recovers when the A query fails temporarily",
+			network:  "ip6",
+			hostname: "ipv6-partial.example.",
+			wantIPs:  []string{"2001:db8::10"},
+		},
+		{
+			name:          "A query failure is preserved when the AAAA query succeeds",
+			network:       "ip4",
+			hostname:      "ipv6-partial.example.",
+			wantTemporary: true,
+		},
+		{
+			name:          "AAAA query failure is preserved when the A query succeeds",
+			network:       "ip6",
+			hostname:      "ipv4-partial.example.",
+			wantTemporary: true,
+		},
+		{
 			name:       "missing hostname preserves A NXDOMAIN",
 			network:    "ip4",
 			hostname:   "missing.example.",
@@ -131,6 +156,17 @@ func TestLookupIPAddressFamilies(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ips, err := lookupIP(ctx, tt.network, tt.hostname, ".example.", resolver)
+			if tt.wantTemporary {
+				require.Empty(t, ips)
+				require.Error(t, err)
+				var dnsErr *net.DNSError
+				require.ErrorAs(t, err, &dnsErr)
+				require.True(t, dnsErr.IsTemporary)
+				rCode, rpcErr := MakeDNSError(err)
+				require.Equal(t, dns.RcodeServerFailure, rCode)
+				require.Equal(t, codes.Unavailable, status.Code(rpcErr))
+				return
+			}
 			if tt.wantAbsent {
 				require.Error(t, err)
 				var dnsErr *net.DNSError
@@ -192,15 +228,77 @@ func (f ipResolverFunc) LookupIP(ctx context.Context, network, host string) ([]n
 	return f(ctx, network, host)
 }
 
+func TestLookupIPUsesCombinedResult(t *testing.T) {
+	for _, network := range []string{"ip4", "ip6"} {
+		t.Run(network, func(t *testing.T) {
+			var calls []string
+			resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+				calls = append(calls, network+" "+host)
+				return []net.IP{net.ParseIP("192.0.2.20"), net.ParseIP("2001:db8::20")}, nil
+			})
+			ips, err := lookupIP(testutil.NewContext(t, false), network, "dual.example.", ".example.", resolver)
+			require.NoError(t, err)
+			require.Len(t, ips, 1)
+			want := "192.0.2.20"
+			if network == "ip6" {
+				want = "2001:db8::20"
+			}
+			require.Equal(t, want, ips[0].String())
+			require.Equal(t, []string{"ip dual.example."}, calls)
+		})
+	}
+	for _, tt := range []struct {
+		name string
+		ips  []net.IP
+		err  error
+	}{
+		{name: "only opposite family", ips: []net.IP{net.ParseIP("2001:db8::20")}},
+		{name: "both families absent", err: &net.DNSError{Err: "no such host", IsNotFound: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls []string
+			resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+				calls = append(calls, network+" "+host)
+				return tt.ips, tt.err
+			})
+			ips, err := lookupIP(testutil.NewContext(t, false), "ip4", "name.example.", ".example.", resolver)
+			require.Empty(t, ips)
+			if tt.err == nil {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, tt.err)
+			}
+			require.Equal(t, []string{"ip name.example."}, calls)
+		})
+	}
+}
+
+func TestLookupIPRetriesAbsoluteName(t *testing.T) {
+	var calls []string
+	resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+		calls = append(calls, network+" "+host)
+		if host == "name.example." {
+			return []net.IP{net.ParseIP("192.0.2.20")}, nil
+		}
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	})
+	ips, err := lookupIP(testutil.NewContext(t, false), "ip4", "name.example.", "", resolver)
+	require.NoError(t, err)
+	require.Len(t, ips, 1)
+	require.Equal(t, "192.0.2.20", ips[0].String())
+	require.Equal(t, []string{"ip name.example", "ip name.example."}, calls)
+}
+
 func TestLookupIPStopsCanceledRetries(t *testing.T) {
+	allCalls := []string{"ip missing.example", "ip4 missing.example", "ip missing.example.", "ip4 missing.example."}
 	for _, tt := range []struct {
 		name        string
 		cancelAfter int
 	}{
 		{name: "before first query"},
-		{name: "before absolute name retry", cancelAfter: 1},
-		{name: "before opposite family", cancelAfter: 2},
-		{name: "before opposite family absolute retry", cancelAfter: 3},
+		{name: "before requested family retry", cancelAfter: 1},
+		{name: "before absolute name retry", cancelAfter: 2},
+		{name: "before requested family absolute retry", cancelAfter: 3},
 		{name: "during final query", cancelAfter: 4},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -209,11 +307,14 @@ func TestLookupIPStopsCanceledRetries(t *testing.T) {
 			if tt.cancelAfter == 0 {
 				cancel()
 			}
-			calls := 0
-			resolver := ipResolverFunc(func(_ context.Context, _, host string) ([]net.IP, error) {
-				calls++
-				if calls == tt.cancelAfter {
+			calls := make([]string, 0, len(allCalls))
+			resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+				calls = append(calls, network+" "+host)
+				if len(calls) == tt.cancelAfter {
 					cancel()
+				}
+				if network == "ip" {
+					return nil, &net.DNSError{Err: "server misbehaving", Name: host, IsTemporary: true}
 				}
 				return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 			})
@@ -222,7 +323,7 @@ func TestLookupIPStopsCanceledRetries(t *testing.T) {
 
 			require.Empty(t, ips)
 			require.ErrorIs(t, err, context.Canceled)
-			require.Equal(t, tt.cancelAfter, calls)
+			require.Equal(t, allCalls[:tt.cancelAfter], calls)
 		})
 	}
 }
@@ -234,9 +335,9 @@ func TestLookupIPPreservesOppositeFamilyFailure(t *testing.T) {
 		context.DeadlineExceeded,
 	} {
 		t.Run(failure.Error(), func(t *testing.T) {
-			calls := 0
+			var calls []string
 			resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
-				calls++
+				calls = append(calls, network+" "+host)
 				if network == "ip4" {
 					return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 				}
@@ -247,7 +348,30 @@ func TestLookupIPPreservesOppositeFamilyFailure(t *testing.T) {
 
 			require.Empty(t, ips)
 			require.ErrorIs(t, err, failure)
-			require.Equal(t, 2, calls)
+			wantCalls := []string{"ip missing.example."}
+			if !errors.Is(failure, context.Canceled) && !errors.Is(failure, context.DeadlineExceeded) {
+				wantCalls = append(wantCalls, "ip4 missing.example.")
+			}
+			require.Equal(t, wantCalls, calls)
+		})
+	}
+}
+
+func TestLookupIPPreservesRequestedFamilyContextFailure(t *testing.T) {
+	for _, failure := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			var calls []string
+			resolver := ipResolverFunc(func(_ context.Context, network, host string) ([]net.IP, error) {
+				calls = append(calls, network+" "+host)
+				if network == "ip" {
+					return nil, &net.DNSError{Err: "server misbehaving", Name: host, IsTemporary: true}
+				}
+				return nil, failure
+			})
+			ips, err := lookupIP(testutil.NewContext(t, false), "ip4", "name.example.", "", resolver)
+			require.Empty(t, ips)
+			require.ErrorIs(t, err, failure)
+			require.Equal(t, []string{"ip name.example", "ip4 name.example"}, calls)
 		})
 	}
 }
@@ -300,19 +424,23 @@ func startLookupIPTestResolver(t *testing.T) *net.Resolver {
 
 			question := request.Question[0]
 			switch question.Name {
-			case "ipv4.example.":
+			case "ipv4.example.", "ipv4-partial.example.":
 				if question.Qtype == dns.TypeA {
 					response.Answer = []dns.RR{&dns.A{
 						Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypeA, Class: dns.ClassINET},
 						A:   net.ParseIP("192.0.2.10").To4(),
 					}}
+				} else if question.Name == "ipv4-partial.example." {
+					response.SetRcode(request, dns.RcodeServerFailure)
 				}
-			case "ipv6.example.":
+			case "ipv6.example.", "ipv6-partial.example.":
 				if question.Qtype == dns.TypeAAAA {
 					response.Answer = []dns.RR{&dns.AAAA{
 						Hdr:  dns.RR_Header{Name: question.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET},
 						AAAA: net.ParseIP("2001:db8::10"),
 					}}
+				} else if question.Name == "ipv6-partial.example." {
+					response.SetRcode(request, dns.RcodeServerFailure)
 				}
 			case "dual.example.":
 				switch question.Qtype {

@@ -7,8 +7,11 @@ import (
 	"io"
 	"net/netip"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	grpcStatus "google.golang.org/grpc/status"
 	empty "google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/telepresenceio/telepresence/rpc/v2/connector"
@@ -282,6 +285,10 @@ func setUserDaemonStatus(ctx context.Context, userD daemon.UserClient, di *daemo
 
 	status, err := userD.Status(ctx, &empty.Empty{})
 	if err != nil {
+		if st, ok := grpcStatus.FromError(err); ok && st.Code() == codes.FailedPrecondition && st.Message() == "connection in progress" {
+			us.Status = "Connecting"
+			return &connector.ConnectInfo{}, nil
+		}
 		err = grpc.FromGRPC(err)
 		us.Status = "Not connected"
 		us.Error = err.Error()
@@ -303,7 +310,7 @@ func setUserDaemonStatus(ctx context.Context, userD daemon.UserClient, di *daemo
 			Client: icept.Spec.Client,
 		}
 		switch {
-		case icept.Spec.NoDefaultPort:
+		case icept.Spec.Replace:
 			us.Replacements = append(us.Replacements, cis)
 		case icept.Spec.Wiretap:
 			us.Wiretaps = append(us.Wiretaps, cis)
@@ -331,10 +338,12 @@ func getStatusInfo(ctx context.Context, di *daemon.Info) (*StatusInfo, error) {
 			tm := &wt.TrafficManager
 			tm.Name = mv.Name
 			tm.Version = mv.Version
-			if af, err := userD.AgentImageFQN(ctx, &empty.Empty{}); err == nil {
+			metadataCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			if af, err := userD.AgentImageFQN(metadataCtx, &empty.Empty{}); err == nil {
 				tm.TrafficAgent = af.FQN
 			}
-			tm.extendedInfo = GetTrafficManagerStatusExtras(ctx, userD)
+			tm.extendedInfo = GetTrafficManagerStatusExtras(metadataCtx, userD)
+			cancel()
 		}
 		rStatus = status.DaemonStatus
 	} else {

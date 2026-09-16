@@ -500,20 +500,59 @@ func requireAgentPortForward(ctx context.Context, kind string) error {
 	return nil
 }
 
-// requireInterceptAgentWatch verifies that the root daemon will receive the target
-// agents and start their reverse dial watchers. The traffic-manager may accept an
-// intercept without enforcing authorization; accepting it here would then redirect
-// traffic before this client has any way to receive it.
-func (s *session) requireInterceptAgentWatch(kind, namespace string) error {
-	if slices.Contains(s.agentPodWatchNamespaces(), namespace) {
+// quicTunnelEndpointGetter is the subset of manager.ManagerClient that
+// requireQuicTunnelAvailable needs, narrowed for testability. Its signature matches
+// manager.ManagerClient.GetQuicTunnelEndpoint so s.ManagerClient() satisfies it directly.
+type quicTunnelEndpointGetter interface {
+	GetQuicTunnelEndpoint(ctx context.Context, in *manager.SessionInfo, opts ...grpc.CallOption) (*manager.QuicTunnelEndpoint, error)
+}
+
+// requireQuicTunnelAvailable fails early when the external manager transport lacks a
+// QUIC tunnel, the only channel to an agent in that mode. An RPC error is treated the
+// same as disabled: the safe default is refusing rather than creating a dead attachment.
+func requireQuicTunnelAvailable(ctx context.Context, mc quicTunnelEndpointGetter, si *manager.SessionInfo, kind string) error {
+	if !client.GetConfig(ctx).Cluster().UsesExternalManager() {
 		return nil
 	}
-	return errcat.User.Newf(
-		"%s cannot receive traffic from namespace %q: this session does not watch its traffic-agents. "+
-			"Verify your Kubernetes permission with `kubectl auth can-i create pods/portforward --namespace %s` "+
-			"using the same kubeconfig context, then reconnect with --mapped-namespaces including %q. "+
-			"No intercept was created.",
-		kind, namespace, namespace, namespace)
+	ep, err := mc.GetQuicTunnelEndpoint(ctx, si)
+	if err != nil || !ep.GetEnabled() {
+		return errcat.User.Newf(
+			"creating an %s requires a channel to the traffic-agent, but this connection uses the external "+
+				"manager endpoint and the QUIC tunnel is not available; publish the traffic-manager's QUIC "+
+				"endpoint (Helm value quicTunnel.enabled) or use a connection with Kubernetes port-forward access",
+			kind)
+	}
+	return nil
+}
+
+// An intercept needs the root daemon's reverse-dial watcher for the target agents.
+func (s *session) requireInterceptAgentWatch(kind, namespace string) error {
+	attachment := kind
+	if kind == "replace" {
+		attachment = "replacement"
+	}
+	if !slices.Contains(s.agentPodWatchNamespaces(), namespace) {
+		if client.GetConfig(s).Cluster().UsesExternalManager() {
+			return errcat.User.Newf(
+				"%s cannot receive traffic from namespace %q: this session does not watch its traffic-agents. "+
+					"Reconnect with --mapped-namespaces including %q. No %s was created.",
+				kind, namespace, namespace, attachment)
+		}
+		return errcat.User.Newf(
+			"%s cannot receive traffic from namespace %q: this session does not watch its traffic-agents. "+
+				"Verify your Kubernetes permission with `kubectl auth can-i create pods/portforward --namespace %s` "+
+				"using the same kubeconfig context, then reconnect with --mapped-namespaces including %q. "+
+				"No %s was created.",
+			kind, namespace, namespace, namespace, attachment)
+	}
+	if namespace != s.Namespace && s.compareFinalizedManagerVersion(2, 28, 0) < 0 {
+		return errcat.User.Newf(
+			"%s cannot receive traffic from namespace %q: traffic-manager version %s only watches traffic-agents "+
+				"in the connected namespace %q. Reconnect with --namespace %q, or upgrade the traffic-manager to "+
+				"version 2.28 or newer. No %s was created.",
+			kind, namespace, s.ManagerVersion(), s.Namespace, namespace, attachment)
+	}
+	return nil
 }
 
 func (s *session) CanIntercept(ctx context.Context, ir *rpc.CreateInterceptRequest) (userd.InterceptInfo, error) {
@@ -523,6 +562,9 @@ func (s *session) CanIntercept(ctx context.Context, ir *rpc.CreateInterceptReque
 		kind = "replace"
 	}
 	if err := requireAgentPortForward(ctx, kind); err != nil {
+		return nil, err
+	}
+	if err := requireQuicTunnelAvailable(ctx, s.ManagerClient(), s.SessionInfo(), kind); err != nil {
 		return nil, err
 	}
 	if spec.Namespace == "" {
@@ -535,6 +577,9 @@ func (s *session) CanIntercept(ctx context.Context, ir *rpc.CreateInterceptReque
 		)
 	} else {
 		spec.Namespace = ns
+	}
+	if spec.Wiretap {
+		kind = "wiretap"
 	}
 	if err := s.requireInterceptAgentWatch(kind, spec.Namespace); err != nil {
 		return nil, err
@@ -675,7 +720,7 @@ func (s *session) AddIntercept(ctx context.Context, ir *rpc.CreateInterceptReque
 	spec.Protocol = pi.Protocol
 	spec.ContainerPort = pi.ContainerPort
 	spec.ContainerName = pi.ContainerName
-	if spec.NoDefaultPort {
+	if spec.Replace {
 		spec.Name = spec.Agent + "/" + pi.ContainerName
 	}
 	spec.PodPorts = pi.PodPorts
@@ -798,14 +843,26 @@ func (s *session) RemoveIntercept(name string) error {
 }
 
 func (s *session) removeIntercept(ic *intercept) error {
+	return s.removeInterceptWithContext(s.Context, ic)
+}
+
+func (s *session) removeInterceptWithContext(c context.Context, ic *intercept) error {
 	name := ic.Spec.Name
-	s.stopHandler(name, ic.handlerContainer, ic.pid)
+	s.stopHandlerWithContext(c, name, ic.handlerContainer, ic.pid)
 
 	// Unmount filesystems before telling the manager to remove the intercept
 	ic.cancel()
-	ic.wg.Wait()
+	unmounted := make(chan struct{})
+	go func() {
+		ic.wg.Wait()
+		close(unmounted)
+	}()
+	select {
+	case <-c.Done():
+		return c.Err()
+	case <-unmounted:
+	}
 
-	c := s.Context
 	clog.Debugf(c, "telling manager to remove intercept %s", name)
 	tos := client.GetConfig(c).Timeouts()
 	cc, cancel := tos.TimeoutContext(c, client.TimeoutTrafficManagerAPI)
@@ -827,11 +884,14 @@ func (s *session) removeIntercept(ic *intercept) error {
 }
 
 func (s *session) stopHandler(name, handlerContainer string, pid int) {
+	s.stopHandlerWithContext(s.Context, name, handlerContainer, pid)
+}
+
+func (s *session) stopHandlerWithContext(c context.Context, name, handlerContainer string, pid int) {
 	// No use trying to kill processes when using a container-based daemon, unless
 	// that daemon runs as a normal user daemon with a separate root daemon.
 	// Some users run a standard telepresence client together with ingests/intercepts
 	// in one single container.
-	c := s.Context
 	if !(proc.RunningInContainer() && s.GetService().RootSessionInProcess()) {
 		if handlerContainer != "" {
 			if err := docker.StopContainer(c, handlerContainer); err != nil {
@@ -986,20 +1046,27 @@ func (s *session) InterceptsForWorkload(workloadName, namespace string) []*manag
 }
 
 // ClearIngestsAndIntercepts removes all intercepts.
-func (s *session) ClearIngestsAndIntercepts() error {
+func (s *session) ClearIngestsAndIntercepts(ctx context.Context) error {
 	for _, ic := range s.getCurrentIntercepts() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		clog.Debugf(s, "Clearing intercept %s", ic.Spec.Name)
-		err := s.removeIntercept(ic)
+		err := s.removeInterceptWithContext(ctx, ic)
 		if err != nil && status.Code(err) != codes.NotFound {
 			return err
 		}
 	}
+	var err error
 	s.currentIngests.Range(func(key ingestKey, ig *ingest) bool {
+		if err = ctx.Err(); err != nil {
+			return false
+		}
 		clog.Debugf(s, "Clearing ingest %s", key)
-		s.stopHandler(key.workload+"/"+key.container, ig.handlerContainer, ig.pid)
+		s.stopHandlerWithContext(ctx, key.workload+"/"+key.container, ig.handlerContainer, ig.pid)
 		return true
 	})
-	return nil
+	return err
 }
 
 // reconcileAPIServers start/stop API servers as needed based on the TELEPRESENCE_API_PORT environment variable

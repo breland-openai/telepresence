@@ -193,6 +193,11 @@ type session struct {
 	// session is constructed.
 	agentPodWatchNamespacesOnce  sync.Once
 	agentPodWatchNamespacesValue []string
+
+	// namespaceWatchOnce guards the choice between the manager's WatchNamespaces RPC and
+	// the client-side Kubernetes namespace watcher: whichever is selected the first time
+	// the client watches all namespaces is the one used for the rest of the session.
+	namespaceWatchOnce sync.Once
 }
 
 // agentPodWatchNamespaces returns the namespaces in which this client watches
@@ -206,7 +211,15 @@ type session struct {
 // independently.
 func (s *session) agentPodWatchNamespaces() []string {
 	s.agentPodWatchNamespacesOnce.Do(func() {
-		if !client.GetConfig(s).Cluster().AgentPortForward {
+		cc := client.GetConfig(s).Cluster()
+		if !cc.AgentPortForward {
+			return
+		}
+		if cc.UsesExternalManager() {
+			// External manager transport: no Kubernetes API access, so
+			// CanPortForward can't run. Keep every mapped namespace; the
+			// manager reviews attach permissions itself.
+			s.agentPodWatchNamespacesValue = s.GetCurrentNamespaces(true)
 			return
 		}
 		s.agentPodWatchNamespacesValue = slices.DeleteFunc(s.GetCurrentNamespaces(true), func(ns string) bool {
@@ -217,6 +230,10 @@ func (s *session) agentPodWatchNamespaces() []string {
 }
 
 func (s *session) RevokeIntercept(ctx context.Context, interceptID string) error {
+	if client.GetConfig(s).Cluster().UsesExternalManager() {
+		return errcat.User.New("revoking an intercept requires cluster access to the traffic-manager's ConfigMap, " +
+			"which this external connection does not have")
+	}
 	return tmconfig.AddCommand(s, k8s.GetManagerNamespace(ctx), tmconfig.AdminCommand{
 		Name:      tmconfig.RemoveIntercept,
 		Args:      []string{interceptID},
@@ -257,6 +274,12 @@ func NewSession(
 		clog.Errorf(config, "Unable to connect to session: %s", err)
 		return nil, nil, err
 	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			tmgr.Close()
+		}
+	}()
 	if tmgr.compareFinalizedManagerVersion(2, 21, 0) < 0 {
 		return nil, nil,
 			fmt.Errorf("traffic manager version %s is too old. Minimum supported version is 2.21.0, please upgrade", tmgr.ManagerVersion())
@@ -292,7 +315,6 @@ func NewSession(
 	rootCtx, rootCancel := tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
 	defer rootCancel()
 	if err = tmgr.connectRootDaemon(rootCtx, oi, wg, cr.IsPodDaemon); err != nil {
-		_ = tmgr.managerConnection().Close()
 		return nil, nil, err
 	}
 
@@ -301,7 +323,11 @@ func NewSession(
 
 	tmgr.AddNamespaceEventHandler(tmgr.updateDaemonNamespaces)
 	ci, err := tmgr.status(rootCtx, true)
-	return tmgr, ci, err
+	if err != nil {
+		return nil, nil, err
+	}
+	handedOff = true
+	return tmgr, ci, nil
 }
 
 func (s *session) GetService() userd.Service {
@@ -319,7 +345,9 @@ func (s *session) Run() {
 	started := time.Now()
 	g := log.NewGroup(s)
 	defer func() {
-		_ = s.WithRootClient(context.WithoutCancel(s), func(ctx context.Context, rd rootdRpc.DaemonClient) error {
+		rootCtx, cancel := context.WithTimeout(context.WithoutCancel(s), 3*time.Second)
+		defer cancel()
+		_ = s.WithRootClient(rootCtx, func(ctx context.Context, rd rootdRpc.DaemonClient) error {
 			_, _ = rd.Disconnect(ctx, &empty.Empty{})
 			return nil
 		})
@@ -336,6 +364,19 @@ func (s *session) Run() {
 		clog.Infof(s, "session context ended after %s: context=%v cause=%v", elapsed, s.Err(), context.Cause(s))
 	default:
 		clog.Infof(s, "session services stopped cleanly after %s", elapsed)
+	}
+}
+
+func (s *session) Close() {
+	rootCtx, cancel := context.WithTimeout(context.WithoutCancel(s), 3*time.Second)
+	defer cancel()
+	_ = s.WithRootClient(rootCtx, func(ctx context.Context, rd rootdRpc.DaemonClient) error {
+		_, err := rd.Disconnect(ctx, &empty.Empty{})
+		return err
+	})
+	s.closeRootDaemon()
+	if conn := s.managerConnection(); conn != nil {
+		_ = conn.Close()
 	}
 }
 
@@ -413,6 +454,12 @@ func connectMgr(
 	if err != nil {
 		return nil, err
 	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			_ = conn.Close()
+		}
+	}()
 	if sdc := cfg.Grpc().SimulateDisconnect; sdc > 0 {
 		time.AfterFunc(sdc, func() {
 			clog.Info(cluster, "Simulated disconnect from manager")
@@ -495,6 +542,7 @@ func connectMgr(
 		podRelay:           newPodRelay(),
 	}
 	sess.Context = withSession(sess.Context, sess)
+	handedOff = true
 	return sess, nil
 }
 
@@ -796,7 +844,7 @@ func (s *session) getInfosForWorkloads(
 			for _, ii := range iis {
 				include := false
 				switch {
-				case ii.Spec.NoDefaultPort:
+				case ii.Spec.Replace:
 					filterMatch |= rpc.ListRequest_REPLACEMENTS
 					include = filter&rpc.ListRequest_REPLACEMENTS != 0
 				case ii.Spec.Wiretap:
@@ -1137,9 +1185,7 @@ func (s *session) CheckStatus(cr *rpc.ConnectRequest) error {
 		// connect that doesn't define a kubeconfig at all.
 		config = s.Kubeconfig
 	}
-	if len(cr.MappedNamespaces) == 1 && cr.MappedNamespaces[0] == "all" {
-		cr.MappedNamespaces = nil
-	}
+	cr.MappedNamespaces, _ = normalizeMappedNamespaces(cr.MappedNamespaces)
 	// If namespaces are specified in the request, then we must ensure that they are the same as the current ones
 	// because the request takes precedence over namespaces configured in the client configuration or by the traffic-manager.
 	if len(cr.MappedNamespaces) == 0 || slices.Equal(cr.MappedNamespaces, s.MappedNamespaces) {
@@ -1187,6 +1233,20 @@ func (s *session) Status(ctx context.Context) (*rpc.ConnectInfo, error) {
 	return s.status(ctx, false)
 }
 
+// managerSupportsWatchNamespaces reports whether the connected traffic-manager implements
+// the WatchNamespaces RPC, so the client can consume it instead of watching namespaces
+// itself.
+func (s *session) managerSupportsWatchNamespaces() bool {
+	return s.compareFinalizedManagerVersion(2, 32, 0) >= 0
+}
+
+// managerSupportsStreamLogs reports whether the connected traffic-manager implements the
+// StreamLogs RPC, so gather-logs can consume it instead of reading pod logs directly through
+// the Kubernetes API.
+func (s *session) managerSupportsStreamLogs() bool {
+	return s.compareFinalizedManagerVersion(2, 32, 0) >= 0
+}
+
 func (s *session) updateClientConfig(ctx context.Context, namespaces []string) {
 	var tmCfg client.Config
 	cliCfg, err := s.ManagerClient().GetClientConfig(ctx, &empty.Empty{})
@@ -1211,17 +1271,30 @@ func (s *session) updateClientConfig(ctx context.Context, namespaces []string) {
 		// We do not want to override the local config with the traffic-manager's config even if the local config is empty.
 		cfg.Cluster().MappedNamespaces = clientMappedNamespaces
 		namespaces = effectiveMappedNamespaces(namespaces, clientMappedNamespaces, tmMappedNamespaces)
-		if s.SetMappedNamespaces(namespaces) {
-			if len(namespaces) == 0 {
-				if k8sapi.CanWatchNamespaces(s) {
+		changed := s.SetMappedNamespaces(namespaces)
+		switch {
+		case len(namespaces) == 0:
+			// A fresh session's mapped set is already empty, so watching
+			// everything is not a "change" -- selection can't depend on that.
+			s.namespaceWatchOnce.Do(func() {
+				external := client.GetConfig(s).Cluster().UsesExternalManager()
+				switch {
+				case s.managerSupportsWatchNamespaces():
+					clog.Infof(s, "Will watch all namespaces using the traffic-manager's WatchNamespaces RPC")
+					s.StartNamespacesFromManager(s.ManagerClient(), s.sessionInfo)
+				case external:
+					// No Kubernetes API access, and this manager predates
+					// WatchNamespaces: no watcher option remains.
+					clog.Warnf(s, "Unable to watch all namespaces: the traffic-manager does not support the WatchNamespaces RPC")
+				case k8sapi.CanWatchNamespaces(s):
 					clog.Infof(s, "Will watch all namespaces")
 					s.StartNamespaceWatcher()
-				} else {
+				default:
 					clog.Warnf(s, "Unable to watch all namespaces")
 				}
-			} else {
-				clog.Infof(s, "Will use mapped namespaces %s", namespaces)
-			}
+			})
+		case changed:
+			clog.Infof(s, "Will use mapped namespaces %s", namespaces)
 		}
 		rt := cfg.Routing()
 		rt.NeverProxy = subnet.Unique(append(rt.NeverProxy, tmCfg.Routing().NeverProxy...))
@@ -1240,12 +1313,29 @@ func (s *session) updateClientConfig(ctx context.Context, namespaces []string) {
 
 func (s *session) status(ctx context.Context, initial bool) (*rpc.ConnectInfo, error) {
 	cfg := s.Kubeconfig
+	managerInstallID := s.SessionInfo().GetManagerInstallId()
+	if managerInstallID == "" {
+		var kubeCtx context.Context
+		var kubeCancel context.CancelFunc
+		if deadline, ok := ctx.Deadline(); ok {
+			kubeCtx, kubeCancel = context.WithDeadline(s, deadline)
+		} else {
+			kubeCtx, kubeCancel = context.WithCancel(s)
+		}
+		stopKubeCancel := context.AfterFunc(ctx, kubeCancel)
+		if ctx.Err() != nil {
+			kubeCancel()
+		}
+		managerInstallID = s.GetManagerInstallId(kubeCtx)
+		stopKubeCancel()
+		kubeCancel()
+	}
 	_, managerName, managerVersion, _ := s.managerSnapshot()
 	ret := &rpc.ConnectInfo{
 		Initial:          initial,
 		ClusterContext:   cfg.KubeContext,
 		ClusterServer:    cfg.Server,
-		ManagerInstallId: s.GetManagerInstallId(),
+		ManagerInstallId: managerInstallID,
 		SessionInfo:      s.SessionInfo(),
 		ConnectionName:   s.daemonID.Name,
 		KubeFlags:        s.OriginalFlagMap,
@@ -1264,7 +1354,7 @@ func (s *session) status(ctx context.Context, initial bool) (*rpc.ConnectInfo, e
 		ret.MappedNamespaces = s.GetCurrentNamespaces(true)
 	}
 	err := s.WithRootClient(ctx, func(ctx context.Context, rd rootdRpc.DaemonClient) (err error) {
-		ret.DaemonStatus, err = rd.Status(s, &empty.Empty{})
+		ret.DaemonStatus, err = rd.Status(ctx, &empty.Empty{})
 		return err
 	})
 	if err != nil {
@@ -1384,7 +1474,7 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 				// ...or not, since we've already done it.
 				return errors.New("unable to reconnect to root daemon")
 			}
-			if _, err = rd.Disconnect(s, &empty.Empty{}); err != nil {
+			if _, err = rd.Disconnect(timeoutCtx, &empty.Empty{}); err != nil {
 				return fmt.Errorf("failed to disconnect from the root daemon: %w", err)
 			}
 		}

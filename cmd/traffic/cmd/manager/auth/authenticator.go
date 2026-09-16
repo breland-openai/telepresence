@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,6 +22,11 @@ import (
 // ErrInvalidToken is returned by Authenticate when the Kubernetes API server rejects the bearer token.
 var ErrInvalidToken = errors.New("invalid bearer token")
 
+// errTooManyReviews is returned when review admission rejects a TokenReview.
+// The token cache stores it for the failure TTL, so a throttled token backs
+// off for those ten seconds instead of re-entering admission per call.
+var errTooManyReviews = errors.New("too many authentication attempts")
+
 const (
 	podNameExtraKey = "authentication.kubernetes.io/pod-name"
 	podUIDExtraKey  = "authentication.kubernetes.io/pod-uid"
@@ -30,9 +38,11 @@ const (
 // Authenticator validates bearer tokens using cached Kubernetes TokenReviews, or,
 // first, a store of tokens minted by the x509 auth listener.
 type Authenticator struct {
-	token   authenticator.Token
-	minted  *MintedTokens
-	metrics *tokenReviewMetrics
+	token         authenticator.Token
+	minted        *MintedTokens
+	reviewer      *tokenReviewer
+	metrics       *Metrics
+	reviewMetrics *tokenReviewMetrics
 }
 
 // Option configures an Authenticator constructed by NewAuthenticator.
@@ -46,16 +56,41 @@ func WithMintedTokens(m *MintedTokens) Option {
 	}
 }
 
+// WithMetrics makes the Authenticator record cache hits, first/fallback TokenReview
+// calls, invalid tokens, and API-server failures on m. Intended for the external
+// listener, whose Authenticator is otherwise unshared with the internal one.
+func WithMetrics(m *Metrics) Option {
+	return func(a *Authenticator) {
+		a.metrics = m
+	}
+}
+
+// WithReviewAdmission bounds the rate and concurrency of TokenReviews -- the
+// expensive, API-server-bound step -- with the external admission constants.
+// Cached tokens never enter admission; only a review pays it.
+func WithReviewAdmission() Option {
+	return func(a *Authenticator) {
+		a.reviewer.limiter = rate.NewLimiter(rate.Limit(externalAuthQPS), externalAuthBurst)
+		a.reviewer.sem = make(chan struct{}, externalMaxConcurrentAuth)
+	}
+}
+
 // NewAuthenticator creates an Authenticator that validates tokens with the TokenReview API of ci.
 func NewAuthenticator(ci kubernetes.Interface, opts ...Option) *Authenticator {
-	metrics := newTokenReviewMetrics()
+	reviewer := &tokenReviewer{client: ci}
 	a := &Authenticator{
-		token:   cache.New(&tokenReviewer{client: ci, metrics: metrics}, true, successCacheTTL, failureCacheTTL),
-		metrics: metrics,
+		token:         cache.New(reviewer, true, successCacheTTL, failureCacheTTL),
+		reviewer:      reviewer,
+		metrics:       unregisteredMetrics(),
+		reviewMetrics: newTokenReviewMetrics(),
 	}
 	for _, opt := range opts {
 		opt(a)
 	}
+	// The reviewer only needs metrics wired once opts (which may set a.metrics) have
+	// all run.
+	reviewer.metrics = a.metrics
+	reviewer.reviewMetrics = a.reviewMetrics
 	return a
 }
 
@@ -67,14 +102,27 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (*Princi
 			return p, nil
 		}
 	}
-	resp, ok, err := a.token.AuthenticateToken(ctx, token)
+	resp, ok, err := a.reviewCounted(ctx, token)
 	if err != nil {
 		return nil, fmt.Errorf("token review: %w", err)
 	}
 	if !ok {
+		a.metrics.InvalidTokens.Inc()
 		return nil, ErrInvalidToken
 	}
 	return principalFromInfo(resp.User), nil
+}
+
+// reviewCounted authenticates the token, counting a cache hit when the call completed
+// without a new TokenReview. Concurrent calls can mask a hit, so the metric is a
+// proportional signal, not an exact count.
+func (a *Authenticator) reviewCounted(reviewCtx context.Context, token string) (*authenticator.Response, bool, error) {
+	before := a.reviewer.calls.Load()
+	resp, ok, err := a.token.AuthenticateToken(reviewCtx, token)
+	if a.reviewer.calls.Load() == before {
+		a.metrics.CacheHits.Inc()
+	}
+	return resp, ok, err
 }
 
 func principalFromInfo(info user.Info) *Principal {
@@ -98,11 +146,21 @@ func principalFromInfo(info user.Info) *Principal {
 
 // tokenReviewer implements authenticator.Token by delegating to the Kubernetes TokenReview API.
 type tokenReviewer struct {
-	client  kubernetes.Interface
-	metrics *tokenReviewMetrics
+	client kubernetes.Interface
+	// metrics is set by NewAuthenticator once its options have run; it is
+	// never nil.
+	metrics       *Metrics
+	reviewMetrics *tokenReviewMetrics
+	// calls counts AuthenticateToken invocations -- i.e. cache misses.
+	calls atomic.Uint64
+	// limiter and sem, when set by WithReviewAdmission, bound the rate and
+	// concurrency of reviews.
+	limiter *rate.Limiter
+	sem     chan struct{}
 }
 
 func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+	t.calls.Add(1)
 	resp, ok, err := t.review(ctx, token, []string{agentconfig.ManagerTokenAudience}, "manager")
 	if err != nil || ok {
 		return resp, ok, err
@@ -113,11 +171,32 @@ func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*a
 }
 
 func (t *tokenReviewer) review(ctx context.Context, token string, audiences []string, audienceLabel string) (*authenticator.Response, bool, error) {
+	if t.limiter != nil {
+		if !t.limiter.Allow() {
+			t.metrics.RateLimited.Inc()
+			return nil, false, errTooManyReviews
+		}
+		select {
+		case t.sem <- struct{}{}:
+			defer func() { <-t.sem }()
+		default:
+			t.metrics.RateLimited.Inc()
+			return nil, false, errTooManyReviews
+		}
+	}
 	review := &authenticationv1.TokenReview{
 		Spec: authenticationv1.TokenReviewSpec{Token: token, Audiences: audiences},
 	}
 	start := time.Now()
 	result, err := t.client.AuthenticationV1().TokenReviews().Create(ctx, review, metav1.CreateOptions{})
+	if audienceLabel == "manager" {
+		t.metrics.FirstReviews.Inc()
+	} else {
+		t.metrics.FallbackReviews.Inc()
+	}
+	if err != nil {
+		t.metrics.APIFailures.Inc()
+	}
 	outcome := "error"
 	if err == nil {
 		outcome = "rejected"
@@ -125,7 +204,7 @@ func (t *tokenReviewer) review(ctx context.Context, token string, audiences []st
 			outcome = "authenticated"
 		}
 	}
-	t.metrics.observe(audienceLabel, outcome, time.Since(start))
+	t.reviewMetrics.observe(audienceLabel, outcome, time.Since(start))
 	if err != nil {
 		return nil, false, err
 	}

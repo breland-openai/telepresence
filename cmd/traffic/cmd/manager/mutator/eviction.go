@@ -154,6 +154,7 @@ const (
 	podEvictionGone podEvictionResult = iota
 	podEvictionStarted
 	podEvictionDeferred
+	podEvictionAccepted
 )
 
 func (c *configWatcher) evictPods(ctx context.Context, wl k8sapi.Workload, pods []*core.Pod) (err error) {
@@ -163,12 +164,31 @@ func (c *configWatcher) evictPods(ctx context.Context, wl k8sapi.Workload, pods 
 		evictionState = c.lockEvictionState(key)
 		defer evictionState.Unlock()
 
+		previousUID := wl.GetUID()
 		wl, err = refreshWorkload(ctx, wl)
 		if err != nil {
 			return err
 		}
+		if previousUID != "" && wl.GetUID() != previousUID {
+			return nil
+		}
+		if pending := evictionState.acceptedReplacement; pending != nil {
+			var recovered bool
+			if recovered, err = pending.recovered(ctx, wl); err != nil {
+				return err
+			}
+			if !recovered {
+				clog.Debugf(ctx, "Deferring pod eviction because %s is replacing pod %s", wl, pending.name)
+				return nil
+			}
+			evictionState.acceptedReplacement = nil
+		}
 		if !workloadUpdateInProgress(wl) {
 			evictionState.replacementPending = false
+		}
+		if k8sapi.DesiredReplicas(wl) == 0 {
+			clog.Debugf(ctx, "Deferring pod eviction because %s has no desired replicas", wl)
+			return nil
 		}
 		if evictionState.replacementPending || workloadRolloutInProgress(wl) {
 			clog.Debugf(ctx, "Deferring pod eviction because %s is already updating", wl)
@@ -176,6 +196,8 @@ func (c *configWatcher) evictPods(ctx context.Context, wl k8sapi.Workload, pods 
 		}
 	}
 
+	var ownedPods []*core.Pod
+	listedPods := false
 	for _, pod := range pods {
 		podID := pod.UID
 		if c.isEvicted(podID) {
@@ -185,6 +207,12 @@ func (c *configWatcher) evictPods(ctx context.Context, wl k8sapi.Workload, pods 
 		if podIsManuallyInjected(ctx, pod) {
 			clog.Tracef(ctx, "Skipping pod %s because it is managed manually", pod.Name)
 			continue
+		}
+		if evictionState != nil && !listedPods {
+			if ownedPods, err = liveWorkloadPods(ctx, wl); err != nil {
+				return err
+			}
+			listedPods = true
 		}
 		result := podEvictionGone
 		c.inactivePods.Compute(podID, func(v inactivation, loaded bool) (inactivation, xsync.ComputeOp) {
@@ -203,6 +231,11 @@ func (c *configWatcher) evictPods(ctx context.Context, wl k8sapi.Workload, pods 
 		switch result {
 		case podEvictionDeferred:
 			return nil
+		case podEvictionAccepted:
+			if evictionState != nil {
+				evictionState.acceptedReplacement = newPodReplacement(wl, pod, ownedPods)
+				return nil
+			}
 		case podEvictionStarted:
 			if evictionState != nil {
 				evictionState.replacementPending = true
@@ -211,6 +244,63 @@ func (c *configWatcher) evictPods(ctx context.Context, wl k8sapi.Workload, pods 
 		}
 	}
 	return nil
+}
+
+type podReplacement struct {
+	name            string
+	uid             types.UID
+	workloadUID     types.UID
+	desiredReplicas int32
+	previousUIDs    map[types.UID]struct{}
+}
+
+func newPodReplacement(wl k8sapi.Workload, pod *core.Pod, ownedPods []*core.Pod) *podReplacement {
+	previous := make(map[types.UID]struct{}, len(ownedPods)+1)
+	previous[pod.UID] = struct{}{}
+	for _, p := range ownedPods {
+		previous[p.UID] = struct{}{}
+	}
+	return &podReplacement{
+		name: pod.Name, uid: pod.UID, workloadUID: wl.GetUID(),
+		desiredReplicas: k8sapi.DesiredReplicas(wl), previousUIDs: previous,
+	}
+}
+
+func (p *podReplacement) recovered(ctx context.Context, wl k8sapi.Workload) (bool, error) {
+	if p.workloadUID != "" && wl.GetUID() != p.workloadUID {
+		return true, nil
+	}
+	old, err := k8sapi.GetK8sInterface(ctx).CoreV1().Pods(wl.GetNamespace()).Get(ctx, p.name, meta.GetOptions{})
+	if err != nil && !k8sErrors.IsNotFound(err) {
+		return false, err
+	}
+	if err == nil && old.UID == p.uid && old.DeletionTimestamp == nil {
+		return false, nil
+	}
+	pods, err := liveWorkloadPods(ctx, wl)
+	if err != nil {
+		return false, err
+	}
+	var ready int32
+	freshReady := false
+	for _, pod := range pods {
+		if pod.UID == "" || pod.UID == p.uid || !podIsReady(pod) {
+			continue
+		}
+		ready++
+		if _, seen := p.previousUIDs[pod.UID]; !seen {
+			freshReady = true
+		}
+	}
+	desired := k8sapi.DesiredReplicas(wl)
+	return ready >= desired && (freshReady || desired < p.desiredReplicas), nil
+}
+
+func podIsReady(pod *core.Pod) bool {
+	return pod.DeletionTimestamp == nil && pod.Status.Phase == core.PodRunning &&
+		slices.ContainsFunc(pod.Status.Conditions, func(condition core.PodCondition) bool {
+			return condition.Type == core.PodReady && condition.Status == core.ConditionTrue
+		})
 }
 
 type disruptionBudgetError struct {
@@ -226,12 +316,13 @@ func (e disruptionBudgetError) Error() string {
 
 func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod) (podEvictionResult, error) {
 	if wl != nil {
+		previousUID := wl.GetUID()
 		refreshed, err := refreshWorkload(ctx, wl)
 		if err != nil {
 			return podEvictionGone, err
 		}
 		wl = refreshed
-		if workloadRolloutInProgress(wl) {
+		if (previousUID != "" && wl.GetUID() != previousUID) || k8sapi.DesiredReplicas(wl) == 0 || workloadRolloutInProgress(wl) {
 			// Do not consume disruption budget while another rollout is already replacing pods.
 			clog.Debugf(ctx, "Deferring eviction of %s because %s is already updating", pod.Name, wl)
 			return podEvictionDeferred, nil
@@ -243,15 +334,7 @@ func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod) (pod
 		if !evicted {
 			return podEvictionGone, nil
 		}
-		if wl == nil {
-			return podEvictionStarted, nil
-		}
-		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if waitErr := waitForWorkloadUpdateStart(waitCtx, wl); waitErr != nil {
-			return podEvictionStarted, fmt.Errorf("workload update was not observed after evicting %s: %w", pod.Name, waitErr)
-		}
-		return podEvictionStarted, nil
+		return podEvictionAccepted, nil
 	}
 	if wl == nil || !errors.As(err, &disruptionBudgetError{}) {
 		return podEvictionGone, fmt.Errorf("failed to evict pod %s: %v", pod.Name, err)
@@ -260,6 +343,9 @@ func evictOrRollout(ctx context.Context, wl k8sapi.Workload, pod *core.Pod) (pod
 	refreshedWorkload, refreshErr := refreshWorkload(ctx, wl)
 	if refreshErr != nil {
 		return podEvictionGone, refreshErr
+	}
+	if wl.GetUID() != "" && refreshedWorkload.GetUID() != wl.GetUID() {
+		return podEvictionDeferred, nil
 	}
 	wl = refreshedWorkload
 	if workloadRolloutInProgress(wl) {
@@ -373,14 +459,6 @@ func workloadRefreshErrorIsTerminal(err error) bool {
 		k8sErrors.IsMethodNotSupported(err)
 }
 
-func refreshedWorkloadUpdateInProgress(ctx context.Context, wl k8sapi.Workload) (k8sapi.Workload, bool, error) {
-	refreshed, err := refreshWorkload(ctx, wl)
-	if err != nil {
-		return nil, false, err
-	}
-	return refreshed, workloadUpdateInProgress(refreshed), nil
-}
-
 func retryEvictPod(ctx context.Context, wl k8sapi.Workload, pod *core.Pod, replicas int) error {
 	err := waitForReplicaCount(ctx, wl, replicas)
 	if err != nil {
@@ -442,24 +520,6 @@ func waitForReplicaCount(ctx context.Context, wl k8sapi.Workload, count int) err
 		case <-ctx.Done():
 			return fmt.Errorf("%s never scaled to %d", wl, count)
 		case <-time.After(2 * time.Second):
-		}
-	}
-}
-
-func waitForWorkloadUpdateStart(ctx context.Context, wl k8sapi.Workload) error {
-	for {
-		refreshed, updating, err := refreshedWorkloadUpdateInProgress(ctx, wl)
-		if err != nil {
-			return err
-		}
-		if updating {
-			return nil
-		}
-		wl = refreshed
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("%s did not start updating: %w", wl, ctx.Err())
-		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
@@ -629,6 +689,84 @@ func workloadPods(ctx context.Context, wl k8sapi.Workload) ([]*core.Pod, error) 
 	if err != nil {
 		return nil, err
 	}
+	return ownedWorkloadPods(ctx, wl, pods, podOwnerWorkload)
+}
+
+func liveWorkloadPods(ctx context.Context, wl k8sapi.Workload) ([]*core.Pod, error) {
+	selector, err := wl.Selector()
+	if err != nil {
+		return nil, err
+	}
+	if _, selectable := selector.Requirements(); !selectable {
+		return nil, nil
+	}
+	list, err := k8sapi.GetK8sInterface(ctx).CoreV1().Pods(wl.GetNamespace()).List(ctx, meta.ListOptions{LabelSelector: selector.String()})
+	if err != nil {
+		return nil, err
+	}
+	pods := make([]*core.Pod, len(list.Items))
+	for i := range list.Items {
+		pods[i] = &list.Items[i]
+	}
+	resolver := &liveOwnerResolver{workloads: make(map[WorkloadKey]k8sapi.Workload)}
+	return ownedWorkloadPods(ctx, wl, pods, func(ctx context.Context, pod *core.Pod, enabledWorkloads k8sapi.Kinds) (k8sapi.Workload, error) {
+		if !enabledWorkloads.Contains(wl.GetKind()) {
+			enabledWorkloads = append(slices.Clone(enabledWorkloads), wl.GetKind())
+		}
+		return resolver.owner(ctx, k8sapi.Pod(pod), enabledWorkloads)
+	})
+}
+
+type liveOwnerResolver struct {
+	workloads map[WorkloadKey]k8sapi.Workload
+}
+
+func (r *liveOwnerResolver) workload(ctx context.Context, key WorkloadKey) (k8sapi.Workload, error) {
+	if wl := r.workloads[key]; wl != nil {
+		return wl, nil
+	}
+	wl, err := k8sapi.GetWorkload(ctx, key.Name, key.Namespace, key.Kind)
+	if err == nil {
+		r.workloads[key] = wl
+	}
+	return wl, err
+}
+
+func (r *liveOwnerResolver) owner(ctx context.Context, obj k8sapi.Object, enabledWorkloads k8sapi.Kinds) (k8sapi.Workload, error) {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.Controller == nil || !*ref.Controller {
+			continue
+		}
+		kind := k8sapi.Kind(ref.Kind)
+		if !enabledWorkloads.Contains(kind) && (kind != k8sapi.ReplicaSetKind ||
+			(!enabledWorkloads.Contains(k8sapi.DeploymentKind) && !enabledWorkloads.Contains(k8sapi.RolloutKind))) {
+			return nil, k8sErrors.NewNotFound(obj.GetGroupResource(), obj.GetName())
+		}
+		owner, err := r.workload(ctx, WorkloadKey{Kind: kind, Name: ref.Name, Namespace: obj.GetNamespace()})
+		if err != nil {
+			return nil, err
+		}
+		if ref.UID != "" && owner.GetUID() != ref.UID {
+			return nil, k8sErrors.NewNotFound(owner.GetGroupResource(), ref.Name)
+		}
+		return r.owner(ctx, owner, enabledWorkloads)
+	}
+	if wl, ok := obj.(k8sapi.Workload); ok && enabledWorkloads.Contains(wl.GetKind()) {
+		return wl, nil
+	}
+	if name, ok := obj.GetLabels()[agentconfig.WorkloadNameLabel]; ok {
+		kind := k8sapi.Kind(obj.GetLabels()[agentconfig.WorkloadKindLabel])
+		return r.workload(ctx, WorkloadKey{Kind: kind, Name: name, Namespace: obj.GetNamespace()})
+	}
+	return nil, k8sErrors.NewNotFound(obj.GetGroupResource(), obj.GetName())
+}
+
+func ownedWorkloadPods(ctx context.Context, wl k8sapi.Workload, pods []*core.Pod,
+	resolveOwner func(context.Context, *core.Pod, k8sapi.Kinds) (k8sapi.Workload, error),
+) ([]*core.Pod, error) {
+	if len(pods) == 0 {
+		return nil, nil
+	}
 	// A selector is not always unique to one workload. Stable and canary
 	// Deployments commonly share one and distinguish their pods only by
 	// template labels, so verify ownership before evicting a candidate pod.
@@ -639,14 +777,15 @@ func workloadPods(ctx context.Context, wl k8sapi.Workload) ([]*core.Pod, error) 
 		if !podIsPendingOrRunning(pod) {
 			continue
 		}
-		owner, err := podOwnerWorkload(ctx, pod, enabledWorkloads)
+		owner, err := resolveOwner(ctx, pod, enabledWorkloads)
 		if err != nil {
 			if k8sErrors.IsNotFound(err) {
 				continue
 			}
 			return nil, err
 		}
-		if (WorkloadKey{Kind: owner.GetKind(), Name: owner.GetName(), Namespace: owner.GetNamespace()}) == workloadKey {
+		if (WorkloadKey{Kind: owner.GetKind(), Name: owner.GetName(), Namespace: owner.GetNamespace()}) == workloadKey &&
+			(wl.GetUID() == "" || owner.GetUID() == wl.GetUID()) {
 			ownedPods = append(ownedPods, pod)
 		}
 	}
