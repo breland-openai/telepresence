@@ -91,6 +91,7 @@ type State struct {
 	llSubs                     *loglevelSubscribers
 	workloadWatchers           *xsync.Map[string, Watcher] // workload watchers, created on demand and keyed by namespace
 	serviceInterceptWatchers   *xsync.Map[string, struct{}]
+	sidecarAgentWaits          sync.Map
 
 	// nodeAgentPodWatchers tracks the running per-workload node-agent pod-set
 	// watchers (nodeAgentPodWatchLoop), one per name+namespace with at least
@@ -703,15 +704,13 @@ func (s *State) RestoreIntercepts(ctx context.Context, intercepts []*rpc.Interce
 		is, _ := s.intercepts.LoadOrCompute(intercept.Id, func() *Intercept {
 			is := &Intercept{InterceptInfo: intercept}
 			s.initializeParticipants(is)
-			wl, err := agentmap.GetWorkload(ctx, spec.Agent, spec.Namespace, k8sapi.Kind(spec.WorkloadKind))
-			if err == nil {
-				is.addFinalizer(func(ctx context.Context, interceptInfo *rpc.InterceptInfo) error {
-					return s.restoreAppContainer(ctx, interceptInfo, wl)
-				})
-			}
 			if spec.NodeAgent {
 				is.addFinalizer(s.nodeAgentReapFinalizer())
 				nodeAgentWatches[nodeAgentWatchKey{name: spec.Agent, namespace: spec.Namespace}] = struct{}{}
+			} else if wl, err := agentmap.GetWorkload(ctx, spec.Agent, spec.Namespace, k8sapi.Kind(spec.WorkloadKind)); err == nil {
+				is.addFinalizer(func(ctx context.Context, interceptInfo *rpc.InterceptInfo) error {
+					return s.restoreAppContainer(ctx, interceptInfo, wl)
+				})
 			}
 			if serviceScopedIntercept(spec) {
 				serviceInterceptWatches[intercept.Id] = struct{}{}

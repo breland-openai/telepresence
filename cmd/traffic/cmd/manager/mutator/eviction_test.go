@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/telepresenceio/clog/testutil"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
@@ -502,7 +503,8 @@ func TestAcceptedEvictionWaitsForOwnedReadyReplacementWithoutDeploymentUpdate(t 
 	}
 	wl := k8sapi.Deployment(deployment)
 	cw := NewWatcher().(*configWatcher)
-	config := &agentconfig.Sidecar{}
+	config := &agentconfig.Sidecar{AgentName: deployment.Name, Namespace: namespace}
+	cw.Store(config)
 	configJSON, err := agentconfig.MarshalTight(config)
 	require.NoError(t, err)
 	reconcile := func() error { return cw.EvictPodsWithAgentConfigMismatch(ctx, wl, config) }
@@ -632,6 +634,9 @@ func TestAcceptedEvictionRecoveryRecognizesReusedStatefulSetPodName(t *testing.T
 	sibling := replacementTestPod("echo-1", namespace, statefulSet.Name)
 	for _, pod := range []*core.Pod{old, sibling} {
 		pod.Labels[agentconfig.WorkloadKindLabel] = string(k8sapi.StatefulSetKind)
+		pod.OwnerReferences = []meta.OwnerReference{{
+			APIVersion: "apps/v1", Kind: string(k8sapi.StatefulSetKind), Name: statefulSet.Name, UID: statefulSet.UID, Controller: ptr.To(true),
+		}}
 	}
 	replacement := old.DeepCopy()
 	replacement.UID = "new-echo-0"
@@ -672,7 +677,7 @@ func TestAcceptedEvictionRecoveryChecksEachControllerUID(t *testing.T) {
 			replicaSet := &apps.ReplicaSet{ObjectMeta: meta.ObjectMeta{
 				Name: "echo-abc123", Namespace: namespace, UID: "new-replica-set-uid",
 				OwnerReferences: []meta.OwnerReference{{
-					Kind: string(k8sapi.DeploymentKind), Name: liveDeployment.Name, UID: liveDeployment.UID, Controller: &controller,
+					APIVersion: "apps/v1", Kind: string(k8sapi.DeploymentKind), Name: liveDeployment.Name, UID: liveDeployment.UID, Controller: &controller,
 				}},
 			}}
 			if tc.staleParentOwner {
@@ -682,7 +687,7 @@ func TestAcceptedEvictionRecoveryChecksEachControllerUID(t *testing.T) {
 			sibling := replacementTestPod("echo-sibling", namespace, deployment.Name)
 			fresh := replacementTestPod("echo-fresh", namespace, deployment.Name)
 			fresh.OwnerReferences = []meta.OwnerReference{{
-				Kind: string(k8sapi.ReplicaSetKind), Name: replicaSet.Name, UID: replicaSet.UID, Controller: &controller,
+				APIVersion: "apps/v1", Kind: string(k8sapi.ReplicaSetKind), Name: replicaSet.Name, UID: replicaSet.UID, Controller: &controller,
 			}}
 			if tc.stalePodOwner {
 				fresh.OwnerReferences[0].UID = "old-replica-set-uid"
@@ -736,6 +741,9 @@ func replacementTestPod(name, namespace, workload string) *core.Pod {
 				agentconfig.WorkloadKindLabel: string(k8sapi.DeploymentKind),
 			},
 			Annotations: map[string]string{annotation.Config: "stale"},
+			OwnerReferences: []meta.OwnerReference{{
+				APIVersion: "apps/v1", Kind: string(k8sapi.DeploymentKind), Name: workload, UID: types.UID(workload + "-deployment-uid"), Controller: ptr.To(true),
+			}},
 		},
 		Status: core.PodStatus{
 			Phase: core.PodRunning, Conditions: []core.PodCondition{{Type: core.PodReady, Status: core.ConditionTrue}},
@@ -952,7 +960,7 @@ func TestDeleteMapsAndRolloutNamespaceWaitsForAllEvictions(t *testing.T) {
 	replicas := int32(3)
 	selector := map[string]string{"app": name}
 	replicaSet := &apps.ReplicaSet{
-		ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace, Generation: 1},
+		ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace, Generation: 1, UID: "echo-replica-set-uid"},
 		Spec: apps.ReplicaSetSpec{
 			Replicas: &replicas,
 			Selector: &meta.LabelSelector{MatchLabels: selector},
@@ -978,6 +986,9 @@ func TestDeleteMapsAndRolloutNamespaceWaitsForAllEvictions(t *testing.T) {
 					agentconfig.WorkloadKindLabel: string(k8sapi.ReplicaSetKind),
 				},
 				Annotations: map[string]string{annotation.Config: "stale"},
+				OwnerReferences: []meta.OwnerReference{{
+					APIVersion: "apps/v1", Kind: string(k8sapi.ReplicaSetKind), Name: name, UID: replicaSet.UID, Controller: ptr.To(true),
+				}},
 			},
 			Status: core.PodStatus{Phase: core.PodRunning, Conditions: []core.PodCondition{{Type: core.PodReady, Status: core.ConditionTrue}}},
 		})
@@ -1029,6 +1040,9 @@ func TestDeleteMapsAndRolloutNamespaceWaitsForAllEvictions(t *testing.T) {
 					agentconfig.WorkloadNameLabel: name,
 					agentconfig.WorkloadKindLabel: string(k8sapi.ReplicaSetKind),
 				},
+				OwnerReferences: []meta.OwnerReference{{
+					APIVersion: "apps/v1", Kind: string(k8sapi.ReplicaSetKind), Name: name, UID: replicaSet.UID, Controller: ptr.To(true),
+				}},
 			},
 			Status: core.PodStatus{Phase: core.PodRunning, Conditions: []core.PodCondition{{Type: core.PodReady, Status: core.ConditionTrue}}},
 		}

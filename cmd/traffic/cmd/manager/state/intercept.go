@@ -1222,6 +1222,11 @@ func (s *State) ensureAgent(parentCtx context.Context, wl k8sapi.Workload, exten
 		return sc, nil, nil
 	}
 
+	wait := s.beginSidecarAgentWait(parentCtx, wl)
+	var cfgJSON string
+	var waitOutcome sidecarAgentWaitOutcome
+	defer func() { s.finishSidecarAgentWait(wait, cfgJSON, waitOutcome) }()
+
 	ctx, cancel := context.WithTimeout(parentCtx, managerutil.GetEnv(parentCtx).AgentArrivalTimeout)
 	defer cancel()
 
@@ -1234,20 +1239,22 @@ func (s *State) ensureAgent(parentCtx context.Context, wl k8sapi.Workload, exten
 	if err != nil {
 		return nil, nil, err
 	}
+	cfgJSON, err = agentconfig.MarshalTight(sc)
+	if err != nil {
+		return nil, nil, err
+	}
+	waitOutcome = sidecarAgentWaitPreserve
 	err = mutator.GetMap(ctx).EvictPodsWithAgentConfigMismatch(ctx, wl, sc)
 	if err != nil {
 		clog.Errorf(ctx, "failed to inactivate pods: %v", err)
 		return nil, nil, err
 	}
-	// The injector puts exactly one traffic-agent in each pod it just
-	// evicted, so this wait always expects a single arrival.
-	as, err := s.waitForAgents(ctx, sc.AgentName, sc.Namespace, false, 1, failedCreateCh)
+	as, err := s.waitForSidecarAgent(ctx, wl, sc.AgentName, sc.Namespace, cfgJSON, failedCreateCh)
 	if err != nil {
-		// If no agent arrives, then drop its entry from the configmap. This ensures that there
-		// are no false positives the next time an intercept is attempted.
-		s.dropAgentConfig(parentCtx, wl)
+		waitOutcome = sidecarAgentWaitFailed
 		return nil, nil, err
 	}
+	waitOutcome = sidecarAgentWaitSucceeded
 	sortAgents(as)
 	return sc, as, nil
 }
@@ -1287,7 +1294,7 @@ func (s *State) waitForNodeAgent(parentCtx context.Context, name, namespace stri
 		expected = 1
 	}
 
-	as, err := s.waitForAgents(ctx, name, namespace, true, expected, failedCreateCh)
+	as, err := s.waitForAgents(ctx, name, namespace, expected, failedCreateCh)
 	if err != nil && ctx.Err() == context.DeadlineExceeded {
 		if missing := missingNodeAgentTargets(jobTargets, as); len(missing) > 0 {
 			err = errcat.User.Newf("%s\nNo agent registered for target pod(s): %s", err.Error(), strings.Join(missing, ", "))
@@ -1332,20 +1339,14 @@ func (s *State) ValidateAgentImage(agentImage string, extended bool) (err error)
 	return err
 }
 
-func (s *State) dropAgentConfig(
-	ctx context.Context,
-	wl k8sapi.Workload,
-) {
-	mutator.GetMap(ctx).Delete(wl.GetName(), wl.GetNamespace())
-}
-
 func (s *State) restoreAppContainer(ctx context.Context, ii *rpc.InterceptInfo, wl k8sapi.Workload) error {
 	clog.Debugf(ctx, "Restoring app container for %s", ii.Id)
 	spec := ii.Spec
 	n := spec.Agent
 	ns := spec.Namespace
 	mm := mutator.GetMap(ctx)
-	_, err := mm.Update(n, ns, func(sc *agentconfig.Sidecar) (*agentconfig.Sidecar, error) {
+	changed := false
+	config, err := mm.Update(n, ns, func(sc *agentconfig.Sidecar) (*agentconfig.Sidecar, error) {
 		if sc == nil {
 			return nil, nil
 		}
@@ -1366,14 +1367,13 @@ func (s *State) restoreAppContainer(ctx context.Context, ii *rpc.InterceptInfo, 
 			return sc, nil
 		}
 		cn.Replace = desiredPolicy
-
-		// The pods for this workload will be killed once the new updated sidecar
-		// reaches the configmap. We inactivate them now, so that they don't continue to
-		// review intercepts.
-		err = mm.EvictPodsWithAgentConfigMismatch(ctx, wl, sc)
-		return sc, err
+		changed = true
+		return sc, nil
 	})
-	return err
+	if err != nil || !changed {
+		return err
+	}
+	return mm.EvictPodsWithAgentConfigMismatch(ctx, wl, config)
 }
 
 func (s *State) GetOrGenerateAgentConfig(ctx context.Context, name, namespace string) (*agentconfig.Sidecar, error) {
@@ -1567,22 +1567,36 @@ func terminalEventMessage(ctx context.Context, fe *events.Event, podNamespace st
 	return msg
 }
 
-// waitForAgents waits for expected distinct agent sessions matching name,
-// namespace and nodeAgent to register, accumulating matching, non-
+// waitForAgents waits for expected distinct node-agent sessions matching name
+// and namespace to register, accumulating matching, non-
 // blacklisted sessions by PodUid across every delta (including the initial
 // snapshot Subscribe delivers of agents already registered) until that many
 // are present.
 func (s *State) waitForAgents(
 	ctx context.Context,
 	name, namespace string,
+	expected int,
+	failedCreateCh <-chan *events.Event,
+) ([]*AgentSession, error) {
+	return s.waitForAgentsMatching(ctx, name, namespace, true, expected, failedCreateCh, nil)
+}
+
+func (s *State) waitForAgentsMatching(
+	ctx context.Context,
+	name, namespace string,
 	nodeAgent bool,
 	expected int,
 	failedCreateCh <-chan *events.Event,
+	sidecar *sidecarAgentArrival,
 ) ([]*AgentSession, error) {
 	clog.Debugf(ctx, "Waiting for %d agent(s) %s.%s", expected, name, namespace)
 	deltaCh := s.WatchAgents(ctx, func(_ tunnel.SessionID, agent *AgentSession) bool {
 		return agentSessionMatches(agent, name, namespace, nodeAgent)
 	})
+	var retryCh <-chan time.Time
+	if sidecar != nil {
+		retryCh = sidecar.retryCh
+	}
 	// podNamespace is where the pods behind failure events live: the
 	// workload's namespace for a sidecar, but the traffic-manager's own
 	// namespace for a node-agent Job.
@@ -1621,20 +1635,23 @@ func (s *State) waitForAgents(
 				// The request has been canceled.
 				return nil, status.Error(codes.Canceled, fmt.Sprintf("channel closed while waiting for agent %s.%s to arrive", name, namespace))
 			}
-			for _, a := range delta.Upserts {
-				if mm.IsInactive(k8sTypes.UID(a.PodUid)) {
-					clog.Debugf(ctx, "Agent %s(%s) is blacklisted", a.PodName, a.PodIp)
-					continue
+			if sidecar != nil {
+				if err := sidecar.apply(ctx, mm, arrived, delta); err != nil {
+					return nil, err
 				}
-				clog.Debugf(ctx, "Agent %s(%s) is ready", a.PodName, a.PodIp)
-				arrived[a.PodUid] = a
+			} else {
+				for _, a := range delta.Upserts {
+					if mm.IsInactive(k8sTypes.UID(a.PodUid)) {
+						clog.Debugf(ctx, "Agent %s(%s) is blacklisted", a.PodName, a.PodIp)
+						continue
+					}
+					clog.Debugf(ctx, "Agent %s(%s) is ready", a.PodName, a.PodIp)
+					arrived[a.PodUid] = a
+				}
 			}
-			if len(arrived) >= expected {
-				as := make([]*AgentSession, 0, len(arrived))
-				for _, a := range arrived {
-					as = append(as, a)
-				}
-				return as, nil
+		case <-retryCh:
+			if err := sidecar.retry(ctx, mm, arrived); err != nil {
+				return nil, err
 			}
 		case <-ctx.Done():
 			v := "canceled"
@@ -1667,11 +1684,10 @@ func (s *State) waitForAgents(
 							"See https://telepresence.io/docs/troubleshooting#eks-calico-and-traffic-agent-injection-timeouts")
 				}
 			}
-			as := make([]*AgentSession, 0, len(arrived))
-			for _, a := range arrived {
-				as = append(as, a)
-			}
-			return as, errcat.User.New(bf.String())
+			return maps.Values(arrived), errcat.User.New(bf.String())
+		}
+		if len(arrived) >= expected {
+			return maps.Values(arrived), nil
 		}
 	}
 }

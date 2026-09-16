@@ -789,7 +789,7 @@ func TestWaitForAgents_FirstArrivalSatisfiesExpectedOne(t *testing.T) {
 	s := &State{agents: cache.NewMap[tunnel.SessionID, *AgentSession](agentsEqual, time.Millisecond)}
 	s.agents.Store(tunnel.SessionID("s1"), waitForAgentsTestSession("uid-1", "pod-1"))
 
-	as, err := s.waitForAgents(ctx, "test-agent", "test-namespace", true, 1, make(chan *events.Event))
+	as, err := s.waitForAgents(ctx, "test-agent", "test-namespace", 1, make(chan *events.Event))
 	require.NoError(t, err)
 	require.Len(t, as, 1)
 	assert.Equal(t, "uid-1", as[0].PodUid)
@@ -819,7 +819,7 @@ func TestWaitForAgents_SatisfiedByExistingSnapshot(t *testing.T) {
 	}
 	resultCh := make(chan result, 1)
 	go func() {
-		as, err := s.waitForAgents(ctx, "test-agent", "test-namespace", true, 2, make(chan *events.Event))
+		as, err := s.waitForAgents(ctx, "test-agent", "test-namespace", 2, make(chan *events.Event))
 		resultCh <- result{as, err}
 	}()
 
@@ -855,7 +855,7 @@ func TestWaitForAgents_AccumulatesToExpectedCount(t *testing.T) {
 	}
 	resultCh := make(chan result, 1)
 	go func() {
-		as, err := s.waitForAgents(ctx, "test-agent", "test-namespace", true, 2, make(chan *events.Event))
+		as, err := s.waitForAgents(ctx, "test-agent", "test-namespace", 2, make(chan *events.Event))
 		resultCh <- result{as, err}
 	}()
 
