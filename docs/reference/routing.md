@@ -6,6 +6,25 @@ toc_max_heading_level: 2
 
 # Connection Routing
 
+## Workstation connections
+
+The workstation has one active Telepresence host connection at a time. Its
+default name is `<kube-context>-<namespace>`; `telepresence connect --name`
+sets an explicit name. To switch to a differently named host connection,
+disconnect the current one first, for example
+`telepresence quit --use '^my-connection$'`, then connect with the new name.
+An active host connection can coexist with connections established using
+`telepresence connect --docker`, because each Docker daemon has its own network.
+
+`--use` selects an existing connection by regular expression. If the expression
+does not match a connection or matches more than one, select an exact name. It
+does not create a new connection under another name. A scoped `quit` that
+matches nothing leaves existing connections unchanged.
+
+When another command is connecting, commands that require a connection wait
+for it to finish unless you cancel them. You can still check `telepresence status`
+while the connection is in progress.
+
 ## The Virtual Network Interface
 
 The Telepresence daemon creates a Virtual Network Interface (VIF) when it connects to the cluster. The VIF routes the cluster's subnets so that every local tool can reach cluster services, and it intercepts DNS requests so that cluster names resolve (see [DNS resolution](#dns-resolution) below).

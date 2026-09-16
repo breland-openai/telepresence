@@ -225,7 +225,7 @@ func (s *service) Connect(ctx context.Context, cr *rpc.ConnectRequest) (result *
 	if s.rootSessionInProc {
 		go runAliveAndCancellationSession(session, func() {
 			cancelUserSession(errors.New("session daemon info file disappeared"))
-		}, daemonID, wg)
+		}, daemonID, s.daemonAddress, s.hostID, wg)
 	}
 	return result, err
 }
