@@ -1,6 +1,7 @@
 package agentpf
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/netip"
@@ -22,6 +23,30 @@ import (
 )
 
 type workloadReadyTestClient struct{ agent.AgentClient }
+
+func seedWorkloadTestClient(cs *clients, info *manager.AgentPodInfo, cli agent.AgentClient) *client {
+	ac := cs.loadOrAddClient(info)
+	ac.Lock()
+	ac.cli = cli
+	ac.Unlock()
+	return ac
+}
+
+func findWorkloadTestClient(cs *clients, info *manager.AgentPodInfo) *client {
+	var found *client
+	cs.clients.Range(func(_ string, ac *client) bool {
+		ac.RLock()
+		stored := ac.info
+		matches := stored != nil && stored.PodName == info.PodName && stored.Namespace == info.Namespace &&
+			stored.PodId == info.PodId && bytes.Equal(stored.PodIp, info.PodIp)
+		ac.RUnlock()
+		if matches {
+			found = ac
+		}
+		return !matches
+	})
+	return found
+}
 
 func TestWaitForWorkloadFirstCallerWaitsForRealAgentDelta(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
@@ -45,7 +70,7 @@ func TestWaitForWorkloadFirstCallerWaitsForRealAgentDelta(t *testing.T) {
 		default:
 		}
 		info := podInfo("missing", "alpha", "10.0.0.1")
-		cs.clients.Store("missing.alpha", &client{Cluster: cs.Cluster, info: info, cli: &workloadReadyTestClient{}})
+		seedWorkloadTestClient(cs, info, &workloadReadyTestClient{})
 		require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"missing.alpha": info}, nil))
 		synctest.Wait()
 		require.NoError(t, <-first)
@@ -102,7 +127,7 @@ func TestWaitForWorkloadSameNameInOtherMappedNamespaceCannotRelease(t *testing.T
 		go func() { result <- cs.WaitForWorkload(t.Context(), time.Minute, "same") }()
 		synctest.Wait()
 		otherInfo := podInfo("same", "other", "10.0.0.1")
-		cs.clients.Store("same.other", &client{Cluster: cs.Cluster, info: otherInfo, cli: &workloadReadyTestClient{}})
+		seedWorkloadTestClient(cs, otherInfo, &workloadReadyTestClient{})
 		require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"same.other": otherInfo}, nil))
 		synctest.Wait()
 		select {
@@ -114,13 +139,27 @@ func TestWaitForWorkloadSameNameInOtherMappedNamespaceCannotRelease(t *testing.T
 		require.True(t, waiterStillStored)
 		require.False(t, cs.isProxyVIA(otherInfo))
 		require.False(t, cs.hasWaiterFor(otherInfo))
+		nodeInfo := podInfo("same-node", "alpha", "10.0.0.3")
+		nodeInfo.WorkloadName, nodeInfo.NodeAgent = "same", true
+		seedWorkloadTestClient(cs, nodeInfo, &workloadReadyTestClient{})
+		require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"same-node.alpha": nodeInfo}, nil))
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("connected matching node agent released workload readiness: %v", err)
+		default:
+		}
+		_, waiterStillStored = cs.wlWaiters.Load("same")
+		require.True(t, waiterStillStored)
+		require.False(t, cs.isProxyVIA(nodeInfo))
+		require.False(t, cs.hasWaiterFor(nodeInfo))
 		primaryInfo := podInfo("same", "alpha", "10.0.0.2")
-		cs.clients.Store("same.alpha", &client{Cluster: cs.Cluster, info: primaryInfo, cli: &workloadReadyTestClient{}})
+		primaryLive := seedWorkloadTestClient(cs, primaryInfo, &workloadReadyTestClient{})
 		require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"same.alpha": primaryInfo}, nil))
 		synctest.Wait()
 		require.NoError(t, <-result)
 		require.True(t, cs.isProxyVIA(primaryInfo))
-		require.NotNil(t, cs.GetWorkloadClient("same"))
+		require.Same(t, primaryLive, cs.GetWorkloadClient("same"))
 	})
 }
 
@@ -133,13 +172,11 @@ func TestWaitForWorkloadRetriesFailedNativeDialWithoutAnotherAgentDelta(t *testi
 	info := podInfo("same", "alpha", "10.0.0.1")
 	info.PodId, info.ApiPort = "native-dial", 9900
 	require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"same.alpha": info}, nil))
-	_, exists := cs.clients.Load("same.alpha")
-	require.True(t, exists)
+	require.NotNil(t, findWorkloadTestClient(cs, info))
 	result := make(chan error, 1)
 	go func() { result <- cs.WaitForWorkload(ctx, time.Second, "same") }()
 	require.Eventually(t, func() bool {
-		_, stillPresent := cs.clients.Load("same.alpha")
-		return !stillPresent
+		return findWorkloadTestClient(cs, info) == nil
 	}, time.Second, 5*time.Millisecond, "native gRPC route failure must remove its failed live client")
 	select {
 	case err := <-result:
@@ -148,9 +185,7 @@ func TestWaitForWorkloadRetriesFailedNativeDialWithoutAnotherAgentDelta(t *testi
 	}
 	_, _, snapshotStillPresent := cs.WorkloadForIP(netip.MustParseAddr("10.0.0.1"))
 	require.True(t, snapshotStillPresent, "the only manager delta stays authoritative after the dial failure")
-	cs.clients.Store("same.alpha", &client{
-		Cluster: cs.Cluster, owner: cs, info: info, cli: &workloadReadyTestClient{}, remove: func() { cs.clients.Delete("same.alpha") },
-	})
+	seedWorkloadTestClient(cs, info, &workloadReadyTestClient{})
 	select {
 	case err := <-result:
 		require.NoError(t, err)
@@ -195,10 +230,7 @@ func TestWaitForWorkloadHealthyReplicaDoesNotWaitBehindUnreachableReplica(t *tes
 	stale.PodId, stale.ApiPort, stale.WorkloadName = "stale-native-dial", 9900, "same"
 	healthy := podInfo("z-healthy", "alpha", "10.0.0.2")
 	healthy.PodId, healthy.ApiPort, healthy.WorkloadName = "healthy-native-dial", 9900, "same"
-	healthyLive := &client{
-		Cluster: cs.Cluster, owner: cs, info: healthy, cli: &workloadReadyTestClient{}, remove: func() { cs.clients.Delete("z-healthy.alpha") },
-	}
-	cs.clients.Store("z-healthy.alpha", healthyLive)
+	healthyLive := seedWorkloadTestClient(cs, healthy, &workloadReadyTestClient{})
 	require.NoError(t, cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"a-stale.alpha": stale, "z-healthy.alpha": healthy}, nil))
 	start := time.Now()
 	require.NoError(t, cs.WaitForWorkload(ctx, 250*time.Millisecond, "same"))
@@ -210,7 +242,7 @@ func TestWaitForWorkloadHealthyReplicaDoesNotWaitBehindUnreachableReplica(t *tes
 
 func TestGetWorkloadClientPrefersReachablePrimaryReplicaAndExcludesNodeAgents(t *testing.T) {
 	cs := newTestClients(t.Context(), "alpha")
-	addWorkloadLookupClient(t, cs, "first-unreachable", "alpha", "target", false, false)
+	unreachable, _ := addWorkloadLookupClient(t, cs, "first-unreachable", "alpha", "target", false, false)
 	addWorkloadLookupClient(t, cs, "first-outside", "other", "target", false, true)
 	addWorkloadLookupClient(t, cs, "first-node", "alpha", "target", true, true)
 	later, _ := addWorkloadLookupClient(t, cs, "later", "alpha", "target", false, true)
@@ -218,13 +250,15 @@ func TestGetWorkloadClientPrefersReachablePrimaryReplicaAndExcludesNodeAgents(t 
 	for range 10 {
 		require.Same(t, last, cs.GetWorkloadClient("target"))
 	}
-	cs.clients.Delete("last.alpha")
+	last.remove()
+	require.Nil(t, findWorkloadTestClient(cs, last.info))
 	require.Same(t, later, cs.GetWorkloadClient("target"))
-	cs.clients.Delete("later.alpha")
-	unreachable, exists := cs.clients.Load("first-unreachable.alpha")
-	require.True(t, exists)
+	later.remove()
+	require.Nil(t, findWorkloadTestClient(cs, later.info))
+	require.Same(t, unreachable, findWorkloadTestClient(cs, unreachable.info))
 	require.Same(t, unreachable, cs.GetWorkloadClient("target"))
-	cs.clients.Delete("first-unreachable.alpha")
+	unreachable.remove()
+	require.Nil(t, findWorkloadTestClient(cs, unreachable.info))
 	require.Nil(t, cs.GetWorkloadClient("target"))
 }
 
@@ -428,27 +462,18 @@ func addWorkloadLookupClient(
 	t *testing.T, cs *clients, pod, namespace, workload string, nodeAgent, connected bool,
 ) (*client, agent.AgentClient) {
 	t.Helper()
-	key := pod + "." + namespace
 	var lookupAgent agent.AgentClient
 	if connected {
 		lookupAgent = &workloadLookupAgent{}
 	}
-	ac := &client{
-		Cluster: cs.Cluster,
-		session: cs.session,
-		owner:   cs,
-		remove:  func() { cs.clients.Delete(key) },
-		cli:     lookupAgent,
-		info: &manager.AgentPodInfo{
-			PodName:      pod,
-			PodId:        pod + "-id",
-			Namespace:    namespace,
-			WorkloadName: workload,
-			NodeAgent:    nodeAgent,
-			ApiPort:      9900,
-		},
-	}
-	cs.clients.Store(key, ac)
+	ac := seedWorkloadTestClient(cs, &manager.AgentPodInfo{
+		PodName:      pod,
+		PodId:        pod + "-id",
+		Namespace:    namespace,
+		WorkloadName: workload,
+		NodeAgent:    nodeAgent,
+		ApiPort:      9900,
+	}, lookupAgent)
 	return ac, lookupAgent
 }
 
@@ -543,13 +568,12 @@ func TestGetAgentForWorkloadReturnsNilWhenConnectionFails(t *testing.T) {
 	ctx := tpClient.WithConfig(t.Context(), tpClient.GetDefaultConfig())
 	ctx = k8sapi.WithK8sInterface(ctx, fake.NewClientset())
 	cs := newTestClients(ctx, "alpha")
-	addWorkloadLookupClient(t, cs, "target-0", "alpha", "target", false, false)
+	target, _ := addWorkloadLookupClient(t, cs, "target-0", "alpha", "target", false, false)
 	lookupContext, cancel := context.WithCancel(ctx)
 	cancel()
 
 	require.Nil(t, cs.GetAgentForWorkload(lookupContext, "target"))
-	_, exists := cs.clients.Load("target-0.alpha")
-	require.False(t, exists)
+	require.Nil(t, findWorkloadTestClient(cs, target.info))
 }
 
 func TestGetAgentForWorkloadConcurrentWithRefresh(t *testing.T) {
