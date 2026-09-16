@@ -721,13 +721,18 @@ func (s *session) simpleLookup(ctx context.Context, question *dns2.Question) (dn
 	if ags := s.agentClients; ags != nil {
 		lookupClient = ags.GetRandomAgent(ctx)
 	}
-	if lookupClient == nil {
+	usingAgent := lookupClient != nil
+	if usingAgent {
+		clog.Debugf(ctx, "Using traffic-agent for lookup %q", question.Name)
+	} else {
 		clog.Debugf(ctx, "Using traffic-manager for lookup %q", question.Name)
 		lookupClient = s.managerClient()
-	} else {
-		clog.Debugf(ctx, "Using traffic-agent for lookup %q", question.Name)
 	}
 	resp, err := lookupClient.Lookup(ctx, request)
+	if usingAgent && status.Code(err) == codes.Unavailable && ctx.Err() == nil {
+		clog.Debugf(ctx, "Traffic-agent unavailable for lookup %q; using traffic-manager: %v", question.Name, err)
+		resp, err = s.managerClient().Lookup(ctx, request)
+	}
 	if status.Code(err) == codes.Unimplemented {
 		return s.complexClusterLookup(ctx, question)
 	}
