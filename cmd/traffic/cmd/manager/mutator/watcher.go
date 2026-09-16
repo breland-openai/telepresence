@@ -17,6 +17,7 @@ import (
 	netv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
@@ -53,14 +54,18 @@ type Map interface {
 }
 
 type configWatcher struct {
-	cancel         context.CancelFunc
-	agentConfigs   *xsync.Map[string, *xsync.Map[string, *agentconfig.Sidecar]]
-	informers      *xsync.Map[string, *informersWithCancel]
-	inactivePods   *xsync.Map[types.UID, inactivation]
-	evictionStates *xsync.Map[WorkloadKey, *workloadEvictionState]
-	startedAt      time.Time
-	configured     atomic.Bool
-	running        atomic.Bool
+	cancel             context.CancelFunc
+	agentConfigs       *xsync.Map[string, *xsync.Map[string, *agentconfig.Sidecar]]
+	informers          *xsync.Map[string, *informersWithCancel]
+	inactivePods       *xsync.Map[types.UID, inactivation]
+	evictionStates     *xsync.Map[WorkloadKey, *workloadEvictionState]
+	evictionRequests   *xsync.Map[WorkloadKey, *workloadEvictionRequest]
+	evictionQueueMutex sync.Mutex
+	evictionQueue      workqueue.TypedRateLimitingInterface[WorkloadKey]
+	evictionQueueDone  chan struct{}
+	startedAt          time.Time
+	configured         atomic.Bool
+	running            atomic.Bool
 }
 
 type workloadEvictionState struct {
@@ -83,6 +88,7 @@ func (c *configWatcher) lockEvictionState(key WorkloadKey) *workloadEvictionStat
 }
 
 func (c *configWatcher) deleteEvictionState(key WorkloadKey) {
+	defer c.deleteEvictionRequest(key)
 	for {
 		state, ok := c.evictionStates.Load(key)
 		if !ok {
@@ -102,6 +108,16 @@ func (c *configWatcher) deleteNamespaceEvictionStates(namespace string) {
 	c.evictionStates.Range(func(key WorkloadKey, _ *workloadEvictionState) bool {
 		if key.Namespace == namespace {
 			c.deleteEvictionState(key)
+		}
+		return true
+	})
+	c.evictionRequests.Range(func(key WorkloadKey, request *workloadEvictionRequest) bool {
+		if key.Namespace == namespace {
+			request.Lock()
+			if current, ok := c.evictionRequests.Load(key); ok && current == request {
+				c.evictionRequests.Delete(key)
+			}
+			request.Unlock()
 		}
 		return true
 	})
@@ -196,8 +212,15 @@ func (c *configWatcher) regenerateAgentConfigs(ctx context.Context, ns string, g
 			}
 		}
 		if len(podsOfInterest) > 0 {
-			if err := c.evictPods(ctx, wl, podsOfInterest); err != nil {
-				clog.Errorf(ctx, "failed to evict pods for %s", wl)
+			var evictionErr error
+			if !managerutil.GetEnv(ctx).EnabledWorkloadKinds.Contains(wl.GetKind()) {
+				c.Delete(wl.GetName(), wl.GetNamespace())
+				evictionErr = c.EvictPodsWithAgentConfig(ctx, wl)
+			} else if desired := c.Get(wl.GetName(), wl.GetNamespace()); desired != nil {
+				evictionErr = c.EvictPodsWithAgentConfigMismatch(ctx, wl, desired)
+			}
+			if evictionErr != nil {
+				clog.Errorf(ctx, "failed to evict pods for %s: %v", wl, evictionErr)
 			}
 		}
 	}
@@ -220,6 +243,7 @@ const (
 	replicaSetWatcher
 	statefulSetWatcher
 	rolloutWatcher
+	podWatcher
 	watcherMax
 )
 
@@ -277,11 +301,12 @@ func (c *configWatcher) Store(sc *agentconfig.Sidecar) {
 
 func NewWatcher() Map {
 	w := &configWatcher{
-		cancel:         func() {},
-		informers:      xsync.NewMap[string, *informersWithCancel](),
-		inactivePods:   xsync.NewMap[types.UID, inactivation](),
-		evictionStates: xsync.NewMap[WorkloadKey, *workloadEvictionState](),
-		agentConfigs:   xsync.NewMap[string, *xsync.Map[string, *agentconfig.Sidecar]](),
+		cancel:           func() {},
+		informers:        xsync.NewMap[string, *informersWithCancel](),
+		inactivePods:     xsync.NewMap[types.UID, inactivation](),
+		evictionStates:   xsync.NewMap[WorkloadKey, *workloadEvictionState](),
+		evictionRequests: xsync.NewMap[WorkloadKey, *workloadEvictionRequest](),
+		agentConfigs:     xsync.NewMap[string, *xsync.Map[string, *agentconfig.Sidecar]](),
 	}
 	return w
 }
@@ -309,7 +334,7 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 			ifns[rolloutWatcher] = workload.StartRollouts(ctx, ns)
 		}
 	}
-	c.startPods(ctx, ns)
+	ifns[podWatcher] = c.startPods(ctx, ns)
 	c.startIngresses(ctx, ns)
 	kf := informer.GetK8sFactory(ctx, ns)
 	kf.Start(ctx.Done())
@@ -332,13 +357,17 @@ func (c *configWatcher) startWatchers(ctx context.Context, iwc *informersWithCan
 	if err != nil {
 		return err
 	}
-	for i := deploymentWatcher; i < watcherMax; i++ {
+	for i := deploymentWatcher; i <= rolloutWatcher; i++ {
 		if ifn := ifns[i]; ifn != nil {
 			iwc.eventRegs[i], err = c.watchWorkloads(ctx, ifn)
 			if err != nil {
 				return err
 			}
 		}
+	}
+	iwc.eventRegs[podWatcher], err = c.watchEvictionPods(ifns[podWatcher])
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -347,6 +376,7 @@ func (c *configWatcher) StartWatchers(ctx context.Context) error {
 	defer c.running.Store(true)
 	c.startedAt = time.Now()
 	ctx, c.cancel = context.WithCancel(ctx)
+	c.startEvictionQueue(ctx)
 	var errs error
 	c.informers.Range(func(ns string, iwc *informersWithCancel) bool {
 		if err := c.startWatchers(ctx, iwc); err != nil {
@@ -449,7 +479,9 @@ func (c *configWatcher) startPods(ctx context.Context, ns string) cache.SharedIn
 					State: cns[i].State,
 				}
 			}
-			ps.Conditions = nil
+			ps.Conditions = slices.DeleteFunc(ps.Conditions, func(condition core.PodCondition) bool {
+				return condition.Type != core.PodReady
+			})
 			ps.EphemeralContainerStatuses = nil
 			ps.HostIPs = nil
 			ps.HostIP = ""

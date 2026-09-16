@@ -390,7 +390,7 @@ matchExpressions:
 	unnamedNumericPortUID := makeUID()
 	multiPortUID := makeUID()
 
-	clientset := fake.NewClientset(
+	clientsetObjects := []runtime.Object{
 		&core.Namespace{
 			TypeMeta: meta.TypeMeta{
 				Kind:       "Namespace",
@@ -539,7 +539,14 @@ matchExpressions:
 		deployment(&podNamedAndNumericPort),
 		deployment(&podMultiPort),
 		deployment(&podMultiSplitPort),
-	)
+	}
+	createClientset := func() kubernetes.Interface {
+		objects := make([]runtime.Object, len(clientsetObjects))
+		for i, object := range clientsetObjects {
+			objects[i] = object.DeepCopyObject()
+		}
+		return fake.NewClientset(objects...)
+	}
 	type testInput struct {
 		name           string
 		request        *core.Pod
@@ -871,7 +878,7 @@ matchExpressions:
 			AgentInitContainerEnabled: true,
 		}
 		ctx = managerutil.WithEnv(ctx, env)
-		ctx = setupAgentInjector(t, ctx, clientset)
+		ctx = setupAgentInjector(t, ctx, createClientset())
 
 		gc, err := env.GeneratorConfig("ghcr.io/telepresenceio/tel2:2.13.3")
 		require.NoError(t, err)
@@ -2188,28 +2195,40 @@ func generateForPod(t *testing.T, ctx context.Context, pod *core.Pod, gc *agentm
 }
 
 func setupAgentInjector(t *testing.T, ctx context.Context, ci kubernetes.Interface) context.Context {
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
 	k8sapi.InstallFakeSelfSubjectAccessReviews(ci, nil)
 	ctx = k8sapi.WithJoinedClientSetInterface(ctx, ci, argorolloutsfake.NewSimpleClientset())
 	ctx = informer.WithFactory(ctx, "")
 	ctx, err := managerutil.WithAgentImageRetriever(ctx, func(context.Context, string) error { return nil })
 	require.NoError(t, err)
 
-	configWatcher := config.NewWatcher(mgrNs)
+	managerConfigWatcher := config.NewWatcher(mgrNs)
+	configWatcherDone := make(chan struct{})
 	go func(watcherCtx context.Context) {
-		err := configWatcher.Run(watcherCtx)
+		defer close(configWatcherDone)
+		err := managerConfigWatcher.Run(watcherCtx)
 		if err != nil {
 			t.Error(err)
 		}
 	}(ctx)
-	require.NoError(t, configWatcher.ForceEvent(ctx))
-	ctx, err = namespaces.InitContext(ctx, configWatcher.SelectorChannel())
+	t.Cleanup(func() {
+		cancel()
+		<-configWatcherDone
+	})
+	require.NoError(t, managerConfigWatcher.ForceEvent(ctx))
+	ctx, err = namespaces.InitContext(ctx, managerConfigWatcher.SelectorChannel())
 	require.NoError(t, err)
 
-	cw := NewWatcher()
+	cw := NewWatcher().(*configWatcher)
 	ctx = WithMap(ctx, cw)
 	cw.Start(ctx)
 
 	require.NoError(t, cw.StartWatchers(ctx))
+	t.Cleanup(func() {
+		cancel()
+		<-cw.evictionQueueDone
+	})
 	informer.GetK8sFactory(ctx, "").WaitForCacheSync(ctx.Done())
 	time.Sleep(time.Second)
 	return ctx

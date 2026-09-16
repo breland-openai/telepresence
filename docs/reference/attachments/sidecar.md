@@ -5,17 +5,26 @@ title: Traffic Agent Sidecar
 
 When replacing a container or intercepting a service, the Telepresence Traffic Manager ensures
 that a Traffic Agent has been injected into the targeted workload.
-The injection is triggered by a Kubernetes Mutating Webhook and will
-only happen once. The Traffic Agent is responsible for making the environment and volumes available
+The initial injection is triggered by a Kubernetes Mutating Webhook. The agent remains installed
+between attachments, and its pods are recreated when a new attachment needs a different agent configuration.
+The Traffic Agent is responsible for making the environment and volumes available
 on the developer's workstation, and also for redirecting traffic to it.
 
 Sidecar injection is the default way to attach to a workload. A workload can instead be attached to entirely
 without injection — and without any pod restart — by the node-hosted traffic-agent (see
 [Node-hosted traffic-agent](../node-agent.md)), at the cost of running a privileged agent pod. `replace`
 always requires the sidecar; it is not supported by the node-agent.
+Removing a node-hosted attachment after the Traffic Manager restarts still cleans up only its
+node-agent job; it does not alter sidecars for the same workload.
 
 When replacing a workload container, all traffic intended for it will be rerouted to the local workstation, unless
 limited using the `--port` flag.
+
+If an earlier pod recreation is still in progress, Telepresence waits until the workload has enough ready
+pods before starting another recreation. This also applies to a single-replica StatefulSet. A replacement
+is established with an agent configured to replace the requested container; an existing agent running the
+earlier configuration is not used to establish it. Only an agent on a pod owned by the current workload can
+establish the attachment.
 
 When intercepting, all `tcp` and/or `udp` traffic to the targeted port is sent to the developer's workstation.
 
@@ -28,7 +37,7 @@ Kubernetes has various
 Currently, Telepresence supports installing a
 Traffic Agent container on `Deployments`, `ReplicaSets`, `StatefulSets`, and `ArgoRollouts`. A Traffic Agent is
 installed the first time a user makes a `telepresence replace WORKLOAD`, `telepresence ingest WORKLOAD`,
-`telepresence intercept WORKLOAD`, `telepresence wiretap WORKLOAD`, or a `telepresence connect --proxy-via CIDR=WORKLAOD`.
+`telepresence intercept WORKLOAD`, `telepresence wiretap WORKLOAD`, or a `telepresence connect --proxy-via CIDR=WORKLOAD`.
 
 A Traffic Agent may also be installed up front by adding a `telepresence.io/inject-traffic-agent: enabled`
 annotation to the WORKLOADS pod template.
@@ -38,16 +47,17 @@ annotation to the WORKLOADS pod template.
 The actual installation of the Traffic Agent is performed by a mutating admission webhook that calls the agent-injector
 service in the Traffic Manager's namespace.
 
-The configuration for the sidecar, which is automatically generated, resides in the configmap `telepresence-agents`.
+The Traffic Manager generates the sidecar configuration and records it on injected pods in the
+`telepresence.io/agent-config` annotation.
 
 ### Uninstalling the Traffic Agent
 
 A Traffic Agent will normally remain in the workload's pods once it has been installed. It can be explicitly removed by
-issuing the command `telepresence uninstall WORKLOAD`. It will also be removed if its configuration is removed
-from the `telepresence-agents` configmap.
+issuing the command `telepresence uninstall WORKLOAD`. The agent may still appear in `telepresence list --agents`
+while its pod is being recreated. The Traffic Manager continues the removal if an earlier pod recreation is
+still in progress; the command does not need to be run again.
 
-Removing the `telepresence-agents` configmap will effectively uninstall all injected Traffic Agents from the same
-namespace.
+Use `telepresence uninstall --all-agents` to remove all injected Traffic Agents from the connected namespace.
 
 > [!NOTE]
 > Uninstalling will not work if the Traffic Agent is installed using the pod template annotation.
