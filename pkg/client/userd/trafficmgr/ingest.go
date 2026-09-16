@@ -30,6 +30,7 @@ func (ik ingestKey) String() string {
 type ingest struct {
 	*manager.AgentInfo
 	ingestKey
+	agentMu          sync.RWMutex
 	wg               sync.WaitGroup
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -41,17 +42,30 @@ type ingest struct {
 	mounter          remotefs.Mounter
 }
 
-func (ig *ingest) podAccess(rd daemon.DaemonClient) *podAccess {
-	ni := ig.Containers[ig.container]
+func (ig *ingest) getAgentInfo() *manager.AgentInfo {
+	ig.agentMu.RLock()
+	defer ig.agentMu.RUnlock()
+	return ig.AgentInfo
+}
+
+func (ig *ingest) setAgentInfo(ai *manager.AgentInfo) {
+	ig.agentMu.Lock()
+	ig.AgentInfo = ai
+	ig.agentMu.Unlock()
+}
+
+func (ig *ingest) podAccess(ctx context.Context, rd daemon.DaemonClient) *podAccess {
+	ai := ig.getAgentInfo()
+	ni := ai.Containers[ig.container]
 	pa := &podAccess{
 		ctx:              ig.ctx,
 		localPorts:       ig.localPorts,
 		workload:         ig.workload,
-		namespace:        ig.Namespace,
+		namespace:        ai.Namespace,
 		container:        ig.container,
-		podIP:            ig.PodIp,
-		sftpPort:         ig.SftpPort,
-		ftpPort:          ig.FtpPort,
+		podIP:            ai.PodIp,
+		sftpPort:         ai.SftpPort,
+		ftpPort:          ai.FtpPort,
 		mountPoint:       ni.MountPoint,
 		clientMountPoint: ig.localMountPoint,
 		localMountPort:   ig.localMountPort,
@@ -59,22 +73,23 @@ func (ig *ingest) podAccess(rd daemon.DaemonClient) *podAccess {
 		readOnly:         true,
 		wg:               &ig.wg,
 	}
-	if err := pa.ensureAccess(ig.ctx, rd); err != nil {
-		clog.Error(ig.ctx, err)
+	if err := pa.ensureAccess(ctx, rd); err != nil {
+		clog.Error(ctx, err)
 	}
 	return pa
 }
 
 func (ig *ingest) response() *rpc.IngestInfo {
-	cn := ig.Containers[ig.container]
+	ai := ig.getAgentInfo()
+	cn := ai.Containers[ig.container]
 	ii := &rpc.IngestInfo{
 		Workload:         ig.workload,
-		WorkloadKind:     ig.Kind,
+		WorkloadKind:     ai.Kind,
 		Container:        ig.container,
 		Namespace:        ig.namespace,
-		PodIp:            ig.PodIp,
-		SftpPort:         ig.SftpPort,
-		FtpPort:          ig.FtpPort,
+		PodIp:            ai.PodIp,
+		SftpPort:         ai.SftpPort,
+		FtpPort:          ai.FtpPort,
 		MountPoint:       cn.MountPoint,
 		Mounts:           cn.Mounts,
 		ClientMountPoint: ig.localMountPoint,
@@ -264,11 +279,14 @@ func (s *session) Ingest(ctx context.Context, rq *rpc.IngestRequest) (ir *rpc.In
 }
 
 func (s *session) startIngestPodAccess(ctx context.Context, ig *ingest, initial bool) {
-	err := s.WithRootClient(ctx, func(_ context.Context, rd daemon.DaemonClient) error {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(ig.ctx, cancel)
+	defer func() { stop(); cancel() }()
+	err := s.WithRootClient(ctx, func(ctx context.Context, rd daemon.DaemonClient) error {
 		if initial {
-			s.ingestTracker.initialStart(ig.podAccess(rd))
+			s.ingestTracker.initialStart(ig.podAccess(ctx, rd))
 		} else {
-			s.ingestTracker.start(ig.podAccess(rd))
+			s.ingestTracker.start(ig.podAccess(ctx, rd))
 		}
 		return nil
 	})
@@ -384,7 +402,7 @@ func (s *session) LeaveIngest(rq *rpc.IngestIdentifier) (ii *rpc.IngestInfo, err
 // The call is best-effort: the manager's reconciler reaps orphaned node-agent Jobs on its
 // own, so a failed or skipped release must never fail the leave.
 func (s *session) releaseNodeAgentIfLast(ig *ingest) {
-	if ig.AgentInfo == nil || !ig.NodeAgent {
+	if !ig.getAgentInfo().GetNodeAgent() {
 		return
 	}
 	stillClaimed := false
