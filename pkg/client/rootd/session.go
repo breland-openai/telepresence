@@ -1612,6 +1612,18 @@ func (s *session) start(startupCtx context.Context, g log.Group, teleroutePort u
 				return !k8s.CanPortForward(startupCtx, ns)
 			})
 		}
+		if s.hasNamedProxyViaWorkloads() && !slices.Contains(agentNamespaces, s.Namespace) {
+			if clusterCfg.UsesExternalManager() {
+				return errcat.User.Newf(
+					"--proxy-via cannot use traffic-agents in the connected namespace %q: this session does not watch its traffic-agents. "+
+						"Reconnect with --mapped-namespaces including %q.", s.Namespace, s.Namespace)
+			}
+			return errcat.User.Newf(
+				"--proxy-via cannot use traffic-agents in the connected namespace %q: this session does not watch its traffic-agents. "+
+					"Verify your Kubernetes permission with `kubectl auth can-i create pods/portforward --namespace %s` "+
+					"using the same kubeconfig context, then reconnect with --mapped-namespaces including %q.",
+				s.Namespace, s.Namespace, s.Namespace)
+		}
 		if len(agentNamespaces) > 0 {
 			s.agentClients = agentpf.NewClients(s.Cluster, s.session, agentNamespaces, s.sessionCredentialToken)
 			// Receive a callback per dial accepted from the dial watchers,
