@@ -1115,10 +1115,18 @@ message WatchInterceptRoutesRequest {
   repeated string namespaces = 1;
 }
 
-// InterceptRouteSnapshot is the complete set of routes visible in the requested
-// namespaces. An empty snapshot means that there are currently no such routes.
+// InterceptRouteSnapshot is the complete set of routes currently known to this
+// manager instance in the requested namespaces. After a manager restart, clients
+// and agents restore routes asynchronously, so the first snapshots can be empty
+// or incomplete. An observer should preserve previously installed routes during
+// recovery when manager_instance_id changes.
 message InterceptRouteSnapshot {
   repeated InterceptRoute routes = 1;
+
+  // Opaque identifier for this manager process, stable across snapshots and
+  // reopened watches. It changes when the manager restarts; it identifies
+  // neither a client session nor the manager installation.
+  string manager_instance_id = 2;
 }
 
 service Manager {
@@ -1319,6 +1327,7 @@ service Manager {
   // WatchInterceptRoutes streams full routing snapshots to an authenticated
   // observer on the internal listener. The caller must be allowed to watch
   // interceptroutes.telepresence.io in every requested namespace. The stream
-  // closes normally after five minutes; the observer must reconnect.
+  // closes normally after five minutes; the observer must reconnect. A change
+  // of manager_instance_id indicates that routes may still be recovering.
   rpc WatchInterceptRoutes(WatchInterceptRoutesRequest) returns (stream InterceptRouteSnapshot);
 }

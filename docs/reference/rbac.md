@@ -282,6 +282,14 @@ client, pod, tunnel, mount, and environment data. Cross-namespace participants
 are visible only when their namespace was also requested and authorized. The
 controller must reconnect after five minutes to renew its token and grant.
 
+Every snapshot includes an opaque manager instance ID. It stays the same across
+watches of the same manager process and changes when the manager restarts.
+Clients and agents restore intercepts asynchronously after a restart, so an
+empty or partial snapshot from a new manager instance does not establish that
+previous routes were removed. A controller should preserve previously installed
+routes during a bounded recovery period before replacing or removing them. The
+API does not indicate when all clients have finished reconnecting.
+
 ### Legacy access
 
 Clients that predate the known-name connection cannot dial

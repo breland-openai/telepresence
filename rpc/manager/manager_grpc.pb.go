@@ -228,7 +228,8 @@ type ManagerClient interface {
 	// WatchInterceptRoutes streams full routing snapshots to an authenticated
 	// observer on the internal listener. The caller must be allowed to watch
 	// interceptroutes.telepresence.io in every requested namespace. The stream
-	// closes normally after five minutes; the observer must reconnect.
+	// closes normally after five minutes; the observer must reconnect. A change
+	// of manager_instance_id indicates that routes may still be recovering.
 	WatchInterceptRoutes(ctx context.Context, in *WatchInterceptRoutesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[InterceptRouteSnapshot], error)
 }
 
@@ -976,7 +977,8 @@ type ManagerServer interface {
 	// WatchInterceptRoutes streams full routing snapshots to an authenticated
 	// observer on the internal listener. The caller must be allowed to watch
 	// interceptroutes.telepresence.io in every requested namespace. The stream
-	// closes normally after five minutes; the observer must reconnect.
+	// closes normally after five minutes; the observer must reconnect. A change
+	// of manager_instance_id indicates that routes may still be recovering.
 	WatchInterceptRoutes(*WatchInterceptRoutesRequest, grpc.ServerStreamingServer[InterceptRouteSnapshot]) error
 	mustEmbedUnimplementedManagerServer()
 }

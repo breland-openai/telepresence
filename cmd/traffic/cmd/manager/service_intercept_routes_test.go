@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -75,6 +76,7 @@ func TestWatchInterceptRoutesGRPCVerifiesProjectedIdentityAndNamespace(t *testin
 	require.NoError(t, err)
 	defer conn.Close()
 	client := rpc.NewManagerClient(conn)
+	require.NoError(t, uuid.Validate(mgr.ID()))
 	for _, tc := range []struct {
 		name, token, namespace string
 		want                   codes.Code
@@ -83,6 +85,7 @@ func TestWatchInterceptRoutesGRPCVerifiesProjectedIdentityAndNamespace(t *testin
 		{name: "invalid", token: "wrong", namespace: "default", want: codes.Unauthenticated},
 		{name: "wrong namespace", token: "projected-observer-token", namespace: "other", want: codes.PermissionDenied},
 		{name: "valid projected identity", token: "projected-observer-token", namespace: "default", want: codes.OK},
+		{name: "reopened projected identity", token: "projected-observer-token", namespace: "default", want: codes.OK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -96,6 +99,9 @@ func TestWatchInterceptRoutesGRPCVerifiesProjectedIdentityAndNamespace(t *testin
 			require.Equal(t, tc.want, status.Code(err))
 			if tc.want == codes.OK {
 				require.Empty(t, snapshot.Routes)
+				require.Equal(t, mgr.ID(), snapshot.ManagerInstanceId)
+			} else {
+				require.Nil(t, snapshot, "a rejected observer cannot see the manager instance ID")
 			}
 		})
 	}
@@ -165,6 +171,8 @@ func TestWatchInterceptRoutesScopedSnapshotsUpdatesAndReauthentication(t *testin
 	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
 	ctx := testutil.NewContext(t, true)
 	_, mgr, sctx := getTestClientConnAndService(ctx, t, nil)
+	managerID := mgr.ID()
+	require.NoError(t, uuid.Validate(managerID))
 	cs := k8sapi.GetK8sInterface(sctx).(*fake.Clientset)
 	rec := &sarRecorder{}
 	installRecordingSAR(cs, rec, func(ra *authv1.ResourceAttributes) bool {
@@ -178,7 +186,7 @@ func TestWatchInterceptRoutesScopedSnapshotsUpdatesAndReauthentication(t *testin
 	go func() {
 		done <- mgr.WatchInterceptRoutes(&rpc.WatchInterceptRoutesRequest{Namespaces: []string{"default", "default"}}, stream)
 	}()
-	require.Empty(t, recvInterceptRoutes(t, stream).Routes, "a new watch must emit a complete initial snapshot")
+	require.Empty(t, recvInterceptRoutesForInstance(t, stream, managerID).Routes, "a new watch must emit a complete initial snapshot")
 	visible := routingTestIntercept("client-session:visible", "default", "visible")
 	foreign := routingTestIntercept("foreign-session:hidden", "other", "hidden")
 	mgr.State().RestoreIntercepts(sctx, []*rpc.InterceptInfo{foreign}, time.Now())
@@ -188,7 +196,7 @@ func TestWatchInterceptRoutesScopedSnapshotsUpdatesAndReauthentication(t *testin
 	case <-time.After(50 * time.Millisecond):
 	}
 	mgr.State().RestoreIntercepts(sctx, []*rpc.InterceptInfo{visible}, time.Now())
-	routes := recvInterceptRoutes(t, stream).Routes
+	routes := recvInterceptRoutesForInstance(t, stream, managerID).Routes
 	require.Len(t, routes, 1)
 	require.Equal(t, "visible", routes[0].Name)
 	require.Equal(t, rpc.InterceptDispositionType_WAITING, routes[0].Disposition)
@@ -197,14 +205,14 @@ func TestWatchInterceptRoutesScopedSnapshotsUpdatesAndReauthentication(t *testin
 	mgr.State().UpdateIntercept(visible.Id, func(intercept *state.Intercept) {
 		intercept.Disposition = rpc.InterceptDispositionType_ACTIVE
 	})
-	routes = recvInterceptRoutes(t, stream).Routes
+	routes = recvInterceptRoutesForInstance(t, stream, managerID).Routes
 	require.Len(t, routes, 1)
 	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, routes[0].Disposition)
 	require.Equal(t, visibleID, routes[0].Id)
 	mgr.State().UpdateIntercept(visible.Id, func(intercept *state.Intercept) {
 		intercept.Disposition = rpc.InterceptDispositionType_REMOVED
 	})
-	require.Empty(t, recvInterceptRoutes(t, stream).Routes, "leaving the scope must emit the complete remaining set")
+	require.Empty(t, recvInterceptRoutesForInstance(t, stream, managerID).Routes, "leaving the scope must emit the complete remaining set")
 	cancel()
 	require.NoError(t, <-done)
 
@@ -213,12 +221,53 @@ func TestWatchInterceptRoutesScopedSnapshotsUpdatesAndReauthentication(t *testin
 	go func() {
 		done <- mgr.(*service).watchInterceptRoutes(&rpc.WatchInterceptRoutesRequest{Namespaces: []string{"default"}}, stream, 20*time.Millisecond)
 	}()
-	require.Empty(t, recvInterceptRoutes(t, stream).Routes)
+	require.Empty(t, recvInterceptRoutesForInstance(t, stream, managerID).Routes)
 	select {
 	case err := <-done:
 		require.NoError(t, err, "bounded expiry closes normally so the observer can reconnect")
 	case <-time.After(time.Second):
 		t.Fatal("observer stream did not expire")
+	}
+}
+
+func TestWatchInterceptRoutesManagerInstanceChangesAfterRestart(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	ctx := testutil.NewContext(t, true)
+	var previousID string
+	intercept := routingTestIntercept("client-session:visible", "default", "visible")
+	for _, name := range []string{"initial manager", "restarted manager"} {
+		t.Run(name, func(t *testing.T) {
+			_, mgr, sctx := getTestClientConnAndService(ctx, t, nil)
+			managerID := mgr.ID()
+			require.NoError(t, uuid.Validate(managerID))
+			require.NotEqual(t, previousID, managerID)
+			previousID = managerID
+			cs := k8sapi.GetK8sInterface(sctx).(*fake.Clientset)
+			installRecordingSAR(cs, &sarRecorder{}, func(ra *authv1.ResourceAttributes) bool {
+				return ra.Namespace == "default"
+			})
+			wctx, cancel := context.WithCancel(auth.WithPrincipal(sctx, routingObserver))
+			defer cancel()
+			stream := newFakeServerStream[rpc.InterceptRouteSnapshot](wctx)
+			done := make(chan error, 1)
+			go func() {
+				done <- mgr.WatchInterceptRoutes(&rpc.WatchInterceptRoutesRequest{Namespaces: []string{"default"}}, stream)
+			}()
+			require.Empty(t, recvInterceptRoutesForInstance(t, stream, managerID).Routes,
+				"the restarted manager sends its changed instance ID before clients restore routes")
+			mgr.State().RestoreIntercepts(sctx, []*rpc.InterceptInfo{intercept}, time.Now())
+			snapshot := recvInterceptRoutesForInstance(t, stream, managerID)
+			require.Len(t, snapshot.Routes, 1)
+			require.Equal(t, rpc.InterceptDispositionType_WAITING, snapshot.Routes[0].Disposition)
+			mgr.State().UpdateIntercept(intercept.Id, func(intercept *state.Intercept) {
+				intercept.Disposition = rpc.InterceptDispositionType_ACTIVE
+			})
+			snapshot = recvInterceptRoutesForInstance(t, stream, managerID)
+			require.Len(t, snapshot.Routes, 1)
+			require.Equal(t, rpc.InterceptDispositionType_ACTIVE, snapshot.Routes[0].Disposition)
+			cancel()
+			require.NoError(t, <-done)
+		})
 	}
 }
 
@@ -291,4 +340,11 @@ func recvInterceptRoutes(t *testing.T, stream *fakeServerStream[rpc.InterceptRou
 		t.Fatal("timed out receiving an intercept route snapshot")
 		return nil
 	}
+}
+
+func recvInterceptRoutesForInstance(t *testing.T, stream *fakeServerStream[rpc.InterceptRouteSnapshot], managerID string) *rpc.InterceptRouteSnapshot {
+	t.Helper()
+	snapshot := recvInterceptRoutes(t, stream)
+	require.Equal(t, managerID, snapshot.ManagerInstanceId)
+	return snapshot
 }

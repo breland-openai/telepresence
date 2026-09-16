@@ -80,7 +80,7 @@ func (s *service) watchInterceptRoutes(request *rpc.WatchInterceptRoutesRequest,
 			return true
 		})
 		slices.SortFunc(routes, func(a, b *rpc.InterceptRoute) int { return cmp.Compare(a.GetId(), b.GetId()) })
-		return stream.Send(&rpc.InterceptRouteSnapshot{Routes: routes})
+		return stream.Send(&rpc.InterceptRouteSnapshot{Routes: routes, ManagerInstanceId: s.id})
 	})
 }
 

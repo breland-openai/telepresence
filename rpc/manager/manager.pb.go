@@ -5580,13 +5580,20 @@ func (x *WatchInterceptRoutesRequest) GetNamespaces() []string {
 	return nil
 }
 
-// InterceptRouteSnapshot is the complete set of routes visible in the requested
-// namespaces. An empty snapshot means that there are currently no such routes.
+// InterceptRouteSnapshot is the complete set of routes currently known to this
+// manager instance in the requested namespaces. After a manager restart, clients
+// and agents restore routes asynchronously, so the first snapshots can be empty
+// or incomplete. An observer should preserve previously installed routes during
+// recovery when manager_instance_id changes.
 type InterceptRouteSnapshot struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Routes        []*InterceptRoute      `protobuf:"bytes,1,rep,name=routes,proto3" json:"routes,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Routes []*InterceptRoute      `protobuf:"bytes,1,rep,name=routes,proto3" json:"routes,omitempty"`
+	// Opaque identifier for this manager process, stable across snapshots and
+	// reopened watches. It changes when the manager restarts; it identifies
+	// neither a client session nor the manager installation.
+	ManagerInstanceId string `protobuf:"bytes,2,opt,name=manager_instance_id,json=managerInstanceId,proto3" json:"manager_instance_id,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *InterceptRouteSnapshot) Reset() {
@@ -5624,6 +5631,13 @@ func (x *InterceptRouteSnapshot) GetRoutes() []*InterceptRoute {
 		return x.Routes
 	}
 	return nil
+}
+
+func (x *InterceptRouteSnapshot) GetManagerInstanceId() string {
+	if x != nil {
+		return x.ManagerInstanceId
+	}
+	return ""
 }
 
 // "Mechanisms" are the ways that an Agent can decide handle
@@ -6421,9 +6435,10 @@ const file_manager_manager_proto_rawDesc = "" +
 	"\x1bWatchInterceptRoutesRequest\x12\x1e\n" +
 	"\n" +
 	"namespaces\x18\x01 \x03(\tR\n" +
-	"namespaces\"V\n" +
+	"namespaces\"\x86\x01\n" +
 	"\x16InterceptRouteSnapshot\x12<\n" +
-	"\x06routes\x18\x01 \x03(\v2$.telepresence.manager.InterceptRouteR\x06routes*\xad\x01\n" +
+	"\x06routes\x18\x01 \x03(\v2$.telepresence.manager.InterceptRouteR\x06routes\x12.\n" +
+	"\x13manager_instance_id\x18\x02 \x01(\tR\x11managerInstanceId*\xad\x01\n" +
 	"\x18InterceptDispositionType\x12\x0f\n" +
 	"\vUNSPECIFIED\x10\x00\x12\n" +
 	"\n" +
