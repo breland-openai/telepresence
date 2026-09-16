@@ -1,10 +1,14 @@
 package attach
 
 import (
+	"context"
+	"encoding/json/v2"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	rbacv1 "k8s.io/api/rbac/v1"
 
 	"github.com/telepresenceio/telepresence/v2/regression_test/framework/cli"
 	"github.com/telepresenceio/telepresence/v2/regression_test/framework/managers"
@@ -18,6 +22,8 @@ const (
 	// cluster component (a controller Deployment plus its RBAC), not a test
 	// workload.
 	argoNamespace = "rtest-argo"
+	// argoDefaultNamespace is the controller namespace in the upstream binding.
+	argoDefaultNamespace = "argo-rollouts"
 
 	// argoInstallURL is the upstream Argo Rollouts install manifest: the
 	// CRDs plus the namespaced controller (ServiceAccount, ClusterRole,
@@ -28,6 +34,7 @@ const (
 	// objects ensureArgoRollouts waits on and patches.
 	argoControllerDeployment = "argo-rollouts"
 	argoClusterRoleBinding   = "argo-rollouts"
+	argoControllerAccount    = "argo-rollouts"
 
 	// rolloutWorkloadName is the one Rollout workload both tests provision
 	// through the normal Workload fixture. WorkloadFixture memoizes by
@@ -121,18 +128,8 @@ func (s *ArgoRollouts) ensureArgoRollouts(t *testing.T) {
 		t.Fatalf("create namespace %s: %v", argoNamespace, err)
 	}
 
-	if _, err := r.Kubectl(ctx, argoNamespace, "apply", "-f", argoInstallURL); err != nil {
+	if err := installArgoManifest(ctx, r.Kubectl); err != nil {
 		t.Fatalf("apply argo-rollouts install manifest: %v", err)
-	}
-
-	// install.yaml hardcodes its ClusterRoleBinding's subject to the
-	// "argo-rollouts" namespace, assuming that's where it gets installed;
-	// repoint it at argoNamespace, or the controller's own ServiceAccount
-	// carries no RBAC and can never reconcile a Rollout.
-	patch := fmt.Sprintf(`[{"op":"replace","path":"/subjects/0/namespace","value":%q}]`, argoNamespace)
-	if _, err := r.Kubectl(ctx, "", "patch", "clusterrolebinding", argoClusterRoleBinding,
-		"--type=json", "-p", patch); err != nil {
-		t.Fatalf("patch %s clusterrolebinding namespace: %v", argoClusterRoleBinding, err)
 	}
 
 	if _, err := r.Kubectl(ctx, "", "wait", "--for=condition=established", "--timeout=120s",
@@ -145,6 +142,45 @@ func (s *ArgoRollouts) ensureArgoRollouts(t *testing.T) {
 	}
 
 	s.argoReady = true
+}
+
+type argoKubectl func(context.Context, string, ...string) (string, error)
+
+func installArgoManifest(ctx context.Context, kubectl argoKubectl) error {
+	out, err := kubectl(ctx, "", "get", "clusterrolebinding", argoClusterRoleBinding, "--ignore-not-found", "-o", "json")
+	if err != nil {
+		return fmt.Errorf("read %s clusterrolebinding: %w", argoClusterRoleBinding, err)
+	}
+	if strings.TrimSpace(out) != "" {
+		var binding rbacv1.ClusterRoleBinding
+		if err = json.Unmarshal([]byte(out), &binding); err != nil {
+			return fmt.Errorf("read %s clusterrolebinding subjects: %w", argoClusterRoleBinding, err)
+		}
+		if len(binding.Subjects) == 1 {
+			subject := binding.Subjects[0]
+			if subject.Kind == "ServiceAccount" && subject.APIGroup == "" &&
+				subject.Name == argoControllerAccount && subject.Namespace == argoNamespace {
+				// Reset only the fixture-owned binding to avoid a server-side conflict with its earlier namespace patch.
+				if err = patchArgoBindingNamespace(ctx, kubectl, argoNamespace, argoDefaultNamespace); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	// Client-side apply would store the oversized CRDs in a last-applied annotation.
+	if _, err = kubectl(ctx, argoNamespace, "apply", "--server-side", "-f", argoInstallURL); err != nil {
+		return err
+	}
+	return patchArgoBindingNamespace(ctx, kubectl, argoDefaultNamespace, argoNamespace)
+}
+
+func patchArgoBindingNamespace(ctx context.Context, kubectl argoKubectl, expectedNamespace, namespace string) error {
+	patch := fmt.Sprintf(`[{"op":"test","path":"/subjects/0/namespace","value":%q},{"op":"replace","path":"/subjects/0/namespace","value":%q}]`, expectedNamespace, namespace)
+	if _, err := kubectl(ctx, "", "patch", "clusterrolebinding", argoClusterRoleBinding,
+		"--type=json", "--field-manager=kubectl", "-p", patch); err != nil {
+		return fmt.Errorf("patch %s clusterrolebinding namespace: %w", argoClusterRoleBinding, err)
+	}
+	return nil
 }
 
 // Test_InterceptsRollout proves the Rollout workload kind attaches like any
