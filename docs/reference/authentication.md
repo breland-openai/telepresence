@@ -135,12 +135,14 @@ reports `Unavailable` rather than rejecting the call as unauthenticated or
 unauthorized, so an infrastructure outage is distinguishable from an actual
 denial.
 
-The internal `WatchInterceptRoutes` API requires a verified Kubernetes bearer
-and the `watch interceptroutes.telepresence.io` grant in every explicitly
-requested namespace in all three modes. It returns only routing fields and
-closes after five minutes so the controller reconnects with its current token
-and repeats authorization. The external listener does not serve this API. See
-[Routing observers](rbac.md#routing-observers) for the dedicated RBAC.
+The internal `WatchInterceptRoutes` API requires a Kubernetes bearer token for
+the `traffic-manager` audience and the `watch interceptroutes.telepresence.io`
+grant in every explicitly requested namespace in all three modes. It rejects
+tokens intended only for the Kubernetes API and tokens minted by the external
+listener. It returns only routing fields and closes after five minutes so the
+controller reconnects with its current token and repeats authorization. The
+external listener does not serve this API. See [Routing observers](rbac.md#routing-observers)
+for the dedicated RBAC.
 
 ### Staged rollout
 

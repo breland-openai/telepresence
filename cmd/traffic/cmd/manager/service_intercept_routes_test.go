@@ -46,7 +46,8 @@ func TestWatchInterceptRoutesGRPCVerifiesProjectedIdentityAndNamespace(t *testin
 		case audiencesSeen <- audiences:
 		default:
 		}
-		if token != "projected-observer-token" {
+		managerAudience := len(audiences) == 1 && audiences[0] == agentconfig.ManagerTokenAudience
+		if !(token == "projected-observer-token" && managerAudience || token == "api-only-observer-token" && len(audiences) == 0) {
 			return &authnv1.TokenReviewStatus{Authenticated: false}
 		}
 		return &authnv1.TokenReviewStatus{
@@ -83,6 +84,7 @@ func TestWatchInterceptRoutesGRPCVerifiesProjectedIdentityAndNamespace(t *testin
 	}{
 		{name: "anonymous", namespace: "default", want: codes.Unauthenticated},
 		{name: "invalid", token: "wrong", namespace: "default", want: codes.Unauthenticated},
+		{name: "same observer identity with API audience", token: "api-only-observer-token", namespace: "default", want: codes.Unauthenticated},
 		{name: "wrong namespace", token: "projected-observer-token", namespace: "other", want: codes.PermissionDenied},
 		{name: "valid projected identity", token: "projected-observer-token", namespace: "default", want: codes.OK},
 		{name: "reopened projected identity", token: "projected-observer-token", namespace: "default", want: codes.OK},
@@ -115,7 +117,10 @@ func TestWatchInterceptRoutesGRPCVerifiesProjectedIdentityAndNamespace(t *testin
 	for len(audiencesSeen) > 0 {
 		seen = append(seen, <-audiencesSeen)
 	}
-	require.Contains(t, seen, []string{agentconfig.ManagerTokenAudience})
+	require.NotEmpty(t, seen)
+	for _, audiences := range seen {
+		require.Equal(t, []string{agentconfig.ManagerTokenAudience}, audiences, "the routing gRPC must never request Kubernetes API-audience fallback")
+	}
 }
 
 func TestWatchInterceptRoutesAuthorization(t *testing.T) {

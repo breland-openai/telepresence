@@ -275,9 +275,11 @@ The controller must supply explicit namespaces and a verified Kubernetes bearer
 token, even when general manager authentication is disabled or permissive. Each
 watch can request up to 256 namespaces.
 Use a projected ServiceAccount token with the `traffic-manager` audience and
-an encrypted connection to the internal manager listener. A request for any
-unauthorized namespace is rejected in full. The resulting snapshots contain
-route and workload names, port, status, mechanism, and HTTP filters; they omit
+an encrypted connection to the internal manager listener. The controller cannot
+use a token intended only for the Kubernetes API or minted by the external
+listener. A request for any unauthorized namespace is rejected in full. The
+resulting snapshots contain route and workload names, port, status, mechanism,
+and HTTP filters; they omit
 client, pod, tunnel, mount, and environment data. Cross-namespace participants
 are visible only when their namespace was also requested and authorized. The
 controller must reconnect after five minutes to renew its token and grant.

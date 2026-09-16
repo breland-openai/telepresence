@@ -32,8 +32,9 @@ const unauthenticatedMessage = "this traffic-manager requires an authenticated c
 // Interceptor authenticates bearer tokens on incoming gRPC calls. Its behavior is
 // governed by a Mode: ModeDisabled skips general authentication, ModePermissive
 // authenticates without generally rejecting failures, and ModeEnforcing rejects
-// calls that lack a valid token. Internal routing observers always require a valid
-// token. Canceled calls never reach application handlers.
+// calls that lack a valid token. Internal routing observers always require a
+// Kubernetes token for the traffic-manager audience. Canceled calls never reach
+// application handlers.
 type Interceptor struct {
 	auth *Authenticator
 	mode Mode
@@ -106,7 +107,13 @@ func (i *Interceptor) authenticate(ctx context.Context, method string) (context.
 		}
 		return ctx, nil
 	}
-	p, err := i.auth.Authenticate(ctx, token)
+	var p *Principal
+	var err error
+	if alwaysAuthenticate(method) {
+		p, err = i.auth.AuthenticateManagerKubernetes(ctx, token)
+	} else {
+		p, err = i.auth.Authenticate(ctx, token)
+	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctx, status.FromContextError(ctxErr).Err()
 	}

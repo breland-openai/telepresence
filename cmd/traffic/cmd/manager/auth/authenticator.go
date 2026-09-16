@@ -39,6 +39,7 @@ const (
 // first, a store of tokens minted by the x509 auth listener.
 type Authenticator struct {
 	token         authenticator.Token
+	managerToken  authenticator.Token
 	minted        *MintedTokens
 	reviewer      *tokenReviewer
 	metrics       *Metrics
@@ -80,6 +81,7 @@ func NewAuthenticator(ci kubernetes.Interface, opts ...Option) *Authenticator {
 	reviewer := &tokenReviewer{client: ci}
 	a := &Authenticator{
 		token:         cache.New(reviewer, true, successCacheTTL, failureCacheTTL),
+		managerToken:  cache.New(authenticator.TokenFunc(reviewer.authenticateManager), true, successCacheTTL, failureCacheTTL),
 		reviewer:      reviewer,
 		metrics:       unregisteredMetrics(),
 		reviewMetrics: newTokenReviewMetrics(),
@@ -102,7 +104,18 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (*Princi
 			return p, nil
 		}
 	}
-	resp, ok, err := a.reviewCounted(ctx, token)
+	return a.authenticateReviewed(ctx, token, a.token)
+}
+
+// AuthenticateManagerKubernetes validates only a Kubernetes-issued token for the
+// traffic-manager audience. Its independent cache never reuses ordinary client
+// authentication, which also accepts Kubernetes API-audience and x509-minted tokens.
+func (a *Authenticator) AuthenticateManagerKubernetes(ctx context.Context, token string) (*Principal, error) {
+	return a.authenticateReviewed(ctx, token, a.managerToken)
+}
+
+func (a *Authenticator) authenticateReviewed(ctx context.Context, token string, tokenCache authenticator.Token) (*Principal, error) {
+	resp, ok, err := a.reviewCounted(ctx, token, tokenCache)
 	if err != nil {
 		return nil, fmt.Errorf("token review: %w", err)
 	}
@@ -116,9 +129,9 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (*Princi
 // reviewCounted authenticates the token, counting a cache hit when the call completed
 // without a new TokenReview. Concurrent calls can mask a hit, so the metric is a
 // proportional signal, not an exact count.
-func (a *Authenticator) reviewCounted(reviewCtx context.Context, token string) (*authenticator.Response, bool, error) {
+func (a *Authenticator) reviewCounted(reviewCtx context.Context, token string, tokenCache authenticator.Token) (*authenticator.Response, bool, error) {
 	before := a.reviewer.calls.Load()
-	resp, ok, err := a.token.AuthenticateToken(reviewCtx, token)
+	resp, ok, err := tokenCache.AuthenticateToken(reviewCtx, token)
 	if a.reviewer.calls.Load() == before {
 		a.metrics.CacheHits.Inc()
 	}
@@ -160,14 +173,18 @@ type tokenReviewer struct {
 }
 
 func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
-	t.calls.Add(1)
-	resp, ok, err := t.review(ctx, token, []string{agentconfig.ManagerTokenAudience}, "manager")
+	resp, ok, err := t.authenticateManager(ctx, token)
 	if err != nil || ok {
 		return resp, ok, err
 	}
 	// API-audience client credentials share one cached decision with the manager-audience attempt.
 	auds, _ := authenticator.AudiencesFrom(ctx)
 	return t.review(ctx, token, auds, "api")
+}
+
+func (t *tokenReviewer) authenticateManager(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+	t.calls.Add(1)
+	return t.review(ctx, token, []string{agentconfig.ManagerTokenAudience}, "manager")
 }
 
 func (t *tokenReviewer) review(ctx context.Context, token string, audiences []string, audienceLabel string) (*authenticator.Response, bool, error) {

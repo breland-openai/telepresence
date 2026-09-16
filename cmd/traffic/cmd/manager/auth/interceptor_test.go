@@ -23,6 +23,7 @@ import (
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/clog/handler"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/auth"
+	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
 )
 
@@ -135,13 +136,19 @@ func TestInterceptor_InterceptRouteObserverRequiresBearerInEveryMode(t *testing.
 	for _, mode := range []auth.Mode{auth.ModeDisabled, auth.ModePermissive, auth.ModeEnforcing} {
 		t.Run(mode.String(), func(t *testing.T) {
 			ci := fake.NewClientset()
-			k8sapi.InstallFakeTokenReviews(ci, func(token string, _ []string) *authnv1.TokenReviewStatus {
-				if token == "good" {
-					return authenticatedStatus("system:serviceaccount:routing:observer", "observer-uid")
+			k8sapi.InstallFakeTokenReviews(ci, func(token string, audiences []string) *authnv1.TokenReviewStatus {
+				if (token == "good" && len(audiences) == 1 && audiences[0] == agentconfig.ManagerTokenAudience) || (token == "api-only" && len(audiences) == 0) {
+					s := authenticatedStatus("system:serviceaccount:routing:observer", "observer-uid")
+					s.Audiences = audiences
+					return s
 				}
 				return &authnv1.TokenReviewStatus{Authenticated: false}
 			})
-			i := auth.NewInterceptor(auth.NewAuthenticator(ci), mode)
+			a := auth.NewAuthenticator(ci)
+			ordinary, err := a.Authenticate(context.Background(), "api-only")
+			require.NoError(t, err)
+			require.Equal(t, "observer-uid", ordinary.UID)
+			i := auth.NewInterceptor(a, mode)
 			info := &grpc.StreamServerInfo{FullMethod: method, IsServerStream: true}
 			for _, tc := range []struct {
 				name, credential string
@@ -149,6 +156,7 @@ func TestInterceptor_InterceptRouteObserverRequiresBearerInEveryMode(t *testing.
 			}{
 				{name: "no bearer", want: codes.Unauthenticated},
 				{name: "invalid bearer", credential: "Bearer bad", want: codes.Unauthenticated},
+				{name: "cached ordinary API audience bearer", credential: "Bearer api-only", want: codes.Unauthenticated},
 				{name: "verified bearer", credential: "Bearer good", want: codes.OK},
 			} {
 				t.Run(tc.name, func(t *testing.T) {

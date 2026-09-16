@@ -35,6 +35,10 @@ var exemptions = []exemption{
 	// quicforwarder-only.
 	{"WatchQuicBackends", "quicforwarder-only: called only from cmd/traffic/cmd/quicforwarder/allowlist.go"},
 
+	// Routing-controller-only: ordinary clients keep their session-scoped
+	// intercept watches, and older managers do not implement this observer.
+	{"WatchInterceptRoutes", "routing-controller-only on the internal listener; no Telepresence CLI or traffic-agent caller, and older managers return Unimplemented; observer authorization and scoped snapshots are covered by the manager observer tests"},
+
 	// QUIC tunnel: genuinely client-invoked, but only when the QUIC tunnel
 	// is enabled, which no compat-core test does yet.
 	{"GetQuicTunnelEndpoint", "client-invoked only when the QUIC tunnel is enabled (pkg/client/rootd/quic.go, pkg/client/agentpf/quic.go); exempt until a compat-core QUIC cell lands (see m4-spec section 1's note on version-gated features)"},
