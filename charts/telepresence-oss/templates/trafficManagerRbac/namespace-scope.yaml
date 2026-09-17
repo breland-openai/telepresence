@@ -80,6 +80,7 @@ rules:
   - patch
   - update
   resourceNames:
+  - {{ include "traffic-manager.name" $ }}
   - traffic-manager-install
 {{- /*
 Kubernetes ignores resourceNames on create, so this rule is namespace-scoped
