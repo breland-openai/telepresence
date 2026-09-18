@@ -211,8 +211,8 @@ func (s *service) Version(ctx context.Context, _ *empty.Empty) (*rpc.VersionInfo
 	vi := &rpc.VersionInfo2{
 		Name:          DisplayName,
 		Version:       version.Version,
-		AuthSupported: s.authMode != auth.ModeDisabled,
-		AuthRequired:  s.authMode == auth.ModeEnforcing,
+		AuthSupported: s.authMode != auth.ModeDisabled || auth.Enforcing(ctx, s.authMode),
+		AuthRequired:  auth.Enforcing(ctx, s.authMode),
 	}
 	// The port is advertised only when the listener is up and accepting
 	// connections, which NewService guarantees by binding it before any server
@@ -240,6 +240,11 @@ func (s *service) GetAgentConfig(ctx context.Context, request *rpc.AgentConfigRe
 	namespace, err := s.managedTargetNamespace(ctx, clientInfo, request.Namespace)
 	if err != nil {
 		return nil, err
+	}
+	if auth.RequiresEnforcement(ctx) {
+		if err := s.authorizeEnsureAgent(ctx, namespace, request.Name); err != nil {
+			return nil, err
+		}
 	}
 	scs, err := s.State().GetOrGenerateAgentConfig(ctx, request.Name, namespace)
 	if err != nil {
@@ -271,6 +276,9 @@ func (s *service) GetTelepresenceAPI(ctx context.Context, e *empty.Empty) (*rpc.
 
 // ArriveAsClient establishes a session between a client and the Manager.
 func (s *service) ArriveAsClient(ctx context.Context, client *rpc.ClientInfo) (*rpc.SessionInfo, error) {
+	if client == nil {
+		return nil, status.Error(codes.InvalidArgument, "client is required")
+	}
 	clog.Debugf(ctx, "Namespace: %s", client.Namespace)
 
 	if !s.State().ManagesNamespace(ctx, client.Namespace) {
@@ -298,8 +306,19 @@ func (s *service) ArriveAsClient(ctx context.Context, client *rpc.ClientInfo) (*
 }
 
 func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClientRequest) (*empty.Empty, error) {
+	if info == nil || info.GetSession().GetSessionId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "a session id and client are required")
+	}
 	ctx = managerutil.WithSessionInfo(ctx, info.Session)
 	sessionID := tunnel.SessionID(info.GetSession().GetSessionId())
+	if auth.RequiresEnforcement(ctx) {
+		if info.GetClient() == nil {
+			return nil, status.Error(codes.InvalidArgument, "a session id and client are required")
+		}
+		if _, err := uuid.Parse(string(sessionID)); err != nil {
+			return nil, status.Error(codes.InvalidArgument, "client session id must be a UUID")
+		}
+	}
 	if session := s.state.GetClient(sessionID); session != nil {
 		if err := state.ClientOwnershipError(ctx, sessionID, session); err != nil {
 			return nil, err
@@ -308,6 +327,9 @@ func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClient
 		return &empty.Empty{}, nil
 	}
 	client := info.Client
+	if client == nil {
+		return nil, status.Error(codes.InvalidArgument, "client is required to restore an unknown session")
+	}
 	st := s.state
 	if !st.ManagesNamespace(ctx, client.Namespace) {
 		// Sorry, we no longer manage this namespace.
@@ -320,21 +342,25 @@ func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClient
 	// State was lost (a restart) and the client is restoring it; reauthorize
 	// so a revoked grant isn't handed back for free.
 	if err := s.authorizeConnect(ctx); err != nil {
-		if s.authMode == auth.ModeEnforcing {
+		if auth.Enforcing(ctx, s.authMode) {
 			return nil, err
 		}
 		clog.Warnf(ctx, "reconnect: %v (not enforced)", err)
 	}
 
 	now := time.Now()
-	st.RestoreClient(sessionID, client, auth.PrincipalFrom(ctx), now)
+	if existing, loaded := st.RestoreClient(sessionID, client, auth.PrincipalFrom(ctx), now); loaded {
+		if err := state.ClientOwnershipError(ctx, sessionID, existing); err != nil {
+			return nil, err
+		}
+		return &empty.Empty{}, nil
+	}
 	restoredAgents := info.Agents
-	if legacyForkClient(client) && len(restoredAgents) != 0 {
-		// Legacy compact snapshots encode their omitted-environment marker at
-		// the field number now used by the QUIC port. They therefore look
-		// complete after decoding, so let the real traffic-agents reconnect
-		// instead of restoring incomplete client-owned snapshots.
-		clog.Debugf(ctx, "Not restoring %d agents supplied by a legacy client; waiting for the traffic-agents to reconnect", len(restoredAgents))
+	if (auth.RequiresEnforcement(ctx) || legacyForkClient(client)) && len(restoredAgents) != 0 {
+		// Externally authenticated clients are not an authority for agent
+		// identity. Legacy internal compact snapshots also cannot be trusted:
+		// their omitted-environment marker reuses the QUIC port field.
+		clog.Debugf(ctx, "Not restoring %d agents supplied over the external path or by a legacy client; waiting for the traffic-agents to reconnect", len(restoredAgents))
 		restoredAgents = nil
 	}
 	agents := slices.DeleteFunc(slices.Clone(restoredAgents), func(agent *rpc.AgentInfo) bool {
@@ -427,7 +453,7 @@ func (s *service) ArriveAsAgent(ctx context.Context, agent *rpc.AgentInfo) (*rpc
 	}
 
 	principal, mismatch := verifiedAgentPrincipal(ctx, agent)
-	if mismatch && s.authMode == auth.ModeEnforcing {
+	if mismatch && auth.Enforcing(ctx, s.authMode) {
 		return nil, errors.Errorf(codes.PermissionDenied,
 			"bound token does not match the presented agent identity %s.%s", agent.PodName, agent.Namespace)
 	}
@@ -452,7 +478,7 @@ func (s *service) ReconnectAgent(ctx context.Context, rq *rpc.ReconnectAgentRequ
 		return nil, status.Errorf(codes.InvalidArgument, "invalid legacy agent information: %v", err)
 	}
 	principal, mismatch := verifiedAgentPrincipal(ctx, rq.Agent)
-	if mismatch && s.authMode == auth.ModeEnforcing {
+	if mismatch && auth.Enforcing(ctx, s.authMode) {
 		return nil, errors.Errorf(codes.PermissionDenied,
 			"bound token does not match the presented agent identity %s.%s", rq.Agent.PodName, rq.Agent.Namespace)
 	}
@@ -484,6 +510,9 @@ func verifiedAgentPrincipal(ctx context.Context, agent *rpc.AgentInfo) (principa
 // A caller whose token couldn't be verified for infrastructure reasons gets
 // Unavailable instead, since ownership could not be established either way.
 func agentOwnershipError(ctx context.Context, sessionID tunnel.SessionID, agent *state.AgentSession) error {
+	if auth.RequiresEnforcement(ctx) {
+		return errors.Errorf(codes.PermissionDenied, "agent session %q is available only on the internal listener", sessionID)
+	}
 	bound := agent.Principal()
 	if bound == nil {
 		return nil
@@ -722,6 +751,14 @@ func (s *service) agentPodNamespaces(ctx context.Context, clientInfo *state.Clie
 		namespace, err := s.managedTargetNamespace(ctx, clientInfo, namespace)
 		if err != nil {
 			return nil, err
+		}
+		if auth.RequiresEnforcement(ctx) {
+			if err := s.authorizeNamespace(ctx, namespace); err != nil {
+				if status.Code(err) == codes.PermissionDenied {
+					continue
+				}
+				return nil, err
+			}
 		}
 		nss = append(nss, namespace)
 	}
@@ -1337,13 +1374,10 @@ func (s *service) WatchSessionEvents(request *rpc.SessionEventsRequest, stream g
 	if err != nil {
 		return err
 	}
-	namespaces, err := s.agentPodNamespaces(ctx, clientInfo, request.Namespaces)
+	requestedNamespaces := append(slices.Clone(request.Namespaces), clientInfo.Namespace)
+	namespaces, err := s.agentPodNamespaces(ctx, clientInfo, requestedNamespaces)
 	if err != nil {
 		return err
-	}
-	if !slices.Contains(namespaces, clientInfo.Namespace) {
-		namespaces = append(namespaces, clientInfo.Namespace)
-		sort.Strings(namespaces)
 	}
 
 	clientSessionID := managerutil.GetSessionID(ctx)
@@ -1388,6 +1422,9 @@ func (s *service) WatchSessionEvents(request *rpc.SessionEventsRequest, stream g
 }
 
 func (s *service) PrepareIntercept(ctx context.Context, request *rpc.CreateInterceptRequest) (*rpc.PreparedIntercept, error) {
+	if request == nil || request.GetInterceptSpec() == nil {
+		return nil, status.Error(codes.InvalidArgument, "intercept specification is required")
+	}
 	clog.Debugf(ctx, "Intercept name %s", request.InterceptSpec.Name)
 	ctx, client, err := s.ensureClientSession(ctx, request.Session)
 	if err != nil {
@@ -1476,6 +1513,9 @@ func (s *service) ReleaseAgent(ctx context.Context, request *rpc.ReleaseAgentReq
 
 // CreateIntercept lets a client create an intercept.
 func (s *service) CreateIntercept(ctx context.Context, ciReq *rpc.CreateInterceptRequest) (*rpc.InterceptInfo, error) {
+	if ciReq == nil || ciReq.GetInterceptSpec() == nil {
+		return nil, status.Error(codes.InvalidArgument, "intercept specification is required")
+	}
 	ctx = managerutil.WithSessionInfo(ctx, ciReq.GetSession())
 	spec := ciReq.InterceptSpec
 	clog.Debugf(ctx, "Intercept name %s", ciReq.InterceptSpec.Name)
@@ -1531,7 +1571,7 @@ func managerPodName(_ context.Context) (string, error) {
 func (s *service) authorized(ctx context.Context, operation string, review func(p *auth.Principal) error) error {
 	var err error
 	if p := auth.PrincipalFrom(ctx); p == nil {
-		if s.authMode != auth.ModeEnforcing {
+		if !auth.Enforcing(ctx, s.authMode) {
 			clog.Debugf(ctx, "caller is unauthenticated; skipping authorization of %s", operation)
 			return nil
 		}
@@ -1539,7 +1579,7 @@ func (s *service) authorized(ctx context.Context, operation string, review func(
 	} else {
 		err = review(p)
 	}
-	if err == nil || s.authMode == auth.ModeEnforcing {
+	if err == nil || auth.Enforcing(ctx, s.authMode) {
 		return err
 	}
 	clog.Warnf(ctx, "%s: %v (not enforced)", operation, err)
@@ -2257,10 +2297,10 @@ func (s *service) SetLogLevel(ctx context.Context, request *rpc.LogLevelRequest)
 		if err != nil {
 			return nil, err
 		}
-		if auth.PrincipalFrom(ctx) == nil && s.authMode == auth.ModeEnforcing {
+		if auth.PrincipalFrom(ctx) == nil && auth.Enforcing(ctx, s.authMode) {
 			return nil, errors.Errorf(codes.Unauthenticated, "setting the log level requires an authenticated caller")
 		}
-	} else if s.authMode == auth.ModeEnforcing {
+	} else if auth.Enforcing(ctx, s.authMode) {
 		return nil, errors.Errorf(codes.Unauthenticated, "setting the log level requires a client session")
 	} else {
 		clog.Debugf(ctx, "unauthenticated log level request allowed; manager is not in enforcing mode")

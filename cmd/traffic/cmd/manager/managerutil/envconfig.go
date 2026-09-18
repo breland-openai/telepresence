@@ -111,9 +111,8 @@ type Env struct {
 	// ExternalPort is the TCP port the traffic-manager's external client-only
 	// TLS gRPC listener binds to on all interfaces. Zero (the default)
 	// disables the listener. Enabling it (chart value
-	// externalEndpoint.enabled) requires AuthenticationMode to be enforcing
-	// and ExternalTLSCertDir to be set; the manager refuses to start
-	// otherwise.
+	// externalEndpoint.enabled) enforces external authentication independently
+	// of AuthenticationMode and requires ExternalTLSCertDir to be set.
 	ExternalPort uint16
 
 	// ExternalTLSCertDir is the directory containing tls.crt and tls.key for
@@ -122,6 +121,15 @@ type Env struct {
 	// the files on change, so certificate rotation never requires a manager
 	// restart.
 	ExternalTLSCertDir string
+
+	// ExternalAuthWebhookURL, when set, replaces native Kubernetes bearer token
+	// reviews on the external listener only. The manager authenticates itself to
+	// the webhook using a rotating token file; reviewed caller tokens must match
+	// at least one of ExternalAuthWebhookAudiences. An empty CA uses system trust.
+	ExternalAuthWebhookURL             string
+	ExternalAuthWebhookAudiences       []string `envSeparator:" "`
+	ExternalAuthWebhookCAFile          string
+	ExternalAuthWebhookCallerTokenFile string
 
 	// TunnelQuicExternalHost is the externally reachable host or IP advertised to
 	// clients for the QUIC tunnel endpoint, overriding candidate discovery

@@ -30,6 +30,7 @@ import (
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
 	testdata "github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/test"
 	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
+	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
 )
 
 // This file covers the required-grant dispatch in authorizeConnect and
@@ -216,6 +217,50 @@ func TestGrant_Connect_Denied(t *testing.T) {
 			req.Equal(0, mgr.State().CountClients(), "a denied connect must not add a client session")
 		})
 	}
+}
+
+func TestExternalGrantRemainsEnforcedWithPermissiveInternalListener(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	ctx := testutil.NewContext(t, true)
+	_, mgr, sctx := getTestClientConnAndService(ctx, t, grantFixtures(), func(e *managerutil.Env) {
+		e.AuthenticationMode = auth.ModePermissive
+		e.AuthorizationRequiredGrant = auth.GrantTelepresence
+	})
+	k8sapi.InstallFakeSubjectAccessReviews(k8sapi.GetK8sInterface(sctx), nil)
+	principal := &auth.Principal{Username: "alice", UID: "alice-uid"}
+	aliceInfo := testdata.GetTestClients(t)["alice"]
+	_, err := mgr.ArriveAsClient(auth.WithEnforcing(auth.WithPrincipal(sctx, principal)), aliceInfo)
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.Zero(t, mgr.State().CountClients())
+	_, err = mgr.ArriveAsClient(auth.WithPrincipal(sctx, principal), aliceInfo)
+	require.NoError(t, err)
+	require.Equal(t, 1, mgr.State().CountClients())
+}
+
+func TestExternalAgentWatchNamespacesAndConfigRequireWorkloadGrant(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	ctx := testutil.NewContext(t, true)
+	fixtures := append(grantFixtures(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "other", Labels: map[string]string{"kubernetes.io/metadata.name": "other"}}})
+	_, mgr, sctx := getTestClientConnAndService(ctx, t, fixtures, func(e *managerutil.Env) {
+		e.AuthenticationMode = auth.ModePermissive
+		e.AuthorizationRequiredGrant = auth.GrantTelepresence
+	})
+	k8sapi.InstallFakeSubjectAccessReviews(k8sapi.GetK8sInterface(sctx), func(_ string, ra *authv1.ResourceAttributes) bool {
+		return isConnectReview(ra) || isAttachmentReview(ra) && ra.Namespace == "default" && ra.Name == ""
+	})
+	principal := &auth.Principal{Username: "alice", UID: "alice-uid"}
+	external := auth.WithEnforcing(auth.WithPrincipal(sctx, principal))
+	sess, err := mgr.ArriveAsClient(external, testdata.GetTestClients(t)["alice"])
+	require.NoError(t, err)
+	client := mgr.State().GetClient(tunnel.SessionID(sess.SessionId))
+	checked, err := mgr.(*service).agentPodNamespaces(external, client, []string{"default", "other"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"default"}, checked)
+	checked, err = mgr.(*service).agentPodNamespaces(sctx, client, []string{"default", "other"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"default", "other"}, checked, "internal legacy metadata scope is unchanged")
+	_, err = mgr.GetAgentConfig(external, &rpc.AgentConfigRequest{Session: sess, Namespace: "default", Name: "test-agent"})
+	require.Equal(t, codes.PermissionDenied, status.Code(err), "namespace discovery permission does not grant a specific workload config")
 }
 
 // TestGrant_PrepareIntercept_DeniedBeforeMutation: a caller authorized to

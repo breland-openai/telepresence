@@ -295,7 +295,7 @@ logs via the StreamLogs RPC, so neither grant is mechanically required.
 */}}
 {{- define "telepresence.clientRbacInterceptRules" -}}
 {{- $requiredGrant := include "telepresence.requiredGrant" . }}
-{{- $external := .Values.externalEndpoint.enabled }}
+{{- $externalOnly := and .Values.externalEndpoint.enabled .Values.externalEndpoint.disablePortForwardRbac }}
 {{- if .Values.clientRbac.legacyAccess }}
 {{- /* Legacy. Namespace access command completion experience and client-side gather-logs discovery. */}}
 - apiGroups: [""]
@@ -309,11 +309,11 @@ logs via the StreamLogs RPC, so neither grant is mechanically required.
 - apiGroups: ["telepresence.io"]
   resources: ["logs", "logs/yaml"]
   verbs: ["get"]
-{{- if and (ne $requiredGrant "telepresence") (or (not $external) (eq $requiredGrant "portforward")) }}
+{{- if and (ne $requiredGrant "telepresence") (or (not $externalOnly) (eq $requiredGrant "portforward")) }}
 {{- /*
 Direct-agent-dial transport, and the legacy policy the manager's attachment
-review falls back to. Withheld when the endpoint is external -- those clients
-never port-forward -- except under the "portforward" required grant, where
+review falls back to. Withheld only when the endpoint is external-only,
+except under the "portforward" required grant, where
 possession of it is itself the attachment policy.
 */}}
 - apiGroups: [""]

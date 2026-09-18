@@ -197,6 +197,20 @@ spec:
             value: {{ .port | quote }}
           - name: EXTERNAL_TLS_CERT_DIR
             value: /var/run/secrets/telepresence.io/external-tls
+          {{- with .authenticationWebhook }}
+          {{- if .url }}
+          - name: EXTERNAL_AUTH_WEBHOOK_URL
+            value: {{ .url | quote }}
+          - name: EXTERNAL_AUTH_WEBHOOK_AUDIENCES
+            value: {{ join " " .audiences | quote }}
+          - name: EXTERNAL_AUTH_WEBHOOK_CALLER_TOKEN_FILE
+            value: /var/run/secrets/telepresence.io/auth-webhook-caller/token
+          {{- if .ca.secretName }}
+          - name: EXTERNAL_AUTH_WEBHOOK_CA_FILE
+            value: /var/run/secrets/telepresence.io/auth-webhook-ca/ca.crt
+          {{- end }}
+          {{- end }}
+          {{- end }}
           {{- end }}
           {{- end }}
       {{- if or .agentInjector.enabled .nodeAgent.enabled }}
@@ -459,6 +473,18 @@ spec:
             - name: external-tls
               mountPath: /var/run/secrets/telepresence.io/external-tls
               readOnly: true
+            {{- with .externalEndpoint.authenticationWebhook }}
+            {{- if .url }}
+            - name: auth-webhook-caller
+              mountPath: /var/run/secrets/telepresence.io/auth-webhook-caller
+              readOnly: true
+            {{- if .ca.secretName }}
+            - name: auth-webhook-ca
+              mountPath: /var/run/secrets/telepresence.io/auth-webhook-ca
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- end }}
           {{- end }}
           {{- with .extraVolumeMounts }}
           {{ toYaml . | nindent 12 }}
@@ -494,6 +520,33 @@ spec:
         - name: external-tls
           secret:
             secretName: {{ include "traffic-manager.externalTLSSecretName" $ }}
+        {{- with .externalEndpoint.authenticationWebhook }}
+        {{- if .url }}
+        - name: auth-webhook-caller
+          {{- if .credentials.serviceAccountTokenAudience }}
+          projected:
+            sources:
+            - serviceAccountToken:
+                audience: {{ .credentials.serviceAccountTokenAudience | quote }}
+                expirationSeconds: 3600
+                path: token
+          {{- else }}
+          secret:
+            secretName: {{ .credentials.secretName | quote }}
+            items:
+            - key: {{ .credentials.secretKey | quote }}
+              path: token
+          {{- end }}
+        {{- if .ca.secretName }}
+        - name: auth-webhook-ca
+          secret:
+            secretName: {{ .ca.secretName | quote }}
+            items:
+            - key: {{ .ca.secretKey | quote }}
+              path: ca.crt
+        {{- end }}
+        {{- end }}
+        {{- end }}
         {{- end }}
         {{- with .extraVolumes }}
         {{ toYaml . | nindent 8 }}

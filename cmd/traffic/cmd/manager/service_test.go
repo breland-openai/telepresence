@@ -549,6 +549,10 @@ func TestVersion_AuthFlags(t *testing.T) {
 			req.NoError(err)
 			req.Equal(tt.authSupported, ver.AuthSupported)
 			req.Equal(tt.authRequired, ver.AuthRequired)
+			ver, err = mgr.Version(auth.WithEnforcing(sctx), &empty.Empty{})
+			req.NoError(err)
+			req.True(ver.AuthSupported)
+			req.True(ver.AuthRequired)
 		})
 	}
 }

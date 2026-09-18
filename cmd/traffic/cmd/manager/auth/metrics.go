@@ -16,7 +16,7 @@ type Metrics struct {
 	// CacheHits counts Authenticate calls resolved from the token-review
 	// cache, without a new TokenReview call.
 	CacheHits prometheus.Counter
-	// FirstReviews counts TokenReview calls made with the manager audience.
+	// FirstReviews counts native manager-audience or configured webhook TokenReviews.
 	FirstReviews prometheus.Counter
 	// FallbackReviews counts the deliberate no-audience TokenReview retry,
 	// which serves tokens minted for the API server only.
@@ -44,10 +44,10 @@ var authMetricVecs = struct { //nolint:gochecknoglobals // prometheus vectors re
 	apiFailures     *prometheus.CounterVec
 }{
 	cacheHits:       authMetricVec("telepresence_auth_cache_hits", "Bearer token authentications resolved from cache"),
-	firstReviews:    authMetricVec("telepresence_auth_first_reviews", "Manager-audience TokenReview calls made"),
+	firstReviews:    authMetricVec("telepresence_auth_first_reviews", "Initial manager-audience or configured webhook TokenReview calls made"),
 	fallbackReviews: authMetricVec("telepresence_auth_fallback_reviews", "No-audience fallback TokenReview calls made"),
 	rateLimited:     authMetricVec("telepresence_auth_rate_limited", "TokenReview attempts rejected by review admission"),
-	invalidTokens:   authMetricVec("telepresence_auth_invalid_tokens", "Bearer tokens the API server rejected"),
+	invalidTokens:   authMetricVec("telepresence_auth_invalid_tokens", "Bearer tokens the configured reviewer rejected"),
 	apiFailures:     authMetricVec("telepresence_auth_api_failures", "TokenReview calls that failed for infrastructure reasons"),
 }
 
