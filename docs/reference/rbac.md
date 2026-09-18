@@ -180,8 +180,8 @@ metadata:
   name: traffic-manager-connect
   namespace: ambassador
 rules:
-  # Rendered when clients port-forward through the API server (no
-  # external endpoint published), and when the required grant is
+  # Rendered unless externalEndpoint.disablePortForwardRbac explicitly removes
+  # the port-forward path, and also when the required grant is
   # "portforward", which reviews possession of this grant.
   - apiGroups: [""]
     resources: ["pods/portforward"]
@@ -226,8 +226,8 @@ rules:
   # client open port-forwards directly to traffic-agents (better
   # throughput than routing via the manager), and doubles as the
   # authorization for attaching when the required grant is pods/portforward.
-  # Withheld with an external endpoint published (those clients never
-  # port-forward) unless the required grant is "portforward", where
+  # Withheld when externalEndpoint.disablePortForwardRbac is explicitly set
+  # unless the required grant is "portforward", where
   # possession of it is itself the attachment policy.
   - apiGroups: [""]
     resources: ["pods/portforward"]

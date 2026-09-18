@@ -241,12 +241,20 @@ func TestEnvconfig(t *testing.T) {
 		},
 		"external-listener": {
 			Input: map[string]string{
-				"EXTERNAL_PORT":         "8443",
-				"EXTERNAL_TLS_CERT_DIR": "/var/run/secrets/telepresence.io/external-tls",
+				"EXTERNAL_PORT":                           "8443",
+				"EXTERNAL_TLS_CERT_DIR":                   "/var/run/secrets/telepresence.io/external-tls",
+				"EXTERNAL_AUTH_WEBHOOK_URL":               "https://identity.example.com/review",
+				"EXTERNAL_AUTH_WEBHOOK_AUDIENCES":         "first second",
+				"EXTERNAL_AUTH_WEBHOOK_CA_FILE":           "/run/webhook-ca",
+				"EXTERNAL_AUTH_WEBHOOK_CALLER_TOKEN_FILE": "/run/webhook-token",
 			},
 			Output: func(e *managerutil.Env) {
 				e.ExternalPort = 8443
 				e.ExternalTLSCertDir = "/var/run/secrets/telepresence.io/external-tls"
+				e.ExternalAuthWebhookURL = "https://identity.example.com/review"
+				e.ExternalAuthWebhookAudiences = []string{"first", "second"}
+				e.ExternalAuthWebhookCAFile = "/run/webhook-ca"
+				e.ExternalAuthWebhookCallerTokenFile = "/run/webhook-token"
 			},
 		},
 	}

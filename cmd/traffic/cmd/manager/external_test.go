@@ -11,38 +11,29 @@ import (
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
 )
 
-// This file covers serveExternal's startup validation: it refuses to start,
-// rather than merely warn, when AuthenticationMode isn't enforcing or no
-// certificate directory is configured.
-
-func TestServeExternal_RefusesNonEnforcing(t *testing.T) {
-	ctx := managerutil.WithEnv(context.Background(), &managerutil.Env{
-		ExternalPort:       8443,
-		ExternalTLSCertDir: "/var/run/secrets/telepresence.io/external-tls",
-		AuthenticationMode: auth.ModePermissive,
-	})
-	err := serveExternal(ctx, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "enforcing")
+func TestServeExternal_RefusesMissingCertDirInEveryInternalMode(t *testing.T) {
+	for _, mode := range []auth.Mode{auth.ModeDisabled, auth.ModePermissive, auth.ModeEnforcing} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := managerutil.WithEnv(context.Background(), &managerutil.Env{ExternalPort: 8443, AuthenticationMode: mode})
+			err := serveExternal(ctx, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "EXTERNAL_TLS_CERT_DIR")
+		})
+	}
 }
 
-func TestServeExternal_RefusesDisabledAuth(t *testing.T) {
+func TestServeExternal_RefusesInvalidWebhookInPermissiveMode(t *testing.T) {
 	ctx := managerutil.WithEnv(context.Background(), &managerutil.Env{
-		ExternalPort:       8443,
-		ExternalTLSCertDir: "/var/run/secrets/telepresence.io/external-tls",
-		AuthenticationMode: auth.ModeDisabled,
+		ExternalPort: 8443, ExternalTLSCertDir: "/some/tls", AuthenticationMode: auth.ModePermissive,
+		ExternalAuthWebhookURL: "http://invalid.example.test/review",
 	})
 	err := serveExternal(ctx, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "enforcing")
-}
+	require.ErrorContains(t, err, "HTTPS")
 
-func TestServeExternal_RefusesMissingCertDir(t *testing.T) {
-	ctx := managerutil.WithEnv(context.Background(), &managerutil.Env{
-		ExternalPort:       8443,
-		AuthenticationMode: auth.ModeEnforcing,
+	ctx = managerutil.WithEnv(context.Background(), &managerutil.Env{
+		ExternalPort: 8443, ExternalTLSCertDir: "/some/tls", AuthenticationMode: auth.ModePermissive,
+		ExternalAuthWebhookAudiences: []string{"missing-url"},
 	})
-	err := serveExternal(ctx, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "EXTERNAL_TLS_CERT_DIR")
+	err = serveExternal(ctx, nil)
+	require.ErrorContains(t, err, "EXTERNAL_AUTH_WEBHOOK_URL")
 }

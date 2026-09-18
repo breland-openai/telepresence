@@ -19,8 +19,10 @@ import (
 	"github.com/telepresenceio/clog/testutil"
 	rpc "github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/auth"
+	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
 	testdata "github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/test"
 	"github.com/telepresenceio/telepresence/v2/pkg/grpc/server"
+	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
 )
 
 // This file covers externalService: internal-only methods are refused,
@@ -48,6 +50,17 @@ func TestExternalService_InternalOnly(t *testing.T) {
 	stream := newFakeServerStream[rpc.QuicBackendSnapshot](pctx)
 	err = es.WatchQuicBackends(&empty.Empty{}, stream)
 	req.Error(err)
+	req.Equal(codes.Unimplemented, status.Code(err))
+
+	// No backing service is provided: a call reaching the internal eviction
+	// handler would panic instead of returning the client-only surface error.
+	_, err = newExternalService(nil).UninstallAgents(pctx, &rpc.UninstallAgentsRequest{SessionInfo: &rpc.SessionInfo{SessionId: "arbitrary-session"}})
+	req.Equal(codes.Unimplemented, status.Code(err))
+	_, err = newExternalService(nil).SetLogLevel(pctx, &rpc.LogLevelRequest{})
+	req.Equal(codes.Unimplemented, status.Code(err))
+	err = newExternalService(nil).WatchAgents(&rpc.SessionInfo{}, newFakeServerStream[rpc.AgentInfoSnapshot](pctx))
+	req.Equal(codes.Unimplemented, status.Code(err))
+	err = newExternalService(nil).WatchAgentsDelta(&rpc.SessionInfo{}, newFakeServerStream[rpc.AgentInfoDelta](pctx))
 	req.Equal(codes.Unimplemented, status.Code(err))
 }
 
@@ -159,6 +172,45 @@ func TestExternalService_RequiresPrincipal(t *testing.T) {
 	_, err := es.Remain(sctx, &rpc.RemainRequest{Session: &rpc.SessionInfo{SessionId: "does-not-matter"}})
 	req.Error(err)
 	req.Equal(codes.Unauthenticated, status.Code(err))
+}
+
+func TestExternalServiceCannotUseUnownedLegacyClientOrAgentSessions(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	ctx := testutil.NewContext(t, true)
+	_, mgr, sctx := getTestClientConnAndService(ctx, t, nil, func(e *managerutil.Env) { e.AuthenticationMode = auth.ModePermissive })
+	external := newExternalService(mgr)
+	clientSession, err := mgr.ArriveAsClient(sctx, testdata.GetTestClients(t)["alice"])
+	require.NoError(t, err)
+	agentSession, err := mgr.ArriveAsAgent(sctx, testdata.GetTestAgents(t)["hello"])
+	require.NoError(t, err)
+	attacker := auth.WithEnforcing(auth.WithPrincipal(sctx, &auth.Principal{Username: "another-user", UID: "another-uid"}))
+	for _, tc := range []struct {
+		name string
+		run  func(*rpc.SessionInfo) error
+	}{
+		{"Remain", func(session *rpc.SessionInfo) error {
+			_, err := external.Remain(attacker, &rpc.RemainRequest{Session: session})
+			return err
+		}},
+		{"Depart", func(session *rpc.SessionInfo) error { _, err := external.Depart(attacker, session); return err }},
+		{"WatchIntercepts", func(session *rpc.SessionInfo) error {
+			return external.WatchIntercepts(session, newFakeServerStream[rpc.InterceptInfoSnapshot](attacker))
+		}},
+		{"WatchInterceptsDelta", func(session *rpc.SessionInfo) error {
+			return external.WatchInterceptsDelta(session, newFakeServerStream[rpc.InterceptInfoDelta](attacker))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, codes.PermissionDenied, status.Code(tc.run(clientSession)))
+			require.Equal(t, codes.NotFound, status.Code(tc.run(agentSession)))
+		})
+	}
+	_, err = mgr.Remain(sctx, &rpc.RemainRequest{Session: clientSession})
+	require.NoError(t, err, "legacy internal client remains operational")
+	agentID := tunnel.SessionID(agentSession.SessionId)
+	agent := mgr.State().GetAgent(agentID)
+	require.NoError(t, agentOwnershipError(sctx, agentID, agent), "legacy agent is valid internally")
+	require.Equal(t, codes.PermissionDenied, status.Code(agentOwnershipError(attacker, agentID, agent)))
 }
 
 // TestExternalSurface_UnauthenticatedContract proves the handler-level

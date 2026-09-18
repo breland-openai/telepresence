@@ -19,12 +19,10 @@ cluster:
 
 ## Requirements
 
-- **`security.authentication.mode: enforcing` is mandatory.** The chart
-  refuses to render, and the manager refuses to start, with an external port
-  and any other mode. In permissive mode an unauthenticated caller would be
-  admitted; that is tolerable over a port-forward only because reaching the
-  manager then requires `pods/portforward` and the API server has vouched for
-  the caller. An external endpoint has no such precondition.
+- **The external listener always enforces both authentication and authorization.**
+  `security.authentication.mode` separately controls the internal listener, so it
+  can remain `permissive` while clients migrate. Opening the external listener does
+  not weaken its checks or revoke existing port-forward access by default.
 - **Server trust must survive manager restarts.** The listener terminates TLS
   with a persisted certificate: either an existing `kubernetes.io/tls` Secret
   (`externalEndpoint.tls.secretName`) or a cert-manager Certificate
@@ -33,6 +31,60 @@ cluster:
 - The client authenticates with its kubeconfig bearer token, exactly as over
   a port-forward. Reading the kubeconfig and running its exec plugin are
   local operations, not API-server requests.
+
+## An external bearer-token webhook
+
+By default the external listener authenticates bearer tokens using the target
+cluster's Kubernetes TokenReview API. If a client's token is instead recognized
+by another identity service, configure a standard `authentication.k8s.io/v1`
+TokenReview webhook for this listener:
+
+```yaml
+externalEndpoint:
+  enabled: true
+  tls:
+    secretName: traffic-manager-external-tls
+  authenticationWebhook:
+    url: https://identity.example.com/tokenreview
+    audiences: [https://identity.example.com/dev-clients]
+    credentials:
+      serviceAccountTokenAudience: https://identity.example.com/tokenreview
+    # For private TLS trust; omit this section to use the system trust store.
+    # ca:
+    #   secretName: identity-root-ca
+    #   secretKey: ca.crt
+```
+
+The `audiences` list describes the end-user tokens the webhook can accept. It is
+sent explicitly in `spec.audiences`, and an authenticated webhook response must
+include at least one of those audiences in `status.audiences`. Kubernetes RBAC
+authorization still runs in the target cluster using the returned username,
+UID, groups, and extra claims. The webhook is therefore trusted to supply those
+claims and should allow only identities entitled to use this cluster.
+When a presented JWT contains a readable, nonempty audience that matches none
+of those configured audiences, the manager rejects it locally without disclosing
+the credential to the webhook. This is only a rejection check: the webhook must
+still validate every accepted identity, including the signature and audience.
+
+The `credentials` setting authenticates the **manager itself** in a separate
+HTTP `Authorization` header; it is not the end-user token in `spec.token`.
+Prefer a projected, one-hour Kubernetes service-account token when the webhook
+can verify the cluster's issuer, audience, and manager service account. As an
+alternative set `credentials.secretName` and optionally `credentials.secretKey`
+(default `token`) to mount an existing Secret containing the caller bearer.
+Both token sources are re-read and may rotate without restarting the manager.
+A private CA bundle (`ca.secretName` and optional `ca.secretKey`, default
+`ca.crt`) is loaded at startup; restart the manager after rotating this bundle.
+HTTPS is mandatory and redirects are rejected.
+
+Webhook errors, malformed or wrong-audience responses, and unsuccessful reviews
+never fall back to Kubernetes or admit an unauthenticated external client.
+Previously verified JWT decisions can be cached for up to two minutes, never
+reused past the JWT's declared expiry. Successful opaque-token decisions are
+not cached because a standard TokenReview response carries no token expiry.
+The existing internal client, agent, and routing-observer authentication remains
+unchanged and never uses this webhook. Do not enable an external webhook until
+its network access, caller authentication, and target-cluster RBAC are ready.
 
 ## The data plane rides QUIC
 
@@ -53,6 +105,12 @@ In external-only mode, features that inherently require client-side
 Kubernetes access are disabled with explicit errors rather than degraded
 silently: the ConfigMap-backed admin commands for revoking intercepts, and
 the legacy direct log-gathering path (the manager serves the logs instead).
+Agent uninstallation and global log-level changes are limited to the internal
+path because the current administrative handlers affect other workloads without
+a dedicated admin check. The legacy full-agent watch RPCs are also internal only;
+modern direct clients use a namespace-authorized watch that omits container
+environment variables. Full details for a particular workload are available only
+through the workload-authorized agent operations.
 Symbolic service ports are resolved by the manager on the client's behalf,
 so they work the same as over a port-forward; only against a
 traffic-manager too old to serve that resolution does the client report an
@@ -90,10 +148,10 @@ remain recommended defense in depth.
 
 ## Disabling the port-forward path entirely
 
-Publishing an endpoint stops the chart from granting `pods/portforward` in
+Setting `externalEndpoint.disablePortForwardRbac: true` stops the chart from granting `pods/portforward` in
 any client Role — the connect Role's bootstrap grant and the per-namespace
 intercept Roles' direct-agent-dial grant alike — since an external client
-never port-forwards. The exception is `security.authorization.requiredGrant:
+never port-forwards. Leave this value false during a mixed-fleet migration. The exception is `security.authorization.requiredGrant:
 portforward`, where possession of `pods/portforward` is itself the
 authorization policy, so the named grants remain. With any other required
 grant, what remains is RBAC granted elsewhere: set

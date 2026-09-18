@@ -99,6 +99,11 @@ already exist when the intercept is created.
 The traffic-manager's authentication posture is controlled by the Helm value
 `security.authentication.mode`:
 
+This value controls the internal listener. When published, the [external control
+endpoint](external-endpoint.md) always enforces both authentication and
+authorization independently and can optionally use a standard TokenReview webhook
+for external bearer credentials.
+
 | Mode | Behavior |
 |------|----------|
 | `disabled` | No general token validation. The routing observer still requires a verified token and its separate grant. |

@@ -35,6 +35,31 @@ func renderCoreChart(t *testing.T, vals map[string]any, withSchema bool) error {
 	return err
 }
 
+func TestExternalAuthenticationWebhookPackagedSchema(t *testing.T) {
+	vals := func(url string, audiences []string) map[string]any {
+		jsonAudiences := make([]any, len(audiences))
+		for i, audience := range audiences {
+			jsonAudiences[i] = audience
+		}
+		return map[string]any{
+			"security": map[string]any{"authentication": map[string]any{"mode": "permissive"}},
+			"externalEndpoint": map[string]any{
+				"enabled": true, "disablePortForwardRbac": false,
+				"tls": map[string]any{"secretName": "external-tls"},
+				"authenticationWebhook": map[string]any{
+					"url": url, "audiences": jsonAudiences,
+					"credentials": map[string]any{"serviceAccountTokenAudience": "manager-caller"},
+				},
+			},
+		}
+	}
+	require.NoError(t, renderCoreChart(t, vals("https://identity.example.com/review", []string{"client-prod", "client-staging"}), true))
+	require.ErrorContains(t, renderCoreChart(t, vals("http://identity.example.com/review", []string{"client"}), true), "url")
+	require.ErrorContains(t, renderCoreChart(t, vals("https://identity.example.com/review", []string{"duplicate", "duplicate"}), true), "audiences")
+	require.ErrorContains(t, renderCoreChart(t, vals("https://identity.example.com/review", []string{""}), true), "audiences")
+	require.ErrorContains(t, renderCoreChart(t, vals("https://identity.example.com/review", []string{"not an audience"}), true), "audiences")
+}
+
 // TestQuicTunnelRequiresSingleManagerReplica pins two defenses against a
 // multi-replica traffic-manager: the values schema pins replicaCount to 1,
 // and the StatefulSet template also refuses replicaCount > 1 without the schema.

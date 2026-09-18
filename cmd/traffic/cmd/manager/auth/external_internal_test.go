@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/time/rate"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -42,6 +43,65 @@ func externalCtxWithBearer(token string) context.Context {
 
 func externalCtxWithTransportPrincipal(tp *TransportPrincipal) context.Context {
 	return peer.NewContext(context.Background(), &peer.Peer{AuthInfo: &externalAuthInfo{TransportPrincipal: tp}})
+}
+
+type enforcementTestStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *enforcementTestStream) Context() context.Context { return s.ctx }
+
+func TestExternalInterceptorPropagatesIndependentEnforcement(t *testing.T) {
+	ci := fake.NewClientset()
+	k8sapi.InstallFakeTokenReviews(ci, func(string, []string) *authnv1.TokenReviewStatus {
+		return &authnv1.TokenReviewStatus{Authenticated: true, User: authnv1.UserInfo{Username: "alice"}}
+	})
+	ext := NewExternalInterceptor(NewInterceptor(NewAuthenticator(ci), ModeEnforcing), nil, nil)
+	for _, tt := range []struct {
+		method string
+		ctx    context.Context
+	}{
+		{versionMethod, context.Background()}, {"/telepresence.manager.Manager/ArriveAsClient", externalCtxWithBearer("valid")},
+	} {
+		called := false
+		_, err := ext.Unary()(tt.ctx, nil, &grpc.UnaryServerInfo{FullMethod: tt.method}, func(ctx context.Context, _ any) (any, error) {
+			called = true
+			require.True(t, Enforcing(ctx, ModePermissive))
+			return nil, nil
+		})
+		require.NoError(t, err)
+		require.True(t, called)
+		called = false
+		err = ext.Stream()(nil, &enforcementTestStream{ctx: tt.ctx}, &grpc.StreamServerInfo{FullMethod: tt.method}, func(_ any, stream grpc.ServerStream) error {
+			called = true
+			require.True(t, Enforcing(stream.Context(), ModeDisabled))
+			return nil
+		})
+		require.NoError(t, err)
+		require.True(t, called)
+	}
+	_, err := ext.Unary()(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/telepresence.manager.Manager/ArriveAsClient"}, func(context.Context, any) (any, error) {
+		t.Fatal("handler must not run without a credential")
+		return nil, nil
+	})
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
+func TestExternalInterceptorRecoversHandlerPanicsWithoutReturningDetails(t *testing.T) {
+	ext := NewExternalInterceptor(NewInterceptor(NewAuthenticator(fake.NewClientset()), ModeEnforcing), nil, nil)
+	_, err := ext.Unary()(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: versionMethod}, func(context.Context, any) (any, error) {
+		panic("do not disclose this payload")
+	})
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.NotContains(t, err.Error(), "do not disclose")
+	err = ext.Stream()(nil, &enforcementTestStream{ctx: context.Background()}, &grpc.StreamServerInfo{FullMethod: versionMethod}, func(any, grpc.ServerStream) error {
+		panic("do not disclose this payload")
+	})
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.NotContains(t, err.Error(), "do not disclose")
+	_, err = ext.Unary()(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: versionMethod}, func(context.Context, any) (any, error) { return nil, nil })
+	require.NoError(t, err)
 }
 
 func TestExternalInterceptor_BothCredentialsRejected(t *testing.T) {
