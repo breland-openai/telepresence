@@ -51,6 +51,11 @@ func EnvFile(path string) InterceptOpt {
 	return func() []string { return []string{"--env-file", path} }
 }
 
+// ShowEnv opts into values for tests that assert on synthetic workload env.
+func ShowEnv() InterceptOpt {
+	return func() []string { return []string{"--show-env"} }
+}
+
 // ToPod adds a --to-pod spec, forwarding an additional pod port to the
 // workstation's localhost while the attach is active.
 func ToPod(spec string) InterceptOpt {

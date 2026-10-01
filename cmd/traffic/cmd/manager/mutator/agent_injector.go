@@ -2,7 +2,6 @@ package mutator
 
 import (
 	"context"
-	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -283,8 +282,8 @@ func createPatch(ctx context.Context, config *agentconfig.Sidecar, pod *core.Pod
 				fmt.Fprintf(&cns, "%d %s\n", i, cn.Name)
 			}
 			clog.Tracef(ctx, "Containers \n%s", cns.String())
-			if pj, err := json.Marshal(patches, jsontext.WithIndent("  ")); err == nil {
-				clog.Tracef(ctx, "\n%s", string(pj))
+			for _, patch := range patches {
+				clog.Tracef(ctx, "Patch %s %s", patch.Op, patch.Path)
 			}
 		}
 	} else {

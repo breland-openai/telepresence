@@ -90,6 +90,9 @@ func (e Syntax) writeFile(fileName string, env map[string]string) error {
 
 //goland:noinspection GoMixedReceiverTypes
 func (e Syntax) WriteToFileAndClose(file *os.File, env map[string]string) (err error) {
+	if file != os.Stdout {
+		defer file.Close()
+	}
 	if e == SyntaxJSON {
 		data, err := json.Marshal(env, jsontext.WithIndent("  "))
 		if err != nil {
@@ -100,7 +103,6 @@ func (e Syntax) WriteToFileAndClose(file *os.File, env map[string]string) (err e
 		return err
 	}
 
-	defer file.Close()
 	w := bufio.NewWriter(file)
 
 	keys := make([]string, len(env))

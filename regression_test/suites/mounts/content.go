@@ -41,7 +41,7 @@ func (s *Content) Test_ConfigMapContent() {
 
 	root, ok := rt.MountRoot(a)
 	if !ok {
-		t.Fatalf("intercept for %s carries no TELEPRESENCE_ROOT", wl.Name)
+		t.Fatalf("intercept for %s carries no local mount directory", wl.Name)
 	}
 
 	check.EventuallyFile(t, configFilePath(root), isConfigContent, mountTimeout)

@@ -49,7 +49,7 @@ func (s *FTPvsFUSE) Test_ContentUnderFTPAndFUSE() {
 	a := ftp.Intercept(t, wl)
 	rootFtp, ok := rt.MountRoot(a)
 	if !ok {
-		t.Fatalf("intercept for %s carries no TELEPRESENCE_ROOT", wl.Name)
+		t.Fatalf("intercept for %s carries no local mount directory", wl.Name)
 	}
 	check.EventuallyFile(t, configFilePath(rootFtp), isConfigContent, mountTimeout)
 	a.Detach(t)
@@ -59,7 +59,7 @@ func (s *FTPvsFUSE) Test_ContentUnderFTPAndFUSE() {
 	defer b.Detach(t)
 	rootFuse, ok := rt.MountRoot(b)
 	if !ok {
-		t.Fatalf("intercept for %s carries no TELEPRESENCE_ROOT", wl.Name)
+		t.Fatalf("intercept for %s carries no local mount directory", wl.Name)
 	}
 	check.EventuallyFile(t, configFilePath(rootFuse), isConfigContent, mountTimeout)
 }

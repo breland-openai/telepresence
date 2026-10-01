@@ -72,6 +72,9 @@ func TestExplicitStdoutExport(t *testing.T) {
 		if err := flags.MaybeWrite(map[string]string{"ORDINARY": "stdout-sentinel"}); err != nil {
 			os.Exit(1)
 		}
+		if _, err := os.Stdout.WriteString("\nafter-export\n"); err != nil {
+			os.Exit(2)
+		}
 		os.Exit(0)
 	}
 	executable, err := os.Executable()
@@ -82,5 +85,6 @@ func TestExplicitStdoutExport(t *testing.T) {
 		data, err := cmd.CombinedOutput()
 		require.NoError(t, err)
 		require.Contains(t, string(data), "stdout-sentinel")
+		require.Contains(t, string(data), "after-export")
 	}
 }

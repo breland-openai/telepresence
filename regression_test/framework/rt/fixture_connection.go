@@ -552,44 +552,28 @@ func (a *Attach) detachWithin(t testing.TB, timeout, interval time.Duration) {
 	}
 }
 
-// MountRoot returns the local mount root path recorded in a's captured
-// info (whichever of Intercept/Replace/Wiretap/Ingest is set): the
-// TELEPRESENCE_ROOT entry the CLI adds to the attach's environment before
-// printing it (pkg/client/cli/intercept/state.go's create():
-// s.env["TELEPRESENCE_ROOT"] = intercept.ClientMountPoint;
-// pkg/client/cli/ingest/state.go's run(): env["TELEPRESENCE_ROOT"] =
-// s.info.ClientMountPoint). It is the same directory `--mount` names or
-// telepresence auto-picks, and matches os.Getenv("TELEPRESENCE_ROOT") in a
-// `--run`/`--run-shell` child.
-//
-// ok is false when a carries no captured info, or its Environment is nil.
-// For intercept/replace/wiretap specifically, a nil Environment is possible
-// even though TELEPRESENCE_ROOT was set: state.go aliases s.env onto the
-// intercepted container's own (manager-reported) environment map before
-// mutating it (s.env = intercept.Environment; s.env["TELEPRESENCE_ROOT"] =
-// ...), so the addition only lands in the JSON output's "environment" field
-// (pkg/client/cli/intercept/info.go's Info.Environment) when that map was
-// already non-nil, i.e. the intercepted container itself reported at least
-// one env var. Ingest has no such gap: ingest/state.go reassigns the map
-// back onto Info.Environment even when it started nil, so TELEPRESENCE_ROOT
-// is always present there.
-func MountRoot(a *Attach) (string, bool) {
-	var env map[string]string
+// Mount returns the recorded mount metadata for any attachment kind.
+func (a *Attach) Mount() *cli.MountInfo {
 	switch {
 	case a.Intercept != nil:
-		env = a.Intercept.Environment
+		return a.Intercept.Mount
 	case a.Replace != nil:
-		env = a.Replace.Environment
+		return a.Replace.Mount
 	case a.Wiretap != nil:
-		env = a.Wiretap.Environment
+		return a.Wiretap.Mount
 	case a.Ingest != nil:
-		env = a.Ingest.Environment
+		return a.Ingest.Mount
 	}
-	if env == nil {
+	return nil
+}
+
+// MountRoot returns the local directory from the mount metadata, if mounted.
+func MountRoot(a *Attach) (string, bool) {
+	m := a.Mount()
+	if m == nil || m.LocalDir == "" {
 		return "", false
 	}
-	root, ok := env["TELEPRESENCE_ROOT"]
-	return root, ok
+	return m.LocalDir, true
 }
 
 // routeCheckTimeout bounds RoutedToLocal/RoutedToCluster.
