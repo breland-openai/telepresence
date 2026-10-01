@@ -35,7 +35,7 @@ func TranslateEnvironmentIPs(ctx context.Context, env map[string]string, provide
 		for k, ev := range env {
 			rv := replaceIP(provider, ipV4Rx, ev)
 			if ev != rv {
-				clog.Debugf(ctx, "%s: %s -> %s", k, ev, rv)
+				clog.Debugf(ctx, "Translated IPs in environment variable %s", k)
 				env[k] = rv
 			}
 		}
@@ -44,7 +44,7 @@ func TranslateEnvironmentIPs(ctx context.Context, env map[string]string, provide
 		for k, ev := range env {
 			rv := replaceIP(provider, ipV6Rx, ev)
 			if ev != rv {
-				clog.Debugf(ctx, "%s: %s -> %s", k, ev, rv)
+				clog.Debugf(ctx, "Translated IPs in environment variable %s", k)
 				env[k] = rv
 			}
 		}

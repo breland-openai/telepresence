@@ -21,8 +21,8 @@ Wiretap a Service
       --docker-debug string            Like --docker-build, but allows a debugger to run inside the container with relaxed security
       --docker-mount string            The volume mount point in docker. Defaults to same as &quot;--mount&quot;
       --docker-run                     Run a Docker container with wiretapped environment, volume mount, by passing arguments after -- to 'docker run', e.g. '--docker-run -- -it --rm ubuntu:20.04 /bin/bash'
-  -e, --env-file string                Also emit the remote environment to an file. The syntax used in the file can be determined using flag --env-syntax
-  -j, --env-json string                Also emit the remote environment to a file as a JSON blob.
+  -e, --env-file string                Export remote environment values, including sensitive values, to a file (&quot;-&quot; for stdout). Explicit opt-in for this export only; see --env-syntax
+  -j, --env-json string                Export remote environment values, including sensitive values, as JSON (&quot;-&quot; for stdout). Explicit opt-in for this export only.
       --env-syntax string              Syntax used for env-file. One of &quot;docker&quot;, &quot;compose&quot;, &quot;sh&quot;, &quot;csh&quot;, &quot;cmd&quot;, &quot;json&quot;, and &quot;ps&quot;; where &quot;sh&quot;, &quot;csh&quot;, and &quot;ps&quot; can be suffixed with &quot;:export&quot; (default &quot;docker&quot;)
   -h, --help                           help for wiretap
       --http-header strings            HTTP header filters. Only requests with matching headers will be wiretapped. Supports both formats: --http-header &quot;X-User-ID=dev123&quot; or --http-header &quot;X-User-ID: dev123&quot; (curl -H compatible). Multiple headers use AND logic.
@@ -37,6 +37,7 @@ Wiretap a Service
       --plaintext                      Use plaintext instead of TLS when communicating with the intercept handler
   -p, --port strings                   Local ports to forward to. Use &lt;local port&gt;:&lt;identifier&gt; to uniquely identify service ports, where the &lt;identifier&gt; is the port name or number. With --docker-run and a daemon that doesn't run in docker', use &lt;local port&gt;:&lt;container port&gt; or &lt;local port&gt;:&lt;container port&gt;:&lt;identifier&gt;.
       --service string                 Optional name of service to wiretap. Sometimes needed to uniquely identify the intercepted port.
+      --show-env                       Include remote environment values in output. WARNING: may expose sensitive values
       --wait-message string            Message to print when wiretap handler has started
   -w, --workload string                Name of workload (Deployment, ReplicaSet, StatefulSet, Rollout) to wiretap, if different from &lt;name&gt;
 ```

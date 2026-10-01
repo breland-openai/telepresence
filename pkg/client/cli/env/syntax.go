@@ -131,7 +131,7 @@ func (e Syntax) WriteEntry(k, v string) (r string, err error) {
 	case SyntaxDocker:
 		// Docker does not accept multi-line environments
 		if strings.IndexByte(v, '\n') >= 0 {
-			return "", fmt.Errorf("docker run/build does not support multi-line environment values: key: %s, value %s", k, v)
+			return "", fmt.Errorf("docker run/build does not support multi-line environment values: key: %s", k)
 		}
 		r = fmt.Sprintf("%s=%s", k, v)
 	case SyntaxCompose:
@@ -150,7 +150,7 @@ func (e Syntax) WriteEntry(k, v string) (r string, err error) {
 		r = fmt.Sprintf("[Environment]::SetEnvironmentVariable(%s, %s, 'User')", quotePS(k), quotePS(v))
 	case SyntaxCmd:
 		if strings.IndexByte(v, '\n') >= 0 {
-			return "", fmt.Errorf("cmd does not support multi-line environment values: key: %s, value %s", k, v)
+			return "", fmt.Errorf("cmd does not support multi-line environment values: key: %s", k)
 		}
 		r = fmt.Sprintf("set %s=%s", k, v)
 	case SyntaxJSON:

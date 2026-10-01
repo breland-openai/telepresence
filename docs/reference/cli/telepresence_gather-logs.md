@@ -44,7 +44,7 @@ telepresence gather-logs --daemons=None
 ```
   -a, --anonymize               To anonymize pod names + namespaces from the logs
       --daemons string          Comma separated list of daemons you want logs from: all, root, user, kubeauth, None (default &quot;all&quot;)
-  -y, --get-pod-yaml            Get the yaml of any pods you are getting logs for
+  -y, --get-pod-yaml            Export the YAML of collected pods. Explicitly includes environment values and other potentially sensitive pod configuration
   -h, --help                    help for gather-logs
   -o, --output-file string      The file you want to output the logs to.
       --traffic-agents string   Traffic-agents to collect logs from: all, name substring, None (default &quot;all&quot;)

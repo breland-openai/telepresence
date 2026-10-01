@@ -13,7 +13,8 @@ Convert compose files into another model
 
 ### Flags:
 ```
-  -h, --help   help for bridge
+  -h, --help       help for bridge
+      --show-env   Include remote environment values in output. WARNING: may expose sensitive values
 ```
 
 ### Compose flags:

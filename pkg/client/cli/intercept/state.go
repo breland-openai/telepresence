@@ -270,7 +270,7 @@ func (s *state) create(ctx context.Context) (acquired bool, err error) {
 	}
 	detailedOutput := s.DetailedOutput && s.FormattedOutput
 	if detailedOutput {
-		output.Object(ctx, s.info, true)
+		output.Object(ctx, s.info.Presentation(s.EnvFlags.Show), true)
 	} else {
 		progress.Info(ctx, s.info)
 	}

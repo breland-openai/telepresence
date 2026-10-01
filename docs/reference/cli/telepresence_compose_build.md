@@ -13,7 +13,8 @@ Build or rebuild services
 
 ### Flags:
 ```
-  -h, --help   help for build
+  -h, --help       help for build
+      --show-env   Include remote environment values in output. WARNING: may expose sensitive values
 ```
 
 ### Compose flags:

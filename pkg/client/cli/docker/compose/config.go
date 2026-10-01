@@ -21,6 +21,7 @@ import (
 	"github.com/telepresenceio/telepresence/cmd/cobraparser/v2/generate"
 	"github.com/telepresenceio/telepresence/cmd/cobraparser/v2/types"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/daemon"
+	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/env"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/flags"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/global"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/progress"
@@ -56,6 +57,7 @@ type config struct {
 	topLevelExtension
 	*parentConfig
 	subCommandFlags *pflag.FlagSet
+	showEnv         bool
 }
 
 func GenerateSubCommands(cmd *cobra.Command) []*cobra.Command {
@@ -155,6 +157,9 @@ func (c *config) subCommand(subCmd *types.CommandInfo) *cobra.Command {
 		ioutil.Printf(os.Stderr, "internal error: %v\n", err)
 		os.Exit(1)
 	}
+	if exportsConfiguration(subCmd.Name, true) {
+		env.AddShowFlag(cmdFlags, &c.showEnv)
+	}
 	// Stop parsing flags at the first non-flag argument (the service name). This mirrors how
 	// docker compose works, so that e.g. `telepresence compose exec svc wget -qO- <url>`
 	// doesn't try to interpret `-qO-` as flags for `exec`.
@@ -202,7 +207,36 @@ func (c *config) appendFlags(flags *pflag.FlagSet, opts []string) []string {
 	return opts
 }
 
+func exportsConfiguration(name string, printConfig bool) bool {
+	switch name {
+	case "config", "bridge", "publish":
+		return true
+	case "build":
+		return printConfig
+	default:
+		return false
+	}
+}
+
+func (c *config) checkEnvironmentExport(cmd *cobra.Command) error {
+	printConfig, _ := cmd.Flags().GetBool("print")
+	// Compose also parses flags forwarded after a service name.
+	for _, arg := range c.services {
+		if arg == "--print" || strings.HasPrefix(arg, "--print=") {
+			printConfig = true
+		}
+	}
+	if exportsConfiguration(cmd.Name(), printConfig) && !c.showEnv {
+		return errcat.User.New("Compose configuration can contain remote environment values; use --show-env to explicitly allow sensitive configuration output")
+	}
+	return nil
+}
+
 func (c *config) run(cmd *cobra.Command) (err error) {
+	if err := c.checkEnvironmentExport(cmd); err != nil {
+		return err
+	}
+
 	if dryFlag := cmd.Flag("dry-run"); dryFlag != nil && dryFlag.Changed {
 		// A dry-run is impossible, because Telepresence will have to attach to a workload to get
 		// the data needed to modify the docker compose project. The intercept, replace, ingest, and

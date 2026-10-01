@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	rpc "github.com/telepresenceio/telepresence/rpc/v2/connector"
+	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/env"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/mount"
 	"github.com/telepresenceio/telepresence/v2/pkg/ioutil"
 	"github.com/telepresenceio/telepresence/v2/pkg/types"
@@ -63,4 +64,14 @@ func (ii *Info) WriteTo(w io.Writer) (int64, error) {
 		}
 	}
 	return kvf.WriteTo(w)
+}
+
+// Presentation returns a copy for output, preserving the runtime environment.
+func (ii *Info) Presentation(showEnv bool) *Info {
+	if ii == nil {
+		return nil
+	}
+	result := *ii
+	result.Environment = env.Presentation(ii.Environment, showEnv)
+	return &result
 }
