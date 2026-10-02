@@ -53,3 +53,34 @@ func TestInjectionTraceDoesNotExposeRemoteEnvironment(t *testing.T) {
 		require.NotContains(t, logs.String(), sentinel)
 	}
 }
+
+func TestContainerComparisonDoesNotExposeRemoteEnvironment(t *testing.T) {
+	for _, level := range []slog.Level{slog.LevelDebug, clog.LevelTrace} {
+		for _, change := range []string{"unchanged", "changed", "added", "kubernetes-defaults"} {
+			t.Run(level.String()+"/"+change, func(t *testing.T) {
+				var logs strings.Builder
+				ctx := clog.WithLogger(context.Background(), slog.New(slog.NewTextHandler(&logs,
+					&slog.HandlerOptions{Level: level})))
+				a := &core.Container{Name: "traffic-agent", Env: []core.EnvVar{{Name: "ORDINARY", Value: "original-synthetic-value"}}}
+				b := a.DeepCopy()
+				switch change {
+				case "changed":
+					b.Env[0].Value = "replacement-synthetic-value"
+				case "added":
+					b.Env = append(b.Env, core.EnvVar{Name: "ADDED", Value: "added-synthetic-value"})
+				case "kubernetes-defaults":
+					b.ImagePullPolicy = core.PullIfNotPresent
+					b.TerminationMessagePath = "/dev/termination-log"
+					b.TerminationMessagePolicy = core.TerminationMessageReadFile
+				}
+				beforeA, beforeB := a.DeepCopy(), b.DeepCopy()
+				require.Equal(t, change == "unchanged" || change == "kubernetes-defaults", containerEqual(ctx, a, b))
+				require.Equal(t, beforeA, a)
+				require.Equal(t, beforeB, b)
+				for _, value := range []string{"original-synthetic-value", "replacement-synthetic-value", "added-synthetic-value"} {
+					require.NotContains(t, logs.String(), value)
+				}
+			})
+		}
+	}
+}

@@ -5,7 +5,6 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"log/slog"
 	"slices"
 	"sort"
 	"strconv"
@@ -487,19 +486,12 @@ func compareAgentOwnerEnv(a, b []core.EnvVar) bool {
 	return true
 }
 
-func containerEqual(ctx context.Context, a, b *core.Container) bool {
+func containerEqual(_ context.Context, a, b *core.Container) bool {
 	// skips contain defaults assigned by Kubernetes that are not zero values
 	options := cmp.Options{
 		cmp.Comparer(compareProbes),
 		cmp.Comparer(compareVolumeMounts),
 		cmpopts.IgnoreFields(core.Container{}, "ImagePullPolicy", "Resources", "TerminationMessagePath", "TerminationMessagePolicy"),
-	}
-	if clog.Enabled(ctx, slog.LevelDebug) {
-		diff := cmp.Diff(a, b, options...)
-		if diff != "" {
-			clog.Debug(ctx, diff)
-		}
-		return diff == ""
 	}
 	return cmp.Equal(a, b, options...)
 }
