@@ -162,7 +162,7 @@ func (s *state) create(ctx context.Context) (acquired bool, err error) {
 	s.ContainerName = env["TELEPRESENCE_CONTAINER"]
 	info := NewInfo(ctx, ii, nil)
 	if s.FormattedOutput {
-		output.Object(ctx, info, true)
+		output.Object(ctx, info.Presentation(s.EnvFlags.Show), true)
 	} else {
 		progress.Info(ctx, info)
 	}

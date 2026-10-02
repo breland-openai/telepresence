@@ -20,6 +20,7 @@ List current intercepts
   -i, --intercepts         intercepts
   -n, --namespace string   If present, the namespace scope for this CLI request
   -r, --replacements       replacements
+      --show-env           Include remote environment values in output. WARNING: may expose sensitive values
   -t, --wiretaps           wiretaps
 ```
 

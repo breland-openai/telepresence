@@ -90,6 +90,9 @@ func (e Syntax) writeFile(fileName string, env map[string]string) error {
 
 //goland:noinspection GoMixedReceiverTypes
 func (e Syntax) WriteToFileAndClose(file *os.File, env map[string]string) (err error) {
+	if file != os.Stdout {
+		defer file.Close()
+	}
 	if e == SyntaxJSON {
 		data, err := json.Marshal(env, jsontext.WithIndent("  "))
 		if err != nil {
@@ -100,7 +103,6 @@ func (e Syntax) WriteToFileAndClose(file *os.File, env map[string]string) (err e
 		return err
 	}
 
-	defer file.Close()
 	w := bufio.NewWriter(file)
 
 	keys := make([]string, len(env))
@@ -131,7 +133,7 @@ func (e Syntax) WriteEntry(k, v string) (r string, err error) {
 	case SyntaxDocker:
 		// Docker does not accept multi-line environments
 		if strings.IndexByte(v, '\n') >= 0 {
-			return "", fmt.Errorf("docker run/build does not support multi-line environment values: key: %s, value %s", k, v)
+			return "", fmt.Errorf("docker run/build does not support multi-line environment values: key: %s", k)
 		}
 		r = fmt.Sprintf("%s=%s", k, v)
 	case SyntaxCompose:
@@ -150,7 +152,7 @@ func (e Syntax) WriteEntry(k, v string) (r string, err error) {
 		r = fmt.Sprintf("[Environment]::SetEnvironmentVariable(%s, %s, 'User')", quotePS(k), quotePS(v))
 	case SyntaxCmd:
 		if strings.IndexByte(v, '\n') >= 0 {
-			return "", fmt.Errorf("cmd does not support multi-line environment values: key: %s, value %s", k, v)
+			return "", fmt.Errorf("cmd does not support multi-line environment values: key: %s", k)
 		}
 		r = fmt.Sprintf("set %s=%s", k, v)
 	case SyntaxJSON:

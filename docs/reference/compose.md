@@ -172,3 +172,17 @@ The `wiretap` ensures that the docker compose service receives wiretapped traffi
 | to-pod           | Ports to forward from the local compose service to the remote pod's localhost                 | strings | empty                       |
 
 The `service` field is optional as long as the given `service ports` are unique.
+
+## Configuration output
+
+`telepresence compose config`, `telepresence compose bridge`, `telepresence compose publish`, and
+`telepresence compose build --print` require `--show-env`, because their output
+can include remote environment values. For example:
+
+```sh
+telepresence compose config --show-env
+```
+
+This flag explicitly permits sensitive configuration output. It is consumed by
+Telepresence and is not passed to Docker Compose. Ordinary execution keeps the
+complete runtime environment. See [Environment values in output](environment.md#environment-values-in-output).

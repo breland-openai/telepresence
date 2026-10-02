@@ -1082,7 +1082,7 @@ func (s *session) reconcileAPIServers() {
 			if err == nil {
 				return int(port)
 			}
-			clog.Errorf(s, "unable to parse TELEPRESENCE_API_PORT(%q) to a port number in agent %s.%s: %v", ps, is.Agent, is.Namespace, err)
+			clog.Errorf(s, "unable to parse TELEPRESENCE_API_PORT to a port number in agent %s.%s", is.Agent, is.Namespace)
 		}
 		return 0
 	}

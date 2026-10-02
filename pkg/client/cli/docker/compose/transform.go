@@ -411,7 +411,7 @@ func (t *transformer) createConfigFile(ctx context.Context, canCreate, forceRecr
 	if err != nil {
 		return "", err
 	}
-	clog.Debug(ctx, string(yml))
+	clog.Debug(ctx, "Generated Compose configuration")
 
 	if composeFile == "" {
 		var mcf *os.File

@@ -66,12 +66,9 @@ type InterceptInfo struct {
 	PodIP   string `json:"pod_ip,omitempty"`
 	Replace bool   `json:"replace,omitempty"`
 	Wiretap bool   `json:"wiretap,omitempty"`
-	// Environment carries the intercepted container's environment plus the
-	// TELEPRESENCE_ROOT/TELEPRESENCE_INTERCEPT_ID/TELEPRESENCE_API_HOST
-	// entries the CLI adds locally before printing (pkg/client/cli/
-	// intercept/info.go's Info.Environment, json tag "environment"; see
-	// rt.MountRoot's doc comment for how those additions reach here).
+	// Environment includes variable names; values require --show-env.
 	Environment map[string]string `json:"environment,omitempty"`
+	Mount       *MountInfo        `json:"mount,omitempty"`
 }
 
 // IngestInfo mirrors the fields the framework asserts on in the JSON object
@@ -82,6 +79,13 @@ type IngestInfo struct {
 	WorkloadKind string            `json:"workload_kind,omitempty"`
 	Container    string            `json:"container,omitempty"`
 	Environment  map[string]string `json:"environment,omitempty"`
+	Mount        *MountInfo        `json:"mount,omitempty"`
+}
+
+// MountInfo mirrors the mount metadata emitted by pkg/client/cli/mount.Info.
+type MountInfo struct {
+	LocalDir string            `json:"local_dir,omitempty"`
+	Mounts   map[string]string `json:"mounts,omitempty"`
 }
 
 // ListEntry mirrors the fields the framework asserts on in one element of the
