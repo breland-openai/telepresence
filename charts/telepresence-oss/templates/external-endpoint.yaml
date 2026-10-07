@@ -1,12 +1,21 @@
 {{- with .Values.externalEndpoint }}
 {{- if .enabled }}
-{{- if ne $.Values.security.authentication.mode "enforcing" }}
-{{- fail "externalEndpoint.enabled requires security.authentication.mode: enforcing -- the external listener has no other access control in permissive or disabled mode" }}
-{{- end }}
 {{- $hasSecret := ne .tls.secretName "" }}
 {{- $hasCertManager := .tls.certManager.enabled }}
 {{- if eq $hasSecret $hasCertManager }}
 {{- fail "externalEndpoint.tls: set exactly one of tls.secretName or tls.certManager.enabled" }}
+{{- end }}
+{{- with .authenticationWebhook }}
+{{- if .url }}
+{{- if not .audiences }}
+{{- fail "externalEndpoint.authenticationWebhook.audiences must contain at least one reviewed user token audience" }}
+{{- end }}
+{{- if eq (ne .credentials.secretName "") (ne .credentials.serviceAccountTokenAudience "") }}
+{{- fail "externalEndpoint.authenticationWebhook.credentials: set exactly one of secretName or serviceAccountTokenAudience for the manager caller" }}
+{{- end }}
+{{- else if or .audiences .credentials.secretName .credentials.serviceAccountTokenAudience .ca.secretName }}
+{{- fail "externalEndpoint.authenticationWebhook.url is required when webhook settings are provided" }}
+{{- end }}
 {{- end }}
 {{- if not (and $.Values.rbac $.Values.rbac.only) }}
 ---

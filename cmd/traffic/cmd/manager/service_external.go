@@ -134,6 +134,9 @@ func (s *externalService) Remain(ctx context.Context, req *rpc.RemainRequest) (*
 	if err := requireAuthenticated(ctx); err != nil {
 		return nil, err
 	}
+	if err := s.requireClientSession(req.GetSession()); err != nil {
+		return nil, err
+	}
 	return s.inner.Remain(ctx, req)
 }
 
@@ -141,14 +144,15 @@ func (s *externalService) Depart(ctx context.Context, session *rpc.SessionInfo) 
 	if err := requireAuthenticated(ctx); err != nil {
 		return nil, err
 	}
+	if err := s.requireClientSession(session); err != nil {
+		return nil, err
+	}
 	return s.inner.Depart(ctx, session)
 }
 
 func (s *externalService) SetLogLevel(ctx context.Context, request *rpc.LogLevelRequest) (*empty.Empty, error) {
-	if err := requireAuthenticated(ctx); err != nil {
-		return nil, err
-	}
-	return s.inner.SetLogLevel(ctx, request)
+	// This changes the manager and every agent, not just the caller's session.
+	return nil, internalOnly("SetLogLevel")
 }
 
 func (s *externalService) StreamLogs(request *rpc.StreamLogsRequest, stream grpc.ServerStreamingServer[rpc.LogChunk]) error {
@@ -182,17 +186,13 @@ func (s *externalService) WatchAgentPodsInNamespacesDelta(
 }
 
 func (s *externalService) WatchAgents(session *rpc.SessionInfo, stream grpc.ServerStreamingServer[rpc.AgentInfoSnapshot]) error {
-	if err := requireAuthenticated(stream.Context()); err != nil {
-		return err
-	}
-	return s.inner.WatchAgents(session, stream)
+	// The legacy response can include all container environment values in the
+	// connected namespace. Modern direct clients use WatchSessionEvents.
+	return internalOnly("WatchAgents")
 }
 
 func (s *externalService) WatchAgentsDelta(session *rpc.SessionInfo, stream grpc.ServerStreamingServer[rpc.AgentInfoDelta]) error {
-	if err := requireAuthenticated(stream.Context()); err != nil {
-		return err
-	}
-	return s.inner.WatchAgentsDelta(session, stream)
+	return internalOnly("WatchAgentsDelta")
 }
 
 func (s *externalService) WatchIntercepts(session *rpc.SessionInfo, stream grpc.ServerStreamingServer[rpc.InterceptInfoSnapshot]) error {
@@ -364,8 +364,7 @@ func (s *externalService) ReportMetrics(ctx context.Context, metrics *rpc.Tunnel
 }
 
 func (s *externalService) UninstallAgents(ctx context.Context, request *rpc.UninstallAgentsRequest) (*empty.Empty, error) {
-	if err := requireAuthenticated(ctx); err != nil {
-		return nil, err
-	}
-	return s.inner.UninstallAgents(ctx, request)
+	// The internal handler owns a client session but performs a namespace-wide
+	// administrative eviction without per-target Kubernetes authorization.
+	return nil, internalOnly("UninstallAgents")
 }

@@ -667,8 +667,16 @@ func (s *State) AddClient(client *rpc.ClientInfo, principal *auth.Principal, now
 	return sessionID
 }
 
-func (s *State) RestoreClient(sessionID tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) {
-	s.addClient(sessionID, client, principal, now)
+// RestoreClient atomically creates or returns the current session. A concurrent
+// restore must verify the returned owner's identity before proceeding.
+func (s *State) RestoreClient(sessionID tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) (*ClientSession, bool) {
+	return s.clients.LoadOrCompute(sessionID, func() (*ClientSession, bool) {
+		cs := newClientSessionState(s.backgroundCtx, sessionID, client, now)
+		if principal != nil {
+			cs.SetPrincipal(principal)
+		}
+		return cs, false
+	})
 }
 
 func (s *State) RestoreAgents(agents []*rpc.AgentInfo, now time.Time) {
@@ -775,13 +783,16 @@ func (s *State) GetClient(id tunnel.SessionID) *ClientSession {
 
 // ClientOwnershipError returns an error when client is bound to a verified
 // principal and the caller's principal (carried by ctx) doesn't match it (see
-// auth.Principal.SameAs). Returns nil when the session is unowned (an older
-// client) or the caller is the bound identity. A caller whose token couldn't
+// auth.Principal.SameAs). Internal calls may use an unowned (older client)
+// session; the external listener requires a verified owner. A caller whose token couldn't
 // be verified for infrastructure reasons gets Unavailable instead of
 // PermissionDenied, since ownership could not be established either way.
 func ClientOwnershipError(ctx context.Context, sessionID tunnel.SessionID, client *ClientSession) error {
 	bound := client.Principal()
 	if bound == nil {
+		if auth.RequiresEnforcement(ctx) {
+			return grpcErrors.Errorf(codes.PermissionDenied, "client session %q has no verified owner", sessionID)
+		}
 		return nil
 	}
 	if p := auth.PrincipalFrom(ctx); p != nil && bound.SameAs(p) {

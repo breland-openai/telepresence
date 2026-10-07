@@ -41,6 +41,26 @@ func PrincipalFrom(ctx context.Context) *Principal {
 
 type authUnavailableKey struct{}
 
+type enforcingKey struct{}
+
+// WithEnforcing marks requests from a listener that must enforce authentication
+// and authorization independently of the internal listener's configured mode.
+func WithEnforcing(ctx context.Context) context.Context {
+	return context.WithValue(ctx, enforcingKey{}, true)
+}
+
+// Enforcing reports whether the listener or its request requires enforcement.
+func Enforcing(ctx context.Context, mode Mode) bool {
+	return RequiresEnforcement(ctx) || mode == ModeEnforcing
+}
+
+// RequiresEnforcement reports whether this request arrived on a listener that
+// independently requires enforcement, regardless of the internal mode.
+func RequiresEnforcement(ctx context.Context) bool {
+	forced, _ := ctx.Value(enforcingKey{}).(bool)
+	return forced
+}
+
 // WithAuthUnavailable marks ctx as carrying a bearer token that could not be
 // verified because the TokenReview infrastructure failed. The caller is neither
 // authenticated nor known to be an impostor.

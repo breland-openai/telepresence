@@ -44,20 +44,29 @@ const (
 )
 
 // serveExternal serves the external client-only TLS gRPC listener on
-// env.ExternalPort. It requires ModeEnforcing and ExternalTLSCertDir;
-// either missing is a fatal startup error, not a warning.
+// env.ExternalPort. It always enforces authentication and authorization, independent
+// of the internal listener's mode; a missing ExternalTLSCertDir is fatal.
 func serveExternal(ctx context.Context, svc Service) error {
 	env := managerutil.GetEnv(ctx)
-	if env.AuthenticationMode != auth.ModeEnforcing {
-		return fmt.Errorf(
-			"externalEndpoint.enabled requires security.authentication.mode: enforcing (got %q); "+
-				"the external listener has no other access control", env.AuthenticationMode)
-	}
 	if env.ExternalTLSCertDir == "" {
 		return errors.New(
 			"externalEndpoint.enabled requires externalEndpoint.tls to be configured (EXTERNAL_TLS_CERT_DIR is unset)")
 	}
 
+	metrics := auth.NewMetrics("external")
+	options := []auth.Option{auth.WithMetrics(metrics), auth.WithReviewAdmission()}
+	if env.ExternalAuthWebhookURL != "" {
+		webhook, err := auth.NewWebhookReviewer(auth.WebhookConfig{
+			URL: env.ExternalAuthWebhookURL, Audiences: env.ExternalAuthWebhookAudiences,
+			CAFile: env.ExternalAuthWebhookCAFile, CallerTokenFile: env.ExternalAuthWebhookCallerTokenFile,
+		})
+		if err != nil {
+			return fmt.Errorf("external authentication webhook: %w", err)
+		}
+		options = append(options, auth.WithExternalWebhook(webhook))
+	} else if len(env.ExternalAuthWebhookAudiences) > 0 || env.ExternalAuthWebhookCAFile != "" || env.ExternalAuthWebhookCallerTokenFile != "" {
+		return errors.New("external authentication webhook settings require EXTERNAL_AUTH_WEBHOOK_URL")
+	}
 	ki := k8sapi.GetK8sInterface(ctx)
 	caPool := auth.NewClientCAPool(ctx, ki)
 	tracker := auth.NewExternalConnTracker()
@@ -68,8 +77,7 @@ func serveExternal(ctx context.Context, svc Service) error {
 	caPool.OnChange(tracker.CloseStale)
 	go caPool.Start(ctx)
 
-	metrics := auth.NewMetrics("external")
-	authenticator := auth.NewAuthenticator(ki, auth.WithMetrics(metrics), auth.WithReviewAdmission())
+	authenticator := auth.NewAuthenticator(ki, options...)
 	inner := auth.NewInterceptor(authenticator, auth.ModeEnforcing)
 	extInterceptor := auth.NewExternalInterceptor(inner, caPool, metrics)
 

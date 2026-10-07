@@ -2,9 +2,14 @@ package manager
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	authv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientfeatures "k8s.io/client-go/features"
@@ -25,6 +30,86 @@ import (
 // TestReconnectClient_UnavailableReview_Fails to simulate an API-server
 // failure distinct from an ordinary denial.
 var errCanned = errors.New("subject access review: canned failure")
+
+func TestExternalReconnectRejectsMalformedRequestsAndIgnoresClientAgentSnapshots(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	ctx := testutil.NewContext(t, true)
+	_, mgr, sctx := getTestClientConnAndService(ctx, t, nil, func(e *managerutil.Env) { e.AuthenticationMode = auth.ModePermissive })
+	k8sapi.InstallFakeSubjectAccessReviews(k8sapi.GetK8sInterface(sctx), func(_ string, _ *authv1.ResourceAttributes) bool { return true })
+	external := newExternalService(mgr)
+	owner := auth.WithEnforcing(auth.WithPrincipal(sctx, &auth.Principal{Username: "alice", UID: "alice"}))
+	for _, malformed := range []*rpc.ReconnectClientRequest{nil, {}, {Session: &rpc.SessionInfo{SessionId: uuid.NewString()}}, {Session: &rpc.SessionInfo{SessionId: "invalid"}, Client: testdata.GetTestClients(t)["alice"]}} {
+		_, err := external.ReconnectClient(owner, malformed)
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+	}
+	for _, malformed := range []*rpc.CreateInterceptRequest{nil, {}} {
+		_, err := external.PrepareIntercept(owner, malformed)
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+		_, err = external.CreateIntercept(owner, malformed)
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+	}
+	client := testdata.GetTestClients(t)["alice"]
+	client.Version = "2.33.0"
+	agent := proto.Clone(testdata.GetTestAgents(t)["hello"]).(*rpc.AgentInfo)
+	agent.PodUid = "forged-pod-uid"
+	agentID := tunnel.SessionID("agent:" + agent.PodUid)
+	knownSession := &rpc.SessionInfo{SessionId: uuid.NewString()}
+	_, err := external.ReconnectClient(owner, &rpc.ReconnectClientRequest{Session: knownSession, Client: client, Agents: []*rpc.AgentInfo{agent}})
+	require.NoError(t, err)
+	_, err = external.ReconnectClient(owner, &rpc.ReconnectClientRequest{Session: knownSession})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = mgr.ReconnectClient(auth.WithPrincipal(sctx, &auth.Principal{Username: "alice", UID: "alice"}), &rpc.ReconnectClientRequest{Session: knownSession})
+	require.NoError(t, err, "internal legacy replay for a known owned session need not resend client info")
+	require.Nil(t, mgr.State().GetAgent(agentID), "external client cannot manufacture an agent")
+	require.Zero(t, mgr.State().CountAgents())
+	_, err = mgr.ReconnectClient(sctx, &rpc.ReconnectClientRequest{Session: &rpc.SessionInfo{SessionId: uuid.NewString()}, Client: client, Agents: []*rpc.AgentInfo{agent}})
+	require.NoError(t, err)
+	require.Equal(t, 1, mgr.State().CountAgents(), "internal new-client recovery behavior is preserved")
+}
+
+func TestExternalConcurrentReconnectKeepsAtomicSessionOwnership(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	ctx := testutil.NewContext(t, true)
+	_, mgr, sctx := getTestClientConnAndService(ctx, t, nil, func(e *managerutil.Env) { e.AuthenticationMode = auth.ModePermissive })
+	k8sapi.InstallFakeSubjectAccessReviews(k8sapi.GetK8sInterface(sctx), func(_ string, _ *authv1.ResourceAttributes) bool { return true })
+	client := testdata.GetTestClients(t)["alice"]
+	sessionID := uuid.NewString()
+	start := make(chan struct{})
+	type outcome struct {
+		owner string
+		err   error
+	}
+	outcomes := make(chan outcome, 24)
+	var group sync.WaitGroup
+	for i := range 24 {
+		owner := "alice"
+		if i%2 != 0 {
+			owner = "bob"
+		}
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			callCtx := auth.WithEnforcing(auth.WithPrincipal(sctx, &auth.Principal{Username: owner, UID: owner}))
+			_, err := mgr.ReconnectClient(callCtx, &rpc.ReconnectClientRequest{Session: &rpc.SessionInfo{SessionId: sessionID}, Client: client})
+			outcomes <- outcome{owner, err}
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(outcomes)
+	session := mgr.State().GetClient(tunnel.SessionID(sessionID))
+	require.NotNil(t, session)
+	winner := session.Principal().Username
+	for result := range outcomes {
+		if result.owner == winner {
+			require.NoError(t, result.err)
+		} else {
+			require.Equal(t, codes.PermissionDenied, status.Code(result.err))
+		}
+	}
+	require.Equal(t, 1, mgr.State().CountClients())
+}
 
 // TestReconnectClient_ForgedPayloadNormalization: a restored intercept is
 // rebuilt from the payload's Spec alone, so a forged Id, ClientSession,

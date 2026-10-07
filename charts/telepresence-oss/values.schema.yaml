@@ -380,15 +380,56 @@ properties:
   externalEndpoint:
     description: >-
       Configuration for the opt-in external TLS gRPC listener that lets a client connect without ever
-      contacting the Kubernetes API server. Publishing it requires security.authentication.mode:
-      enforcing and exactly one of tls.secretName / tls.certManager.enabled, both enforced at chart
-      render.
+      contacting the Kubernetes API server. It independently enforces authentication and authorization,
+      and requires exactly one of tls.secretName / tls.certManager.enabled.
     type: object
     additionalProperties: false
     properties:
       enabled:
         description: Enable the traffic-manager's external TLS gRPC listener.
         type: boolean
+      disablePortForwardRbac:
+        description: Remove mechanical port-forward client RBAC after all clients migrate to the external listener.
+        type: boolean
+      authenticationWebhook:
+        description: Optional standard Kubernetes v1 TokenReview HTTPS webhook for external bearer credentials.
+        type: object
+        additionalProperties: false
+        properties:
+          url:
+            description: HTTPS webhook URL; empty uses native Kubernetes TokenReview.
+            type: string
+            pattern: '^$|^https://\S+$'
+          audiences:
+            description: Explicit reviewed user token audiences; an authenticated response must return at least one.
+            type: array
+            uniqueItems: true
+            items:
+              type: string
+              minLength: 1
+              pattern: '^\S+$'
+          credentials:
+            description: A projected service-account token or existing Secret that authenticates the manager to the webhook.
+            type: object
+            additionalProperties: false
+            properties:
+              serviceAccountTokenAudience:
+                type: string
+              secretName:
+                type: string
+              secretKey:
+                type: string
+                minLength: 1
+          ca:
+            description: Optional Secret with PEM trust roots; empty secretName uses system CAs.
+            type: object
+            additionalProperties: false
+            properties:
+              secretName:
+                type: string
+              secretKey:
+                type: string
+                minLength: 1
       port:
         description: The container port the external TLS listener binds to.
         type: integer
@@ -883,9 +924,9 @@ properties:
         properties:
           mode:
             description: >-
-              disabled performs no token validation, permissive (the default) validates
+              On the internal listener, disabled performs no token validation, permissive (the default) validates
               tokens and logs authorization decisions without rejecting any call, and
-              enforcing rejects unauthenticated or unauthorized calls.
+              enforcing rejects unauthenticated or unauthorized calls. The external listener always enforces independently.
             type: string
             enum: ["disabled", "permissive", "enforcing"]
           x509:
@@ -903,7 +944,8 @@ properties:
                   extension-apiserver-authentication-reader Role, needed to read the
                   cluster's client CA. Only takes effect when
                   security.authentication.mode is "enforcing"; defaults to true, so
-                  set this to false to opt out. Has no effect under any other mode.
+                  set this to false to opt out. The external listener reads this CA
+                  via the same RoleBinding independently when published.
                 type: boolean
               port:
                 description: The container port the auth-only TLS listener binds to.
