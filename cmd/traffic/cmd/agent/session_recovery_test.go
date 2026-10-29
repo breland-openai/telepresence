@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ type sessionRecoveryManager struct {
 	arrive func(context.Context) error
 	remain func(context.Context) error
 	review func(context.Context) error
+	repair func(context.Context) error
 	delta  func(context.Context) grpc.ServerStreamingClient[rpc.InterceptInfoDelta]
 	depart atomic.Int32
 }
@@ -43,6 +45,10 @@ func (m *sessionRecoveryManager) Remain(ctx context.Context, _ *rpc.RemainReques
 
 func (m *sessionRecoveryManager) ReviewIntercept(ctx context.Context, _ *rpc.ReviewInterceptRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, m.review(ctx)
+}
+
+func (m *sessionRecoveryManager) ReconnectAgent(ctx context.Context, _ *rpc.ReconnectAgentRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, m.repair(ctx)
 }
 
 func (m *sessionRecoveryManager) Depart(context.Context, *rpc.SessionInfo, ...grpc.CallOption) (*emptypb.Empty, error) {
@@ -101,20 +107,77 @@ func TestRemainRetriesTransientErrorsAndReturnsSessionLoss(t *testing.T) {
 			return status.Error(codes.NotFound, "session expired")
 		}
 	}}
-	err := remainLoop(ctx, mgr, &rpc.SessionInfo{SessionId: "agent:pod-uid"})
+	err := remainLoop(ctx, mgr, &rpc.SessionInfo{SessionId: "agent:pod-uid"}, newInterceptReadiness(), cancel)
 	require.Equal(t, codes.NotFound, status.Code(err))
 	require.Equal(t, 6, calls, "a successful heartbeat must reset the failure count")
 }
 
+func TestAgentKeepsSynchronizedSessionWhenHeartbeatRepliesAreLost(t *testing.T) {
+	fastManagerHeartbeats(t)
+	ctx, cancel := context.WithTimeout(interceptReadinessContext(t), 3*time.Second)
+	startHeartbeats := make(chan struct{})
+	heartbeatAfterLimit := make(chan struct{})
+	calls := 0
+	mgr := &sessionRecoveryManager{
+		arrive: func(context.Context) error { return nil },
+		remain: func(ctx context.Context) error {
+			select {
+			case <-startHeartbeats:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			calls++
+			if calls == managerHeartbeatFailureLimit+1 {
+				close(heartbeatAfterLimit)
+			}
+			return status.Error(codes.DeadlineExceeded, "heartbeat reply lost")
+		},
+		delta: func(ctx context.Context) grpc.ServerStreamingClient[rpc.InterceptInfoDelta] {
+			stream := newFakeInterceptReadinessStream[rpc.InterceptInfoDelta](ctx)
+			stream.values = make(chan *rpc.InterceptInfoDelta, 1)
+			stream.values <- &rpc.InterceptInfoDelta{}
+			return stream
+		},
+	}
+	st := &sessionRecoveryState{handle: func(context.Context, []*rpc.InterceptInfo) []*rpc.ReviewInterceptRequest { return nil }}
+	oldClientFactory := NewExtendedManagerClient
+	NewExtendedManagerClient = func(*grpc.ClientConn, rpc.ManagerClient) rpc.ManagerClient { return mgr }
+	t.Cleanup(func() { NewExtendedManagerClient = oldClientFactory })
+	var talkErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		talkErr = TalkToManager(ctx, "127.0.0.1:1", &rpc.AgentInfo{PodUid: "pod-uid"}, st)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		awaitReadinessSignal(t, done, "agent cleanup")
+	})
+	require.Eventually(t, func() bool { return readinessMarkerExists(ctx) }, time.Second, time.Millisecond)
+	close(startHeartbeats)
+	select {
+	case <-heartbeatAfterLimit:
+		require.True(t, readinessMarkerExists(ctx))
+	case <-done:
+		t.Fatalf("synchronized session ended after lost heartbeat replies: %v", talkErr)
+	case <-ctx.Done():
+		t.Fatal("heartbeats stopped before reaching the failure threshold")
+	}
+	cancel()
+	awaitReadinessSignal(t, done, "agent shutdown")
+	require.NoError(t, talkErr)
+	require.EqualValues(t, 1, mgr.depart.Load())
+}
+
 func TestAgentRecoversMissingSessionWithOpenInterceptWatch(t *testing.T) {
-	testAgentRecoversSessionWithOpenInterceptWatch(t, codes.NotFound)
+	testAgentRecoversSession(t, codes.NotFound)
 }
 
-func TestAgentRecoversUnconfirmedSessionWithOpenInterceptWatch(t *testing.T) {
-	testAgentRecoversSessionWithOpenInterceptWatch(t, codes.DeadlineExceeded)
+func TestAgentRecoversUnconfirmedSessionAfterWatchDisconnect(t *testing.T) {
+	testAgentRecoversSession(t, codes.DeadlineExceeded)
 }
 
-func testAgentRecoversSessionWithOpenInterceptWatch(t *testing.T, heartbeatFailure codes.Code) {
+func testAgentRecoversSession(t *testing.T, heartbeatFailure codes.Code) {
 	t.Helper()
 	fastManagerHeartbeats(t)
 	ctx, cancel := context.WithTimeout(interceptReadinessContext(t), 5*time.Second)
@@ -147,6 +210,10 @@ func testAgentRecoversSessionWithOpenInterceptWatch(t *testing.T, heartbeatFailu
 				}
 			}
 			return nil
+		},
+		repair: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
 		},
 		delta: func(ctx context.Context) grpc.ServerStreamingClient[rpc.InterceptInfoDelta] {
 			stream := newFakeInterceptReadinessStream[rpc.InterceptInfoDelta](ctx)
@@ -187,6 +254,10 @@ func testAgentRecoversSessionWithOpenInterceptWatch(t *testing.T, heartbeatFailu
 	require.Eventually(t, func() bool { return readinessMarkerExists(ctx) }, time.Second, time.Millisecond)
 	first.values <- &rpc.InterceptInfoDelta{Upserts: map[string]*rpc.InterceptInfo{"stale": {Id: "stale"}}}
 	awaitReadinessSignal(t, staleSnapshot, "in-flight snapshot")
+	if heartbeatFailure != codes.NotFound {
+		first.errors <- io.EOF
+		require.Eventually(t, func() bool { return !readinessMarkerExists(ctx) }, time.Second, time.Millisecond)
+	}
 	close(loseSession)
 	require.Eventually(t, func() bool { return !readinessMarkerExists(ctx) }, time.Second, time.Millisecond)
 
@@ -231,6 +302,8 @@ func testAgentRecoversStalledInterceptReview(t *testing.T, concurrentHeartbeatFa
 	remaining := make(chan time.Duration, 1)
 	reviewStarted := make(chan struct{})
 	heartbeatsFailed := make(chan struct{})
+	watchErrors := make(chan error, 1)
+	repairStarted := make(chan struct{})
 	failures := 0
 	mgr := &sessionRecoveryManager{
 		arrive: func(context.Context) error { return nil },
@@ -252,6 +325,14 @@ func testAgentRecoversStalledInterceptReview(t *testing.T, concurrentHeartbeatFa
 		review: func(ctx context.Context) error {
 			deadline, _ := ctx.Deadline()
 			remaining <- time.Until(deadline)
+			if concurrentHeartbeatFailure {
+				watchErrors <- io.EOF
+				select {
+				case <-repairStarted:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 			close(reviewStarted)
 			if concurrentHeartbeatFailure {
 				select {
@@ -262,8 +343,14 @@ func testAgentRecoversStalledInterceptReview(t *testing.T, concurrentHeartbeatFa
 			}
 			return status.Error(codes.DeadlineExceeded, "review timed out")
 		},
+		repair: func(ctx context.Context) error {
+			close(repairStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		},
 		delta: func(ctx context.Context) grpc.ServerStreamingClient[rpc.InterceptInfoDelta] {
 			stream := newFakeInterceptReadinessStream[rpc.InterceptInfoDelta](ctx)
+			stream.errors = watchErrors
 			stream.values = make(chan *rpc.InterceptInfoDelta, 1)
 			stream.values <- &rpc.InterceptInfoDelta{Upserts: map[string]*rpc.InterceptInfo{"intercept": {Id: "intercept"}}}
 			return stream

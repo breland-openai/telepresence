@@ -142,6 +142,17 @@ func (r *interceptReadiness) setUnsynchronized(ctx context.Context) error {
 	return nil
 }
 
+func (r *interceptReadiness) cancelIfUnsynchronized(cancel context.CancelFunc) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.synchronized {
+		return false
+	}
+	// Hold the lock so a fresh snapshot cannot restore readiness before cancellation.
+	cancel()
+	return true
+}
+
 func (r *interceptReadiness) awaitInitialSync(ctx context.Context, timeout time.Duration) error {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -307,7 +318,7 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 		}
 	})
 	wg.Go("remain", func(ctx context.Context) error {
-		return recoverSession(remainLoop(ctx, manager, session))
+		return recoverSession(remainLoop(ctx, manager, session, readiness, cancel))
 	})
 	wg.Go("initialInterceptSync", func(ctx context.Context) error {
 		return readiness.awaitInitialSync(ctx, initialInterceptSyncTimeout)
@@ -425,7 +436,7 @@ func sendInterceptSnapshot(ctx context.Context, snapshots chan interceptSnapshot
 	}
 }
 
-func remainLoop(ctx context.Context, manager rpc.ManagerClient, session *rpc.SessionInfo) error {
+func remainLoop(ctx context.Context, manager rpc.ManagerClient, session *rpc.SessionInfo, readiness *interceptReadiness, cancelSession context.CancelFunc) error {
 	// Loop calling Remain
 	ticker := time.NewTicker(managerHeartbeatInterval)
 	defer ticker.Stop()
@@ -440,6 +451,9 @@ func remainLoop(ctx context.Context, manager rpc.ManagerClient, session *rpc.Ses
 		heartbeatCtx, cancel := context.WithTimeout(ctx, managerSessionRPCTimeout)
 		_, err := manager.Remain(heartbeatCtx, &rpc.RemainRequest{Session: session})
 		cancel()
+		if ctx.Err() != nil {
+			return nil
+		}
 		if err == nil {
 			failures = 0
 			continue
@@ -448,7 +462,8 @@ func remainLoop(ctx context.Context, manager rpc.ManagerClient, session *rpc.Ses
 			return fmt.Errorf("agent session lost: %w", err)
 		}
 		failures++
-		if failures >= managerHeartbeatFailureLimit {
+		// A lost response does not prove the manager missed the heartbeat.
+		if failures >= managerHeartbeatFailureLimit && readiness.cancelIfUnsynchronized(cancelSession) {
 			return status.Errorf(codes.Unavailable, "agent session unconfirmed after %d heartbeats: %v", failures, err)
 		}
 		clog.Warnf(ctx, "remain: %v", err)

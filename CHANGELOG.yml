@@ -248,8 +248,8 @@ items:
         body: >-
           Service intercepts waiting for multiple workloads no longer publish a
           new revision for each sibling approval. Traffic-agents keep intercept
-          watch updates flowing during reviews and recover when manager sessions
-          stop responding.
+          watch updates flowing during reviews and attempt to reconnect unready
+          sessions after repeated manager heartbeat failures.
   - version: 2.31.2
     date: 2026-08-02
     notes:

@@ -131,7 +131,7 @@ The <code>--replace</code> flag of <code>telepresence intercept</code>, deprecat
 <Note>
 	<Title type="bugfix">Keep intercept reviews and manager sessions responsive</Title>
 	<Body>
-Service intercepts waiting for multiple workloads no longer publish a new revision for each sibling approval. Traffic-agents keep intercept watch updates flowing during reviews and recover when manager sessions stop responding.
+Service intercepts waiting for multiple workloads no longer publish a new revision for each sibling approval. Traffic-agents keep intercept watch updates flowing during reviews and attempt to reconnect unready sessions after repeated manager heartbeat failures.
   </Body>
 </Note>
 ## Version 2.31.2 <span style={{fontSize:'16px'}}>(August  2)</span>
