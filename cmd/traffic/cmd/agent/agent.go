@@ -245,7 +245,7 @@ func talkToManagerLoop(ctx context.Context, retryInterval time.Duration, talk fu
 	ticker := time.NewTicker(retryInterval)
 	defer ticker.Stop()
 
-	for {
+	for ctx.Err() == nil {
 		err := talk(ctx)
 		if err != nil {
 			switch status.Code(err) {

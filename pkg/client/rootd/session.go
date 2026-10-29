@@ -1017,6 +1017,7 @@ func (s *session) networkReady(ctx context.Context) <-chan error {
 }
 
 func (s *session) watchClusterInfo(teleroutePort uint16) error {
+	initialized := false
 	return watcher.WatchWithRetry(s, "WatchClusterInfo", client.GetConfig(s).Grpc().WatchRetryInterval,
 		func(ctx context.Context) (grpc.ServerStreamingClient[manager.ClusterInfo], error) {
 			return s.managerClient().WatchClusterInfo(ctx, s.session)
@@ -1025,21 +1026,21 @@ func (s *session) watchClusterInfo(teleroutePort uint16) error {
 			if err := s.readAdditionalRouting(mgrInfo); err != nil {
 				return err
 			}
-			select {
-			case <-s.vifReady:
+			if initialized {
 				if err := s.onClusterInfo(mgrInfo); err != nil {
 					if !errors.Is(err, context.Canceled) {
 						clog.Error(s, err)
 					}
 					return err
 				}
-			default:
+			} else {
 				if err := s.onFirstClusterInfo(teleroutePort, mgrInfo); err != nil {
 					if !errors.Is(err, context.Canceled) {
 						clog.Error(s, err)
 					}
 					return err
 				}
+				initialized = true
 			}
 			return nil
 		},

@@ -111,8 +111,11 @@ func (p *Proc) Wait(timeout time.Duration) (stdout, stderr string, err error) {
 	case err = <-p.done:
 	case <-time.After(timeout):
 		_ = p.cmd.Process.Kill()
-		<-p.done
+		exitErr := <-p.done
 		err = fmt.Errorf("cli: %s: did not exit within %s", p.cmd.Path, timeout)
+		if exitErr != nil {
+			err = fmt.Errorf("%w: %v", err, exitErr)
+		}
 	}
 	return p.outBuf.String(), p.errBuf.String(), err
 }

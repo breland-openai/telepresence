@@ -35,7 +35,7 @@ func healthHandler(allowlist *Allowlist) http.Handler {
 }
 
 // ServeHealth runs the forwarder's HTTP health endpoint on all interfaces at port until
-// ctx is done, at which point it shuts the server down and returns nil. It exists solely
+// ctx is done, then shuts the server down. Unexpected server errors are returned. It exists solely
 // to back the Deployment's readiness probe (see Env.HealthPort's doc comment): the probe
 // must not pass until allowlist has a snapshot, since a "ready" pod that is still
 // dropping every datagram is worse than one the Service hasn't started routing to yet.
@@ -55,7 +55,9 @@ func ServeHealth(ctx context.Context, port uint16, allowlist *Allowlist) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), healthShutdownTimeout)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
-		<-errCh
+		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
 		return nil
 	case err := <-errCh:
 		if errors.Is(err, http.ErrServerClosed) {

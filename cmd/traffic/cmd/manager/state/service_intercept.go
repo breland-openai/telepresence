@@ -547,8 +547,11 @@ func (is *Intercept) applyServiceReview(agent *rpc.AgentInfo, review *rpc.Review
 		return
 	}
 
-	participant.review = proto.Clone(review).(*rpc.ReviewInterceptRequest)
-	participant.podName = agent.PodName
+	// One successful review elects a pod for this workload until that approval is invalidated.
+	if participant.review == nil {
+		participant.review = proto.Clone(review).(*rpc.ReviewInterceptRequest)
+		participant.podName = agent.PodName
+	}
 	pending := is.pendingParticipants()
 	if len(pending) > 0 {
 		is.Disposition = rpc.InterceptDispositionType_WAITING

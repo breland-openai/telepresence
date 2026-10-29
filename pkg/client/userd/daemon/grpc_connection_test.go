@@ -56,8 +56,8 @@ func TestConnectingStatusAndConcurrentCallerRemainResponsive(t *testing.T) {
 	require.Equal(t, codes.Canceled, status.Code(connectionTestResult(t, waiter)))
 	require.Equal(t, int32(1), calls.Load())
 	select {
-	case <-owner:
-		t.Fatal("canceling a competing caller canceled the owner")
+	case err := <-owner:
+		t.Fatalf("canceling a competing caller canceled the owner: %v", err)
 	default:
 	}
 	close(release)
@@ -120,8 +120,8 @@ func TestQuitCancelsConstructionWithoutWaitingForIt(t *testing.T) {
 	require.NoError(t, connectionTestResult(t, quit))
 	connectionTestWait(t, canceled)
 	select {
-	case <-owner:
-		t.Fatal("construction ended before its fake cleanup was released")
+	case err := <-owner:
+		t.Fatalf("construction ended before its fake cleanup was released: %v", err)
 	default:
 	}
 	close(release)

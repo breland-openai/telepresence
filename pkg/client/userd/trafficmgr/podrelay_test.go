@@ -175,7 +175,7 @@ func TestPodRelayRunInProcess(t *testing.T) {
 	default:
 	}
 	cancel()
-	<-runErr
+	require.NoError(t, <-runErr)
 }
 
 func TestPodRelayRunInProcessUnimplemented(t *testing.T) {
@@ -270,7 +270,7 @@ func TestPodRelayRunStream(t *testing.T) {
 	// server, so this test doesn't leak a goroutine racing the next test's
 	// bufconn setup.
 	cancel()
-	<-runErr
+	require.NoError(t, <-runErr)
 }
 
 func TestPodRelayRunStreamUnimplemented(t *testing.T) {

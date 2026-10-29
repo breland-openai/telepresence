@@ -361,6 +361,41 @@ func TestEmbeddedProxyNetworkReadinessPreservesCancellationBeforeAndAfterVIF(t *
 	}
 }
 
+type clusterInfoTestManager struct {
+	manager.UnimplementedManagerServer
+}
+
+func (*clusterInfoTestManager) WatchClusterInfo(_ *manager.SessionInfo, stream grpc.ServerStreamingServer[manager.ClusterInfo]) error {
+	for range 2 {
+		if err := stream.Send(&manager.ClusterInfo{}); err != nil {
+			return err
+		}
+	}
+	return status.Error(codes.Unimplemented, "test stream complete")
+}
+
+func TestClusterInfoWatchPreservesPendingStartupError(t *testing.T) {
+	rd, _, stopSession := newEmbeddedProxyFixture(t)
+	defer stopSession()
+	conn := newWorkloadLookupConnection(t, func(server *grpc.Server) {
+		manager.RegisterManagerServer(server, &clusterInfoTestManager{})
+	})
+	rd.managerConnMu.Lock()
+	rd.managerConn = conn
+	rd.managerConnMu.Unlock()
+
+	startupErr := errors.New("startup timed out")
+	rd.vifReady <- startupErr
+	require.Equal(t, codes.Unimplemented, status.Code(rd.watchClusterInfo(0)))
+	select {
+	case err, ok := <-rd.vifReady:
+		require.True(t, ok)
+		require.ErrorIs(t, err, startupErr)
+	default:
+		t.Fatal("cluster info watch consumed the startup error")
+	}
+}
+
 type embeddedProxyClients struct {
 	agentpf.Clients
 	started  chan string
