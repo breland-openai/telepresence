@@ -127,33 +127,10 @@ func unspecified(addr netip.Addr) netip.Addr {
 // it cannot return an error.
 func (d *device) Close() {
 	d.Endpoint.Close()
-
-	// The tun.NativeTun device has a closing mutex which is read locked during
-	// a call to Read(). The read lock prevents a call to Close() to proceed
-	// until Read() actually receives something. To resolve that "deadlock",
-	// we call Close() in one goroutine to wait for the lock and write a bogus
-	// message in another that will be returned by Read().
-	closeCh := make(chan error)
-	go func() {
-		// first message is just to indicate that this goroutine has started
-		closeCh <- nil
-		closeCh <- d.dev.Close()
-		close(closeCh)
-	}()
-
-	// Not 100%, but we can be fairly sure that Close() is
-	// hanging on the lock, or at least will be by the time
-	// the Read() returns
-	<-closeCh
-
-	// Send something to the TUN device so that the Read
-	// unlocks the NativeTun.closing mutex and let the actual
-	// Close call continue
-	conn, err := net.Dial("udp", net.JoinHostPort(d.dns.String(), "53"))
-	if err == nil {
-		_, _ = conn.Write([]byte("bogus"))
+	// NativeTun.Close wakes blocked reads and waits for them to exit.
+	if err := d.dev.Close(); err != nil {
+		clog.Warnf(d.ctx, "failed to close TUN device: %v", err)
 	}
-	<-closeCh
 }
 
 func (d *device) getLUID() winipcfg.LUID {
