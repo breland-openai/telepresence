@@ -128,6 +128,12 @@ The new Helm setting <code>externalEndpoint</code> publishes a TLS gRPC listener
 The <code>--replace</code> flag of <code>telepresence intercept</code>, deprecated since 2.22.0, has been removed. Use the <code>telepresence replace</code> command instead. The traffic-manager now ignores HTTP filters that older clients send along with a replace request.
   </Body>
 </Note>
+<Note>
+	<Title type="bugfix">Keep intercept reviews and manager sessions responsive</Title>
+	<Body>
+Service intercepts waiting for multiple workloads no longer publish a new revision for each sibling approval. Traffic-agents keep intercept watch updates flowing during reviews and recover when manager sessions stop responding.
+  </Body>
+</Note>
 ## Version 2.31.2 <span style={{fontSize:'16px'}}>(August  2)</span>
 <Note>
 	<Title type="change">Namespaced installs no longer read ingresses cluster-wide</Title>

@@ -1053,6 +1053,63 @@ func TestServiceInterceptWaitsForEveryWorkload(t *testing.T) {
 	require.True(t, st.IsInterceptedBy(canary, "client"))
 }
 
+func TestServiceInterceptElectsOneReviewerPerWorkload(t *testing.T) {
+	ctx, st := newServiceInterceptState(t)
+	agents := []*AgentSession{
+		serviceAgent("example-service", "stable-pod-1", "10.0.0.1"),
+		serviceAgent("example-service", "stable-pod-2", "10.0.0.2"),
+		serviceAgent("example-service-canary", "canary-pod", "10.0.0.3"),
+	}
+	for _, agent := range agents {
+		st.agents.Store(tunnel.SessionID(agent.PodName), agent)
+	}
+	intercept := &Intercept{InterceptInfo: &rpc.InterceptInfo{
+		Id:               "client:example-service",
+		Spec:             sharedServiceSpec(),
+		Disposition:      rpc.InterceptDispositionType_WAITING,
+		ClientSession:    &rpc.SessionInfo{SessionId: "client"},
+		ServiceWorkloads: sharedServiceWorkloads(agents[0].Name, agents[2].Name),
+	}}
+	st.initializeParticipants(intercept)
+	st.intercepts.Store(intercept.Id, intercept)
+
+	approve := func(agent *AgentSession) *Intercept {
+		return st.ApplyAgentReview(ctx, intercept.Id, agent, &rpc.ReviewInterceptRequest{
+			Disposition: rpc.InterceptDispositionType_ACTIVE,
+			PodIp:       agent.PodIp,
+		})
+	}
+	start := make(chan struct{})
+	results := make(chan *Intercept, 2)
+	for _, agent := range agents[:2] {
+		go func() {
+			<-start
+			results <- approve(agent)
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	require.Same(t, first, second, "competing approvals must publish only one revision")
+	require.Equal(t, rpc.InterceptDispositionType_WAITING, first.Disposition)
+
+	key := agentParticipantKey(agents[0].AgentInfo)
+	elected, replacement := agents[0], agents[1]
+	if first.participants[key].podName == agents[1].PodName {
+		elected, replacement = replacement, elected
+	}
+	require.Equal(t, elected.PodIp, first.participants[key].review.PodIp)
+	st.agents.Delete(tunnel.SessionID(elected.PodName))
+	st.consolidateAgentSessionIntercepts(elected)
+	invalidated, ok := st.intercepts.Load(intercept.Id)
+	require.True(t, ok)
+	require.Nil(t, invalidated.participants[key].review)
+	require.Equal(t, replacement.PodName, approve(replacement).participants[key].podName)
+	active := approve(agents[2])
+	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, active.Disposition)
+	require.Equal(t, replacement.PodName, active.PodName)
+	require.Equal(t, replacement.PodIp, active.PodIp)
+}
+
 func TestServiceInterceptPublishesLateWorkload(t *testing.T) {
 	_, st := newServiceInterceptState(t)
 	stable := serviceAgent("example-service", "stable-pod", "10.0.0.1")
@@ -1701,6 +1758,13 @@ func TestServiceInterceptRequeuesWhenNonClaimingParticipantLeaves(t *testing.T) 
 	code, message := st.checkAgentsForIntercept(updated)
 	require.Equal(t, rpc.InterceptDispositionType_UNSPECIFIED, code)
 	require.Empty(t, message)
+
+	updated = st.ApplyAgentReview(ctx, intercept.Id, canary, &rpc.ReviewInterceptRequest{
+		Disposition: rpc.InterceptDispositionType_ACTIVE,
+		PodIp:       canary.PodIp,
+	})
+	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, updated.Disposition)
+	require.Equal(t, stable.PodName, updated.PodName)
 }
 
 func TestNonServiceSiblingRemovalDoesNotResetActiveIntercept(t *testing.T) {

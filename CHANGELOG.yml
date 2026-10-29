@@ -243,6 +243,13 @@ items:
           since 2.22.0, has been removed. Use the <code>telepresence replace</code> command
           instead. The traffic-manager now ignores HTTP filters that older clients send
           along with a replace request.
+      - type: bugfix
+        title: Keep intercept reviews and manager sessions responsive
+        body: >-
+          Service intercepts waiting for multiple workloads no longer publish a
+          new revision for each sibling approval. Traffic-agents keep intercept
+          watch updates flowing during reviews and recover when manager sessions
+          stop responding.
   - version: 2.31.2
     date: 2026-08-02
     notes:

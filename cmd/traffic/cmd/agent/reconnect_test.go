@@ -102,6 +102,10 @@ func TestTalkToManagerLoopStopsWhenContextCanceled(t *testing.T) {
 		cancel()
 		return status.Error(codes.Aborted, "inactivated pod")
 	})
+	talkToManagerLoop(ctx, time.Hour, func(context.Context) error {
+		attempts++
+		return nil
+	})
 
 	require.Equal(t, 1, attempts)
 	require.ErrorIs(t, ctx.Err(), context.Canceled)

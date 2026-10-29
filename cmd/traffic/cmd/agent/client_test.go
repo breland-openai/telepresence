@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/spf13/afero"
@@ -307,6 +308,112 @@ func TestInterceptReadinessDoesNotWaitForReview(t *testing.T) {
 
 	cancel()
 	require.NoError(t, <-done)
+}
+
+func TestInterceptReviewExpiresBeforeSession(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(interceptReadinessContext(t), 2*managerSessionRPCTimeout)
+		defer cancel()
+		manager := &interceptReadinessManager{review: func(ctx context.Context, _ *rpc.ReviewInterceptRequest) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+		state := &interceptReadinessState{handle: func(context.Context, []*rpc.InterceptInfo) []*rpc.ReviewInterceptRequest {
+			return []*rpc.ReviewInterceptRequest{{Id: "intercept"}}
+		}}
+		snapshots := make(chan interceptSnapshot, 1)
+		snapshots <- interceptSnapshot{}
+		err := handleInterceptLoop(ctx, manager, &rpc.SessionInfo{}, snapshots, state, newInterceptReadiness())
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.NoError(t, ctx.Err(), "a review timeout must not wait for the session to expire")
+	})
+}
+
+func TestInterceptWatchCoalescesSnapshotsWhileConsumerIsBusy(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(interceptReadinessContext(t))
+		stream := newFakeInterceptReadinessStream[rpc.InterceptInfoDelta](ctx)
+		manager := &interceptReadinessManager{delta: func(context.Context) (grpc.ServerStreamingClient[rpc.InterceptInfoDelta], error) {
+			return stream, nil
+		}}
+		snapshots := make(chan interceptSnapshot, 1)
+		watchDone := make(chan error, 1)
+		go func() {
+			watchDone <- interceptWatchLoop(ctx, manager, &rpc.SessionInfo{}, &rpc.AgentInfo{}, snapshots, time.Second, newInterceptReadiness())
+		}()
+		defer func() {
+			cancel()
+			require.NoError(t, <-watchDone)
+		}()
+
+		kept := &rpc.InterceptInfo{Id: "kept"}
+		removed := &rpc.InterceptInfo{Id: "removed"}
+		added := &rpc.InterceptInfo{Id: "added"}
+		fed := make(chan struct{})
+		go func() {
+			defer close(fed)
+			for _, delta := range []*rpc.InterceptInfoDelta{
+				{Upserts: map[string]*rpc.InterceptInfo{kept.Id: kept, removed.Id: removed}},
+				{Upserts: map[string]*rpc.InterceptInfo{added.Id: added}, Removals: []string{removed.Id}},
+				{},
+			} {
+				select {
+				case stream.values <- delta:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		select {
+		case <-fed:
+		case <-time.After(time.Second):
+			t.Fatal("watch stopped receiving while the snapshot consumer was busy")
+		}
+		require.ElementsMatch(t, []*rpc.InterceptInfo{kept, added}, (<-snapshots).intercepts)
+	})
+}
+
+func TestInterceptWatchRetriesStalledRepair(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(interceptReadinessContext(t), 2*managerSessionRPCTimeout)
+		stream := newFakeInterceptReadinessStream[rpc.InterceptInfoDelta](ctx)
+		stream.values = make(chan *rpc.InterceptInfoDelta, 1)
+		stream.values <- &rpc.InterceptInfoDelta{Upserts: map[string]*rpc.InterceptInfo{"fresh": {Id: "fresh"}}}
+		watches, repairs := 0, 0
+		manager := &interceptReadinessManager{
+			delta: func(context.Context) (grpc.ServerStreamingClient[rpc.InterceptInfoDelta], error) {
+				watches++
+				if watches == 1 {
+					return nil, status.Error(codes.Unavailable, "watch interrupted")
+				}
+				return stream, nil
+			},
+			reconnect: func(ctx context.Context) error {
+				repairs++
+				if repairs == 1 {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return nil
+			},
+		}
+		snapshots := make(chan interceptSnapshot, 1)
+		watchDone := make(chan error, 1)
+		go func() {
+			watchDone <- interceptWatchLoop(ctx, manager, &rpc.SessionInfo{}, &rpc.AgentInfo{}, snapshots, time.Millisecond, newInterceptReadiness())
+		}()
+		defer func() {
+			cancel()
+			require.NoError(t, <-watchDone)
+		}()
+		select {
+		case snapshot := <-snapshots:
+			require.Equal(t, "fresh", snapshot.intercepts[0].Id)
+			require.Equal(t, 2, repairs)
+		case <-ctx.Done():
+			t.Fatal("watch did not recover before the session expired")
+		}
+	})
 }
 
 func TestInterceptReadinessWithdrawnUntilReconnectSnapshotApplied(t *testing.T) {
