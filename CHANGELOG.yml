@@ -250,6 +250,13 @@ items:
           new revision for each sibling approval. Traffic-agents keep intercept
           watch updates flowing during reviews and attempt to reconnect unready
           sessions after repeated manager heartbeat failures.
+      - type: bugfix
+        title: Avoid repeated or stale intercept approvals
+        body: >-
+          Traffic-agents reuse successful approvals when unrelated intercepts
+          change. Service intercepts wait for every required workload to recover
+          before accepting fresh approvals, and expired agents can no longer
+          claim a replacement pod's intercept.
   - version: 2.31.2
     date: 2026-08-02
     notes:

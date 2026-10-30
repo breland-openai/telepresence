@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -1108,6 +1109,109 @@ func TestServiceInterceptElectsOneReviewerPerWorkload(t *testing.T) {
 	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, active.Disposition)
 	require.Equal(t, replacement.PodName, active.PodName)
 	require.Equal(t, replacement.PodIp, active.PodIp)
+}
+
+func TestLateServiceReviewPreservesUnavailableParticipants(t *testing.T) {
+	for _, cause := range []string{"expired participant", "replica without target"} {
+		t.Run(cause, func(t *testing.T) {
+			ctx, st := newServiceInterceptState(t)
+			now := time.Now()
+			register := func(id tunnel.SessionID, info *rpc.AgentInfo) *AgentSession {
+				t.Helper()
+				_, err := st.RestoreAgent(ctx, id, info, nil, now)
+				require.NoError(t, err)
+				agent := st.GetAgent(id)
+				require.NotNil(t, agent)
+				return agent
+			}
+			stable := register("stable", serviceAgent("example-service", "stable", "10.0.0.1").AgentInfo)
+			canary := register("canary", serviceAgent("example-service-canary", "canary", "10.0.0.2").AgentInfo)
+			sibling := register("sibling", serviceAgent(stable.Name, "sibling", "10.0.0.3").AgentInfo)
+			intercept := activeServiceIntercept(t, ctx, st, stable, canary)
+			review := func(agent *AgentSession) *Intercept {
+				return st.ApplyAgentReview(ctx, intercept.Id, agent, &rpc.ReviewInterceptRequest{
+					Disposition: rpc.InterceptDispositionType_ACTIVE,
+					PodIp:       agent.PodIp,
+				})
+			}
+
+			if cause == "expired participant" {
+				st.expireAgentSession(canary, now.Add(time.Second))
+				require.Nil(t, st.GetAgent("canary"))
+			} else {
+				legacy := serviceAgent(canary.Name, "legacy", "10.0.0.4")
+				legacy.InterceptTargets = nil
+				register("legacy", legacy.AgentInfo)
+			}
+			unavailable, ok := st.intercepts.Load(intercept.Id)
+			require.True(t, ok)
+			require.Equal(t, rpc.InterceptDispositionType_NO_AGENT, unavailable.Disposition)
+			code, _ := st.checkAgentsForIntercept(unavailable)
+			require.Equal(t, rpc.InterceptDispositionType_NO_AGENT, code)
+
+			// These RPCs could already have been in flight when the agent set changed.
+			for _, agent := range []*AgentSession{sibling, stable, sibling} {
+				updated := review(agent)
+				require.Same(t, unavailable, updated, "late review from %s", agent.PodName)
+			}
+
+			if cause == "expired participant" {
+				canary = register("canary", canary.AgentInfo)
+			} else {
+				st.RemoveSession(ctx, "legacy")
+			}
+			waiting, ok := st.intercepts.Load(intercept.Id)
+			require.True(t, ok)
+			require.Equal(t, rpc.InterceptDispositionType_WAITING, waiting.Disposition)
+			require.Equal(t, rpc.InterceptDispositionType_ACTIVE, review(canary).Disposition)
+		})
+	}
+}
+
+func TestExpiredServiceReviewerCannotApproveAfterReplacementArrives(t *testing.T) {
+	ctx, st := newServiceInterceptState(t)
+	now := time.Now()
+	stable := serviceAgent("example-service", "stable", "10.0.0.1")
+	canaryInfo := serviceAgent("example-service-canary", "old-canary", "10.0.0.2").AgentInfo
+	_, err := st.RestoreAgent(ctx, "canary", canaryInfo, nil, now)
+	require.NoError(t, err)
+	old := st.GetAgent("canary")
+	require.NotNil(t, old)
+	intercept := activeServiceIntercept(t, ctx, st, stable, old)
+	review := func(agent *AgentSession) *Intercept {
+		return st.ApplyAgentReview(ctx, intercept.Id, agent, &rpc.ReviewInterceptRequest{
+			Disposition: rpc.InterceptDispositionType_ACTIVE,
+			PodIp:       agent.PodIp,
+		})
+	}
+	// Each worker resolved the same session before expiry. Its review can
+	// overlap removal and registration, or arrive after the replacement does.
+	start := make(chan struct{})
+	var overlapping sync.WaitGroup
+	for range 8 {
+		overlapping.Go(func() {
+			<-start
+			review(old)
+		})
+	}
+	close(start)
+	st.expireAgentSession(old, now.Add(time.Second))
+	replacementInfo := serviceAgent(old.Name, "new-canary", "10.0.0.3").AgentInfo
+	_, err = st.RestoreAgent(ctx, "replacement", replacementInfo, nil, now.Add(time.Second))
+	overlapping.Wait()
+	require.NoError(t, err)
+	replacement := st.GetAgent("replacement")
+	require.NotNil(t, replacement)
+
+	waiting, ok := st.intercepts.Load(intercept.Id)
+	require.True(t, ok)
+	require.Equal(t, rpc.InterceptDispositionType_WAITING, waiting.Disposition)
+	// The RPC resolved the old session before expiry and is only now applying its review.
+	got := review(old)
+	require.Same(t, waiting, got, "review from expired %s", old.PodName)
+	active := review(replacement)
+	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, active.Disposition)
+	require.Equal(t, replacement.PodName, active.participants[agentParticipantKey(replacement.AgentInfo)].podName)
 }
 
 func TestServiceInterceptPublishesLateWorkload(t *testing.T) {

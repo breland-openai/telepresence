@@ -116,7 +116,8 @@ func TestState_HandleIntercepts(t *testing.T) {
 	cepts[0].Disposition = rpc.InterceptDispositionType_WAITING
 	cepts[1].Disposition = rpc.InterceptDispositionType_WAITING
 
-	reviews = s.HandleIntercepts(ctx, cepts)
+	// A delta can supply the same pair in the opposite order.
+	reviews = s.HandleIntercepts(ctx, []*rpc.InterceptInfo{cepts[1], cepts[0]})
 	require.Len(t, reviews, 2)
 
 	// Reviews are in the correct order

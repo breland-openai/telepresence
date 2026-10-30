@@ -128,6 +128,12 @@ The <code>--replace</code> flag of <code>telepresence intercept</code>, deprecat
 Service intercepts waiting for multiple workloads no longer publish a new revision for each sibling approval. Traffic-agents keep intercept watch updates flowing during reviews and attempt to reconnect unready sessions after repeated manager heartbeat failures.
 </div>
 
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Avoid repeated or stale intercept approvals</div></div>
+<div style="margin-left: 15px">
+
+Traffic-agents reuse successful approvals when unrelated intercepts change. Service intercepts wait for every required workload to recover before accepting fresh approvals, and expired agents can no longer claim a replacement pod's intercept.
+</div>
+
 ## Version 2.31.2 <span style="font-size: 16px;">(August  2)</span>
 ## <div style="display:flex;"><img src="images/change.png" alt="change" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Namespaced installs no longer read ingresses cluster-wide</div></div>
 <div style="margin-left: 15px">
