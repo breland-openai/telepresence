@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -36,14 +38,21 @@ const unauthenticatedMessage = "this traffic-manager requires an authenticated c
 // Kubernetes token for the traffic-manager audience. Canceled calls never reach
 // application handlers.
 type Interceptor struct {
-	auth *Authenticator
-	mode Mode
+	auth                    *Authenticator
+	mode                    Mode
+	invalidTokenWarnings    *rate.Limiter
+	reviewAdmissionWarnings *rate.Limiter
 }
 
 // NewInterceptor creates an Interceptor that authenticates calls using a, behaving
 // according to mode.
 func NewInterceptor(a *Authenticator, mode Mode) *Interceptor {
-	return &Interceptor{auth: a, mode: mode}
+	return &Interceptor{
+		auth:                    a,
+		mode:                    mode,
+		invalidTokenWarnings:    rate.NewLimiter(rate.Every(10*time.Second), 1),
+		reviewAdmissionWarnings: rate.NewLimiter(rate.Every(10*time.Second), 1),
+	}
 }
 
 // Unary returns a grpc.UnaryServerInterceptor that authenticates the call.
@@ -121,13 +130,20 @@ func (i *Interceptor) authenticate(ctx context.Context, method string) (context.
 	case err == nil:
 		return WithPrincipal(ctx, p), nil
 	case errors.Is(err, ErrInvalidToken):
-		clog.Warnf(ctx, "call to %s presented an invalid bearer token", method)
+		if i.invalidTokenWarnings.Allow() {
+			clog.Warnf(ctx, "call to %s presented an invalid bearer token (warnings rate-limited)", method)
+		}
 		if enforcing {
 			return ctx, status.Error(codes.Unauthenticated, unauthenticatedMessage)
 		}
 	case errors.Is(err, errTooManyReviews):
-		clog.Warnf(ctx, "call to %s was rejected by review admission", method)
-		return ctx, status.Error(codes.ResourceExhausted, "too many authentication attempts")
+		if i.reviewAdmissionWarnings.Allow() {
+			clog.Warnf(ctx, "call to %s was rejected by review admission (warnings rate-limited)", method)
+		}
+		if enforcing {
+			return ctx, status.Error(codes.ResourceExhausted, "too many authentication attempts")
+		}
+		ctx = WithAuthUnavailable(ctx)
 	default:
 		clog.Errorf(ctx, "token authentication unavailable for %s: %v", method, err)
 		if enforcing {

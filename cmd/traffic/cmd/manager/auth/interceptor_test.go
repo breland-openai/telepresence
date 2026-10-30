@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -341,6 +343,33 @@ func TestInterceptor_LogsNeverContainToken(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotContains(t, buf.String(), secretUnavailable)
 		assert.Contains(t, buf.String(), "unavailable")
+	})
+}
+
+func TestInterceptor_InvalidTokenWarningsAreRateLimited(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ci := fake.NewClientset()
+		k8sapi.InstallFakeTokenReviews(ci, nil)
+		metrics := auth.NewMetrics("test-invalid-token-warnings")
+		initialInvalid := testutil.ToFloat64(metrics.InvalidTokens)
+		i := auth.NewInterceptor(auth.NewAuthenticator(ci, auth.WithMetrics(metrics)), auth.ModePermissive)
+		buf := &bytes.Buffer{}
+		ctx := metadata.NewIncomingContext(loggingContext(buf), metadata.Pairs("authorization", "Bearer bad"))
+		info := &grpc.UnaryServerInfo{FullMethod: "/telepresence.manager.Manager/Connect"}
+		handler := func(context.Context, any) (any, error) { return nil, nil }
+
+		for range 20 {
+			_, err := i.Unary()(ctx, nil, info, handler)
+			require.NoError(t, err)
+		}
+		assert.Equal(t, 1, strings.Count(buf.String(), "invalid bearer token"))
+		assert.Equal(t, initialInvalid+20, testutil.ToFloat64(metrics.InvalidTokens))
+
+		time.Sleep(10 * time.Second)
+		_, err := i.Unary()(ctx, nil, info, handler)
+		require.NoError(t, err)
+		assert.Equal(t, 2, strings.Count(buf.String(), "invalid bearer token"))
+		assert.Equal(t, initialInvalid+21, testutil.ToFloat64(metrics.InvalidTokens))
 	})
 }
 

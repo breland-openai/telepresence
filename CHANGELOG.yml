@@ -28,6 +28,14 @@ items:
     date: (TBD)
     notes:
       - type: bugfix
+        title: Limit internal traffic-manager authentication load
+        body: >-
+          The traffic-manager now limits internal TokenReview requests and
+          rate-limits warnings for invalid tokens and admission rejections.
+          Authentication metrics distinguish the internal and external
+          listeners, and permissive mode treats admission limits as
+          authentication being unavailable.
+      - type: bugfix
         title: Reject intercepts without a reverse connection to the traffic-agent
         body: >-
           The client now refuses to create an intercept, replacement, or wiretap if
