@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	empty "google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/telepresenceio/clog"
@@ -412,6 +413,7 @@ func interceptWatchLoop(
 				}, nil
 			},
 			func(snapshot *rpc.InterceptInfoSnapshot) error {
+				snapMap = retainWaitingIntercepts(snapMap, snapshot.Intercepts)
 				return sendInterceptSnapshot(ctx, snapshots, interceptSnapshot{
 					intercepts: snapshot.Intercepts,
 					generation: readiness.currentGeneration(),
@@ -419,6 +421,23 @@ func interceptWatchLoop(
 			}, reconnectAgent)
 	}
 	return err
+}
+
+// A full watch decodes new messages for every route. Preserve the identity of
+// an unchanged, versioned route before snapshots can be coalesced. Managers
+// without revisions may be asking for a fresh review on every full snapshot.
+func retainWaitingIntercepts(previous map[string]*rpc.InterceptInfo, infos []*rpc.InterceptInfo) map[string]*rpc.InterceptInfo {
+	current := make(map[string]*rpc.InterceptInfo)
+	for i, info := range infos {
+		if info.Disposition != rpc.InterceptDispositionType_WAITING || info.ModifiedAt == nil {
+			continue
+		}
+		if old := previous[info.Id]; old != nil && proto.Equal(old, info) {
+			infos[i] = old
+		}
+		current[info.Id] = infos[i]
+	}
+	return current
 }
 
 func sendInterceptSnapshot(ctx context.Context, snapshots chan interceptSnapshot, snapshot interceptSnapshot) error {
@@ -478,6 +497,8 @@ func handleInterceptLoop(
 	state State,
 	readiness *interceptReadiness,
 ) error {
+	var approvals interceptApprovals
+	var generation uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -488,21 +509,57 @@ func handleInterceptLoop(
 			if err := readiness.setSynchronized(ctx, snapshot.generation); err != nil {
 				return err
 			}
-			for _, review := range reviews {
-				review.Session = session
-				reviewCtx, cancel := context.WithTimeout(ctx, managerSessionRPCTimeout)
-				_, err := manager.ReviewIntercept(reviewCtx, review)
-				cancel()
-				if err != nil {
-					if status.Code(err) == codes.NotFound {
-						// An intercept may be removed after a snapshot has arrived and before
-						// the next snapshot. This is not an error. We can safely assume that
-						// a new snapshot will arrive.
-						continue
-					}
-					return err
-				}
+			if generation != snapshot.generation {
+				generation = snapshot.generation
+				approvals = nil
+			}
+			var err error
+			approvals, err = approvals.submit(ctx, manager, session, snapshot.intercepts, reviews)
+			if err != nil {
+				return err
 			}
 		}
 	}
+}
+
+// Delta upserts replace an intercept's immutable message. Its identity stays
+// stable across unrelated deltas, even when intermediate snapshots are dropped.
+type interceptApprovals map[*rpc.InterceptInfo]*rpc.ReviewInterceptRequest
+
+func (previous interceptApprovals) submit(ctx context.Context, manager rpc.ManagerClient, session *rpc.SessionInfo,
+	infos []*rpc.InterceptInfo, reviews []*rpc.ReviewInterceptRequest,
+) (interceptApprovals, error) {
+	if len(reviews) == 0 {
+		return nil, nil
+	}
+	waiting := make(map[string]*rpc.InterceptInfo, len(reviews))
+	for _, info := range infos {
+		if info.Disposition == rpc.InterceptDispositionType_WAITING {
+			waiting[info.Id] = info
+		}
+	}
+	next := make(interceptApprovals, len(reviews))
+	for _, review := range reviews {
+		review.Session = session
+		info := waiting[review.Id]
+		if ack := previous[info]; ack != nil && proto.Equal(ack, review) {
+			next[info] = ack
+			continue
+		}
+		reviewCtx, cancel := context.WithTimeout(ctx, managerSessionRPCTimeout)
+		_, err := manager.ReviewIntercept(reviewCtx, review)
+		cancel()
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				// Removal can race an in-flight review.
+				continue
+			}
+			return nil, err
+		}
+		if info != nil && review.Disposition == rpc.InterceptDispositionType_ACTIVE {
+			next[info] = proto.CloneOf(review)
+			clog.Infof(ctx, "Allowing non-conflicting intercept %q to become active", info.Id)
+		}
+	}
+	return next, nil
 }

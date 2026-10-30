@@ -11,15 +11,13 @@ import (
 	"github.com/telepresenceio/clog/testutil"
 	rpc "github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
-	"github.com/telepresenceio/telepresence/v2/pkg/log"
 	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
 )
 
 func TestPresence(t *testing.T) {
 	ctx := testutil.NewContext(t, false)
 	ctx = managerutil.WithEnv(ctx, &managerutil.Env{})
-	g := log.NewGroup(ctx)
-	p := NewState(ctx, g, nil)
+	p := newTestState(t, ctx)
 
 	now := time.Now()
 

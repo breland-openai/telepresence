@@ -179,7 +179,6 @@ func (fs *fwdState) processRegularIntercept(
 			MechanismArgsDesc: generateMechanismDescription(ii.Spec),
 		}
 	}
-	clog.Infof(ctx, "Allowing non-conflicting intercept %q to become active", ii.Id)
 	return &manager.ReviewInterceptRequest{
 		Id:                ii.Id,
 		Disposition:       manager.InterceptDispositionType_ACTIVE,
@@ -228,17 +227,18 @@ func (fs *fwdState) HandlePort(ctx context.Context, cepts []*manager.InterceptIn
 	// Review waiting intercepts
 	reviews := make([]*manager.ReviewInterceptRequest, 0, len(waiting))
 
-	// Collect all intercepts that could potentially become active
-	candidateIntercepts := slices.Clone(waiting)
+	// Full watches order by ID. Delta maps can arrive in any order, so use
+	// the same tie-breaker when two waiting intercepts compete for a port.
+	slices.SortFunc(waiting, func(a, b *manager.InterceptInfo) int { return strings.Compare(a.Id, b.Id) })
 
-	for i, ii := range candidateIntercepts {
+	for i, ii := range waiting {
 		if ii.Spec.Wiretap {
 			reviews = append(reviews, fs.processWiretapIntercept(ii))
 			continue
 		}
 
 		// Check for conflicts and process regular intercept
-		review := fs.processRegularIntercept(ctx, ii, i, active, candidateIntercepts)
+		review := fs.processRegularIntercept(ctx, ii, i, active, waiting)
 		reviews = append(reviews, review)
 	}
 	return reviews

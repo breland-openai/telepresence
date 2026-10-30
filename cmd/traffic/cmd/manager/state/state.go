@@ -367,6 +367,7 @@ func (s *State) expireAgentSession(agent *AgentSession, moment time.Time) {
 }
 
 func (s *State) removeAgentSessionLocked(agent *AgentSession, inactivate bool) {
+	agent.reviewMu.Lock()
 	id := agent.sessionID()
 	s.agents.Delete(id)
 	if inactivate {
@@ -376,6 +377,7 @@ func (s *State) removeAgentSessionLocked(agent *AgentSession, inactivate bool) {
 		clog.Infof(s.backgroundCtx, "AgentSession %s expired; last heartbeat %s", id, agent.lastMarked())
 	}
 	agent.cancel()
+	agent.reviewMu.Unlock()
 	s.consolidateAgentSessionIntercepts(agent)
 }
 
@@ -1038,6 +1040,14 @@ func (s *State) UpdateIntercept(interceptID string, apply func(*Intercept)) *Int
 // they become active; workload-scoped intercepts retain the historical
 // first-review-wins behavior.
 func (s *State) ApplyAgentReview(ctx context.Context, interceptID string, agent *AgentSession, review *rpc.ReviewInterceptRequest) *Intercept {
+	agent.reviewMu.RLock()
+	defer agent.reviewMu.RUnlock()
+	select {
+	case <-agent.done():
+		intercept, _ := s.intercepts.Load(interceptID)
+		return intercept
+	default:
+	}
 	return s.UpdateIntercept(interceptID, func(intercept *Intercept) {
 		if !AgentMatchesInterceptInfo(agent.AgentInfo, intercept) {
 			return
@@ -1047,17 +1057,18 @@ func (s *State) ApplyAgentReview(ctx context.Context, interceptID string, agent 
 			return
 		}
 
-		// Agents race to review an intercept, so only reviews for waiting
-		// intercepts can change its state.
+		if serviceScopedIntercept(intercept.Spec) {
+			// Participant reconciliation reopens an unavailable Service once every workload is eligible.
+			if intercept.Disposition != rpc.InterceptDispositionType_WAITING {
+				return
+			}
+			intercept.applyServiceReview(agent.AgentInfo, review)
+			return
+		}
 		if intercept.Disposition != rpc.InterceptDispositionType_NO_AGENT &&
 			intercept.Disposition != rpc.InterceptDispositionType_WAITING {
 			return
 		}
-		if serviceScopedIntercept(intercept.Spec) {
-			intercept.applyServiceReview(agent.AgentInfo, review)
-			return
-		}
-
 		applyReview(intercept, review)
 		intercept.PodName = agent.PodName
 	})
