@@ -78,7 +78,8 @@ grpc:
 # security configures the traffic-manager's caller-authentication behavior.
 security:
   authentication:
-    # mode controls how strictly the traffic-manager enforces caller authentication:
+    # mode controls how strictly the internal traffic-manager listener enforces
+    # caller authentication. The external listener always enforces it separately:
     #
     #  disabled    no token validation at all.
     #  permissive  tokens are validated and the resulting identity is used for
@@ -102,7 +103,8 @@ security:
       # Role. This only has an effect when mode above is "enforcing" --
       # x509 client-certificate authentication is active whenever mode is
       # "enforcing", unless this is set to false. It has no effect under
-      # any other mode.
+      # any other mode. The external listener obtains the CA through the same
+      # RoleBinding independently when published.
       #
       # Default: true
       enabled: true
@@ -395,16 +397,42 @@ quicTunnel:
 ################################################################################
 # externalEndpoint controls the opt-in external TLS gRPC listener that lets a
 # client connect without ever contacting the Kubernetes API server. Publishing
-# it requires security.authentication.mode: enforcing -- in permissive or
-# disabled mode the listener would have no access control -- and exactly one
-# of tls.secretName / tls.certManager.enabled, both enforced at chart render.
-# Publishing it also drops the mechanical pods/portforward rules from the
-# rendered clientRbac Roles -- both the connect Role and the per-namespace
-# intercept Roles -- since external clients never port-forward, unless the
-# required grant is "portforward", where possession of that grant is itself
-# the authorization policy.
+# it always enforces authentication and authorization independently of
+# security.authentication.mode, and requires exactly one of tls.secretName /
+# tls.certManager.enabled. Existing port-forward RBAC is kept by default so
+# internal/older clients can coexist during migration.
 externalEndpoint:
   enabled: false
+
+  # Set true only after all clients have stopped using the internal port-forward
+  # path. Removes its mechanical RBAC, except when port-forward is itself the
+  # configured security.authorization.requiredGrant.
+  disablePortForwardRbac: false
+
+  # Optionally validate external bearer tokens using a standard Kubernetes v1
+  # TokenReview HTTPS webhook, instead of the Kubernetes API. Internal clients
+  # and agents keep their native Kubernetes authentication. The webhook must
+  # explicitly return at least one of the configured audiences; errors do not
+  # fall back to Kubernetes. Leave url empty for native external authentication.
+  authenticationWebhook:
+    url: ""
+    audiences: []
+    # Exactly one caller credential source is required when url is set. This
+    # credential authenticates the manager to the webhook, never its end user.
+    credentials:
+      # Prefer a short-lived, automatically rotated projected ServiceAccount
+      # token when the webhook trusts this cluster's ServiceAccount issuer.
+      serviceAccountTokenAudience: ""
+      # Alternative: an existing Secret in the manager namespace. Rotation is
+      # picked up without restarting the manager.
+      secretName: ""
+      secretKey: token
+    # Leave secretName empty to trust system/public CAs. For a private CA,
+    # supply an existing Secret in the manager namespace containing PEM roots.
+    # Restart the manager after changing this CA bundle.
+    ca:
+      secretName: ""
+      secretKey: ca.crt
 
   # port is the container port the external TLS listener binds to. 8444
   # avoids colliding with the agent-injector webhook's 8443 container port.

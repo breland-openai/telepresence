@@ -3,6 +3,8 @@ package golden
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestExternalEndpointDisabledByDefault asserts that a default render omits
@@ -129,8 +131,8 @@ func TestExternalEndpointOmitsConnectPortForward(t *testing.T) {
 				"authorization":  map[string]any{"requiredGrant": grant},
 			},
 			"externalEndpoint": map[string]any{
-				"enabled": true,
-				"tls":     map[string]any{"secretName": "rtest-external-tls"},
+				"enabled": true, "disablePortForwardRbac": true,
+				"tls": map[string]any{"secretName": "rtest-external-tls"},
 			},
 			"clientRbac": map[string]any{"create": true, "subjects": subjects},
 		}
@@ -189,8 +191,8 @@ func TestExternalEndpointOmitsInterceptPortForward(t *testing.T) {
 					"authorization":  map[string]any{"requiredGrant": grant},
 				},
 				"externalEndpoint": map[string]any{
-					"enabled": true,
-					"tls":     map[string]any{"secretName": "rtest-external-tls"},
+					"enabled": true, "disablePortForwardRbac": true,
+					"tls": map[string]any{"secretName": "rtest-external-tls"},
 				},
 				"clientRbac": map[string]any{"create": true, "subjects": subjects},
 			})
@@ -202,27 +204,87 @@ func TestExternalEndpointOmitsInterceptPortForward(t *testing.T) {
 	}
 }
 
-// TestExternalEndpointRequiresEnforcing asserts that externalEndpoint.enabled
-// fails the render under any auth mode other than enforcing.
-func TestExternalEndpointRequiresEnforcing(t *testing.T) {
+func TestExternalEndpointCoexistsWithNonEnforcingInternalListener(t *testing.T) {
 	for _, mode := range []string{"permissive", "disabled"} {
 		t.Run(mode, func(t *testing.T) {
-			err := renderErr(t, map[string]any{
+			out := renderChart(t, map[string]any{
 				"security": map[string]any{
 					"authentication": map[string]any{"mode": mode},
 				},
+				"clientRbac": map[string]any{"create": true, "subjects": []map[string]any{{"kind": "ServiceAccount", "name": "rtest-golden", "namespace": releaseNamespace}}},
 				"externalEndpoint": map[string]any{
 					"enabled": true,
 					"tls":     map[string]any{"secretName": "rtest-external-tls"},
 				},
 			})
-			if err == nil {
-				t.Fatalf("expected render to fail under security.authentication.mode=%s", mode)
-			}
-			if !strings.Contains(err.Error(), "enforcing") {
-				t.Errorf("unexpected render error: %v", err)
-			}
+			require.True(t, rendered(out, externalEndpointTpl))
+			require.True(t, rendered(out, x509Tpl), "external listener needs the cluster client CA independent of internal mode")
+			require.Equal(t, mode, parseEnv(out[statefulsetTpl])["AUTHENTICATION_MODE"])
+			require.Contains(t, out[clientConnectTpl], "pods/portforward", "retain old clients' bootstrap RBAC by default")
+			assertInterceptRules(t, clientClusterScopeTpl, out[clientClusterScopeTpl], "any", false)
 		})
+	}
+}
+
+func TestExternalAuthenticationWebhook(t *testing.T) {
+	values := func(webhook map[string]any) map[string]any {
+		return map[string]any{"externalEndpoint": map[string]any{
+			"enabled": true, "tls": map[string]any{"secretName": "external-tls"}, "authenticationWebhook": webhook,
+		}}
+	}
+	for _, tc := range []struct {
+		name        string
+		credentials map[string]any
+		ca          map[string]any
+		expected    []string
+		absent      string
+	}{
+		{
+			"projected service account",
+			map[string]any{"serviceAccountTokenAudience": "review-caller"},
+			nil,
+			[]string{"serviceAccountToken:", `audience: "review-caller"`, "expirationSeconds: 3600", "path: token"},
+			"name: auth-webhook-ca\n",
+		},
+		{
+			"secret and custom ca",
+			map[string]any{"secretName": "review-caller-secret", "secretKey": "credential"},
+			map[string]any{"secretName": "review-ca", "secretKey": "roots"},
+			[]string{`secretName: "review-caller-secret"`, `key: "credential"`, `secretName: "review-ca"`, `key: "roots"`, "path: ca.crt"},
+			"serviceAccountToken:",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			webhook := map[string]any{"url": "https://identity.example.com/review", "audiences": []string{"client-prod", "client-staging"}, "credentials": tc.credentials}
+			if tc.ca != nil {
+				webhook["ca"] = tc.ca
+			}
+			out := renderChart(t, values(webhook))
+			ss := out[statefulsetTpl]
+			env := parseEnv(ss)
+			require.Equal(t, "https://identity.example.com/review", env["EXTERNAL_AUTH_WEBHOOK_URL"])
+			require.Equal(t, "client-prod client-staging", env["EXTERNAL_AUTH_WEBHOOK_AUDIENCES"])
+			require.Equal(t, "/var/run/secrets/telepresence.io/auth-webhook-caller/token", env["EXTERNAL_AUTH_WEBHOOK_CALLER_TOKEN_FILE"])
+			if tc.ca != nil {
+				require.Equal(t, "/var/run/secrets/telepresence.io/auth-webhook-ca/ca.crt", env["EXTERNAL_AUTH_WEBHOOK_CA_FILE"])
+			}
+			for _, expected := range tc.expected {
+				require.Contains(t, ss, expected)
+			}
+			require.NotContains(t, ss, tc.absent)
+		})
+	}
+	for _, tc := range []struct {
+		name    string
+		webhook map[string]any
+		want    string
+	}{
+		{"missing audiences", map[string]any{"url": "https://identity.example.com/review", "credentials": map[string]any{"secretName": "secret"}}, "audiences"},
+		{"missing caller", map[string]any{"url": "https://identity.example.com/review", "audiences": []string{"client"}}, "exactly one"},
+		{"both callers", map[string]any{"url": "https://identity.example.com/review", "audiences": []string{"client"}, "credentials": map[string]any{"secretName": "secret", "serviceAccountTokenAudience": "projected"}}, "exactly one"},
+		{"missing URL", map[string]any{"audiences": []string{"client"}}, "url is required"},
+	} {
+		t.Run(tc.name, func(t *testing.T) { require.ErrorContains(t, renderErr(t, values(tc.webhook)), tc.want) })
 	}
 }
 

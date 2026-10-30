@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"runtime/debug"
 	"time"
 
 	"google.golang.org/grpc"
@@ -9,6 +10,8 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+
+	"github.com/telepresenceio/clog"
 )
 
 // Admission-control defaults for the external listener's TokenReviews -- the
@@ -72,11 +75,17 @@ func NewExternalInterceptor(inner *Interceptor, caPool *ClientCAPool, metrics *M
 
 // Unary returns a grpc.UnaryServerInterceptor that authenticates the call.
 func (e *ExternalInterceptor) Unary() grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (response any, err error) {
+		defer func() {
+			if failure := recover(); failure != nil {
+				response, err = nil, externalHandlerPanic(ctx, info.FullMethod, failure)
+			}
+		}()
+		ctx = WithEnforcing(ctx)
 		if skipAuth(info.FullMethod) {
 			return handler(ctx, req)
 		}
-		ctx, err := e.authenticate(ctx, info.FullMethod)
+		ctx, err = e.authenticate(ctx, info.FullMethod)
 		if err != nil {
 			return nil, err
 		}
@@ -86,16 +95,29 @@ func (e *ExternalInterceptor) Unary() grpc.UnaryServerInterceptor {
 
 // Stream returns a grpc.StreamServerInterceptor that authenticates the call.
 func (e *ExternalInterceptor) Stream() grpc.StreamServerInterceptor {
-	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
+		defer func() {
+			if failure := recover(); failure != nil {
+				err = externalHandlerPanic(ss.Context(), info.FullMethod, failure)
+			}
+		}()
+		ctx := WithEnforcing(ss.Context())
 		if skipAuth(info.FullMethod) {
-			return handler(srv, ss)
+			return handler(srv, &authenticatedStream{ServerStream: ss, ctx: ctx})
 		}
-		ctx, err := e.authenticate(ss.Context(), info.FullMethod)
+		ctx, err = e.authenticate(ctx, info.FullMethod)
 		if err != nil {
 			return err
 		}
 		return handler(srv, &authenticatedStream{ServerStream: ss, ctx: ctx})
 	}
+}
+
+// Only code locations and panic type are logged: a panic value could include
+// client-supplied or other sensitive information. It is never sent to the client.
+func externalHandlerPanic(ctx context.Context, method string, failure any) error {
+	clog.Errorf(ctx, "external RPC %s panicked (%T): %s", method, failure, debug.Stack())
+	return status.Error(codes.Internal, "external RPC failed")
 }
 
 // authenticate applies the admission controls and credential rules described on

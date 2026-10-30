@@ -1,4 +1,4 @@
-{{- if and .Values.managerRbac.create (include "telepresence.x509AuthEnabled" $) }}
+{{- if and .Values.managerRbac.create (or .Values.externalEndpoint.enabled (include "telepresence.x509AuthEnabled" $)) }}
 {{- /*
 The manager's x509 auth listener verifies presented client certificates
 against the cluster's client CA, published in the

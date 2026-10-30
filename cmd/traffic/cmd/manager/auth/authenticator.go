@@ -39,6 +39,7 @@ const (
 // first, a store of tokens minted by the x509 auth listener.
 type Authenticator struct {
 	token         authenticator.Token
+	noExpiryToken authenticator.Token
 	managerToken  authenticator.Token
 	minted        *MintedTokens
 	reviewer      *tokenReviewer
@@ -76,11 +77,20 @@ func WithReviewAdmission() Option {
 	}
 }
 
+// WithExternalWebhook makes ordinary bearer authentication use only webhook; native
+// Kubernetes manager-audience reviews for internal roles remain independent.
+func WithExternalWebhook(webhook *WebhookReviewer) Option {
+	return func(a *Authenticator) {
+		a.reviewer.webhook = webhook
+	}
+}
+
 // NewAuthenticator creates an Authenticator that validates tokens with the TokenReview API of ci.
 func NewAuthenticator(ci kubernetes.Interface, opts ...Option) *Authenticator {
 	reviewer := &tokenReviewer{client: ci}
 	a := &Authenticator{
 		token:         cache.New(reviewer, true, successCacheTTL, failureCacheTTL),
+		noExpiryToken: cache.New(reviewer, true, 0, failureCacheTTL),
 		managerToken:  cache.New(authenticator.TokenFunc(reviewer.authenticateManager), true, successCacheTTL, failureCacheTTL),
 		reviewer:      reviewer,
 		metrics:       unregisteredMetrics(),
@@ -102,6 +112,20 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (*Princi
 	if a.minted != nil {
 		if p, ok := a.minted.Lookup(token); ok {
 			return p, nil
+		}
+	}
+	if a.reviewer.webhook != nil {
+		if webhookTokenHasDisjointAudience(token, a.reviewer.webhook.audiences) {
+			// Never disclose a recognizable credential intended only for another
+			// service to this webhook. Decoding can only reject; it cannot grant.
+			a.metrics.InvalidTokens.Inc()
+			return nil, ErrInvalidToken
+		}
+		if !webhookTokenHasFutureExpiry(token, time.Now()) {
+			// A standard TokenReview contains no expiry. An unverified JWT exp may
+			// only remove cache eligibility; the webhook still decides identity. Opaque
+			// tokens and expired JWTs therefore cannot reuse positive cache results.
+			return a.authenticateReviewed(ctx, token, a.noExpiryToken)
 		}
 	}
 	return a.authenticateReviewed(ctx, token, a.token)
@@ -159,7 +183,8 @@ func principalFromInfo(info user.Info) *Principal {
 
 // tokenReviewer implements authenticator.Token by delegating to the Kubernetes TokenReview API.
 type tokenReviewer struct {
-	client kubernetes.Interface
+	client  kubernetes.Interface
+	webhook *WebhookReviewer
 	// metrics is set by NewAuthenticator once its options have run; it is
 	// never nil.
 	metrics       *Metrics
@@ -173,6 +198,10 @@ type tokenReviewer struct {
 }
 
 func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+	if t.webhook != nil {
+		t.calls.Add(1)
+		return t.review(ctx, token, t.webhook.audiences, "webhook")
+	}
 	resp, ok, err := t.authenticateManager(ctx, token)
 	if err != nil || ok {
 		return resp, ok, err
@@ -205,8 +234,14 @@ func (t *tokenReviewer) review(ctx context.Context, token string, audiences []st
 		Spec: authenticationv1.TokenReviewSpec{Token: token, Audiences: audiences},
 	}
 	start := time.Now()
-	result, err := t.client.AuthenticationV1().TokenReviews().Create(ctx, review, metav1.CreateOptions{})
-	if audienceLabel == "manager" {
+	var result *authenticationv1.TokenReview
+	var err error
+	if audienceLabel == "webhook" {
+		result, err = t.webhook.review(ctx, review)
+	} else {
+		result, err = t.client.AuthenticationV1().TokenReviews().Create(ctx, review, metav1.CreateOptions{})
+	}
+	if audienceLabel != "api" {
 		t.metrics.FirstReviews.Inc()
 	} else {
 		t.metrics.FallbackReviews.Inc()
