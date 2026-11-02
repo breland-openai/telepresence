@@ -250,6 +250,12 @@ items:
           new revision for each sibling approval. Traffic-agents keep intercept
           watch updates flowing during reviews and attempt to reconnect unready
           sessions after repeated manager heartbeat failures.
+      - type: bugfix
+        title: Reduce traffic-agent registration retry pressure
+        body: >-
+          Traffic-agents allow more time for registration and session restoration
+          when a traffic-manager is slow to respond. Failed connections wait
+          before retrying, reducing repeated work during recovery.
   - version: 2.31.2
     date: 2026-08-02
     notes:

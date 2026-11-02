@@ -36,16 +36,14 @@ func (c handshakeManagerClient) ArriveAsAgent(ctx context.Context, _ *rpc.AgentI
 }
 
 func TestTalkToManagerTimesOutHandshakeRPCs(t *testing.T) {
-	oldTimeout := managerHandshakeTimeout
-	managerHandshakeTimeout = 10 * time.Millisecond
-	t.Cleanup(func() { managerHandshakeTimeout = oldTimeout })
-
 	tests := []struct {
-		name   string
-		client handshakeManagerClient
+		name    string
+		timeout time.Duration
+		client  handshakeManagerClient
 	}{
 		{
-			name: "version",
+			name:    "version",
+			timeout: managerVersionRPCTimeout,
 			client: handshakeManagerClient{
 				version: func(ctx context.Context) (*rpc.VersionInfo2, error) {
 					<-ctx.Done()
@@ -58,7 +56,8 @@ func TestTalkToManagerTimesOutHandshakeRPCs(t *testing.T) {
 			},
 		},
 		{
-			name: "arrive",
+			name:    "arrive",
+			timeout: managerRegistrationTimeout,
 			client: handshakeManagerClient{
 				version: func(context.Context) (*rpc.VersionInfo2, error) {
 					return &rpc.VersionInfo2{Version: "v2.29.2"}, nil
@@ -73,22 +72,61 @@ func TestTalkToManagerTimesOutHandshakeRPCs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := interceptReadinessContext(t)
-			file, err := dos.OpenFile(ctx, readyFile, os.O_CREATE|os.O_WRONLY, 0o600)
-			require.NoError(t, err)
-			require.NoError(t, file.Close())
+			synctest.Test(t, func(t *testing.T) {
+				ctx := interceptReadinessContext(t)
+				file, err := dos.OpenFile(ctx, readyFile, os.O_CREATE|os.O_WRONLY, 0o600)
+				require.NoError(t, err)
+				require.NoError(t, file.Close())
 
-			oldClientFactory := NewExtendedManagerClient
-			NewExtendedManagerClient = func(*grpc.ClientConn, rpc.ManagerClient) rpc.ManagerClient { return tt.client }
-			t.Cleanup(func() { NewExtendedManagerClient = oldClientFactory })
+				oldClientFactory := NewExtendedManagerClient
+				NewExtendedManagerClient = func(*grpc.ClientConn, rpc.ManagerClient) rpc.ManagerClient { return tt.client }
+				t.Cleanup(func() { NewExtendedManagerClient = oldClientFactory })
 
-			start := time.Now()
-			err = TalkToManager(ctx, "127.0.0.1:1", &rpc.AgentInfo{}, nil)
-			require.ErrorIs(t, err, context.DeadlineExceeded)
-			require.Less(t, time.Since(start), time.Second)
-			require.False(t, readinessMarkerExists(ctx))
+				start := time.Now()
+				err = TalkToManager(ctx, "127.0.0.1:1", &rpc.AgentInfo{}, nil)
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+				require.Equal(t, tt.timeout, time.Since(start))
+				require.False(t, readinessMarkerExists(ctx))
+			})
 		})
 	}
+}
+
+func TestSlowAgentRegistrationWaitsForSnapshot(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(interceptReadinessContext(t))
+		defer cancel()
+		streams := make(chan *fakeInterceptReadinessStream[rpc.InterceptInfoDelta], 1)
+		manager := &sessionRecoveryManager{
+			arrive: func(ctx context.Context) error {
+				time.Sleep(managerVersionRPCTimeout + time.Second)
+				return ctx.Err()
+			},
+			delta: func(ctx context.Context) grpc.ServerStreamingClient[rpc.InterceptInfoDelta] {
+				stream := newFakeInterceptReadinessStream[rpc.InterceptInfoDelta](ctx)
+				streams <- stream
+				return stream
+			},
+		}
+		state := &sessionRecoveryState{handle: func(context.Context, []*rpc.InterceptInfo) []*rpc.ReviewInterceptRequest { return nil }}
+		oldClientFactory := NewExtendedManagerClient
+		NewExtendedManagerClient = func(*grpc.ClientConn, rpc.ManagerClient) rpc.ManagerClient { return manager }
+		t.Cleanup(func() { NewExtendedManagerClient = oldClientFactory })
+		done := make(chan error, 1)
+		go func() { done <- TalkToManager(ctx, "127.0.0.1:1", &rpc.AgentInfo{PodUid: "pod-uid"}, state) }()
+
+		select {
+		case stream := <-streams:
+			require.False(t, readinessMarkerExists(ctx))
+			stream.values <- &rpc.InterceptInfoDelta{}
+		case err := <-done:
+			t.Fatalf("registration ended before the intercept watch opened: %v", err)
+		}
+		synctest.Wait()
+		require.True(t, readinessMarkerExists(ctx))
+		cancel()
+		require.NoError(t, <-done)
+	})
 }
 
 func TestRecoverAgentSessionID(t *testing.T) {
@@ -375,7 +413,7 @@ func TestInterceptWatchCoalescesSnapshotsWhileConsumerIsBusy(t *testing.T) {
 
 func TestInterceptWatchRetriesStalledRepair(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(interceptReadinessContext(t), 2*managerSessionRPCTimeout)
+		ctx, cancel := context.WithTimeout(interceptReadinessContext(t), 2*managerRegistrationTimeout)
 		stream := newFakeInterceptReadinessStream[rpc.InterceptInfoDelta](ctx)
 		stream.values = make(chan *rpc.InterceptInfoDelta, 1)
 		stream.values <- &rpc.InterceptInfoDelta{Upserts: map[string]*rpc.InterceptInfo{"fresh": {Id: "fresh"}}}
@@ -399,6 +437,7 @@ func TestInterceptWatchRetriesStalledRepair(t *testing.T) {
 		}
 		snapshots := make(chan interceptSnapshot, 1)
 		watchDone := make(chan error, 1)
+		start := time.Now()
 		go func() {
 			watchDone <- interceptWatchLoop(ctx, manager, &rpc.SessionInfo{}, &rpc.AgentInfo{}, snapshots, time.Millisecond, newInterceptReadiness())
 		}()
@@ -410,6 +449,7 @@ func TestInterceptWatchRetriesStalledRepair(t *testing.T) {
 		case snapshot := <-snapshots:
 			require.Equal(t, "fresh", snapshot.intercepts[0].Id)
 			require.Equal(t, 2, repairs)
+			require.GreaterOrEqual(t, time.Since(start), managerRegistrationTimeout)
 		case <-ctx.Done():
 			t.Fatal("watch did not recover before the session expired")
 		}

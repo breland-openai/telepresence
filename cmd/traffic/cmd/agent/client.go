@@ -46,17 +46,14 @@ func (is interceptsStringer) String() string {
 
 var NewExtendedManagerClient func(conn *grpc.ClientConn, ossManager rpc.ManagerClient) rpc.ManagerClient //nolint:gochecknoglobals // extension point
 
-// managerHandshakeTimeout bounds the initial unary RPCs made before the agent
-// can enter its reconnecting watch loops. Without a timeout, a manager that
-// accepts the transport but stops servicing unary RPCs can leave the agent
-// stuck forever before /tmp/agent/ready is created.
-var managerHandshakeTimeout = 10 * time.Second //nolint:gochecknoglobals // overridden by tests
-
 var managerHeartbeatInterval = time.Minute //nolint:gochecknoglobals // overridden by tests
 
 const (
-	agentSessionIDPrefix         = "agent:"
-	initialInterceptSyncTimeout  = 30 * time.Second
+	agentSessionIDPrefix        = "agent:"
+	initialInterceptSyncTimeout = 30 * time.Second
+	managerVersionRPCTimeout    = 10 * time.Second
+	// Registration may authenticate and reconcile agent state.
+	managerRegistrationTimeout   = 30 * time.Second
 	managerSessionRPCTimeout     = 10 * time.Second
 	managerHeartbeatFailureLimit = 3
 )
@@ -216,7 +213,7 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 		manager = NewExtendedManagerClient(conn, manager)
 	}
 
-	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, managerHandshakeTimeout)
+	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, managerVersionRPCTimeout)
 	ver, err := manager.Version(handshakeCtx, &empty.Empty{})
 	handshakeCancel()
 	if err != nil {
@@ -230,7 +227,7 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 		return fmt.Errorf("failed to parse manager version %q: %s", verStr, err)
 	}
 
-	handshakeCtx, handshakeCancel = context.WithTimeout(ctx, managerHandshakeTimeout)
+	handshakeCtx, handshakeCancel = context.WithTimeout(ctx, managerRegistrationTimeout)
 	session, err := manager.ArriveAsAgent(handshakeCtx, info)
 	handshakeCancel()
 	if err != nil {
@@ -369,7 +366,7 @@ func interceptWatchLoop(
 			return err
 		}
 		clear(snapMap)
-		repairCtx, cancel := context.WithTimeout(ctx, managerSessionRPCTimeout)
+		repairCtx, cancel := context.WithTimeout(ctx, managerRegistrationTimeout)
 		defer cancel()
 		_, err := manager.ReconnectAgent(repairCtx, &rpc.ReconnectAgentRequest{
 			Session: session,
