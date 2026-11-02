@@ -242,9 +242,6 @@ func TalkToManagerLoop(ctx context.Context, s State, info *rpc.AgentInfo) {
 }
 
 func talkToManagerLoop(ctx context.Context, retryInterval time.Duration, talk func(context.Context) error) {
-	ticker := time.NewTicker(retryInterval)
-	defer ticker.Stop()
-
 	for ctx.Err() == nil {
 		err := talk(ctx)
 		if err != nil {
@@ -264,7 +261,7 @@ func talkToManagerLoop(ctx context.Context, retryInterval time.Duration, talk fu
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(retryInterval):
 		}
 	}
 }
