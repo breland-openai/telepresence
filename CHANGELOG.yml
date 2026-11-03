@@ -256,6 +256,12 @@ items:
           Traffic-agents allow more time for registration and session restoration
           when a traffic-manager is slow to respond. Failed connections wait
           before retrying, reducing repeated work during recovery.
+      - type: bugfix
+        title: Resume service intercepts after workloads are selected again
+        body: >-
+          The traffic-manager no longer panics when a Service selects workloads
+          after temporarily selecting none. Reselected workloads must approve
+          before the intercept becomes active.
   - version: 2.31.2
     date: 2026-08-02
     notes:
