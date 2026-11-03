@@ -282,6 +282,71 @@ func TestServiceInterceptPrunesDroppedSelectorParticipantWithoutAgent(t *testing
 	require.Len(t, updated.ServiceWorkloads, 1)
 }
 
+func TestServiceInterceptReselectsAfterPruningAllParticipants(t *testing.T) {
+	stable := serviceAgent("example-service", "stable-pod", "10.0.0.1")
+	canary := serviceAgent("example-service-canary", "canary-pod", "10.0.0.2")
+	svc := &core.Service{
+		ObjectMeta: meta.ObjectMeta{
+			Name:      "example-service",
+			Namespace: "default",
+			UID:       k8sTypes.UID("shared-service-uid"),
+		},
+		Spec: core.ServiceSpec{Selector: map[string]string{"app": "example-service"}},
+	}
+	ctx := mutator.WithMap(serviceDiscoveryContext(t, svc,
+		serviceDeployment(stable.Name, map[string]string{"app": "example-service", "track": "stable"}),
+		serviceDeployment(canary.Name, map[string]string{"app": "example-service", "track": "canary"}),
+	), mutator.NewWatcher())
+	_, st := newServiceInterceptState(t)
+	st.backgroundCtx = ctx
+	intercept := activeServiceIntercept(t, ctx, st, stable, canary)
+	serviceStore := informer.GetK8sFactory(ctx, "").Core().V1().Services().Informer().GetStore()
+
+	svc.Spec.Selector = map[string]string{"track": "none"}
+	require.NoError(t, serviceStore.Update(svc.DeepCopy()))
+	st.reconcileServiceInterceptWorkloads(ctx, intercept.Id)
+	pruned, ok := st.GetIntercept(intercept.Id)
+	require.True(t, ok)
+	require.Empty(t, pruned.participants)
+	require.Empty(t, pruned.ServiceWorkloads)
+	require.Equal(t, rpc.InterceptDispositionType_NO_AGENT, pruned.Disposition)
+
+	svc.Spec.Selector = map[string]string{"track": "stable"}
+	require.NoError(t, serviceStore.Update(svc.DeepCopy()))
+	st.reconcileServiceInterceptWorkloads(ctx, intercept.Id)
+	reselected, ok := st.GetIntercept(intercept.Id)
+	require.True(t, ok)
+	require.Equal(t, sharedServiceWorkloads(stable.Name), reselected.ServiceWorkloads)
+	require.Equal(t, rpc.InterceptDispositionType_WAITING, reselected.Disposition)
+	require.Empty(t, reselected.PodName)
+	require.False(t, AgentMatchesInterceptInfo(canary.AgentInfo, reselected))
+	require.Empty(t, pruned.participants)
+
+	active := st.ApplyAgentReview(ctx, intercept.Id, stable, &rpc.ReviewInterceptRequest{
+		Disposition: rpc.InterceptDispositionType_ACTIVE,
+		PodIp:       stable.PodIp,
+	})
+	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, active.Disposition)
+	require.Equal(t, stable.PodName, active.PodName)
+}
+
+func TestServiceParticipantReconciliationAfterFallback(t *testing.T) {
+	ctx, st := newServiceInterceptState(t)
+	stable := serviceAgent("example-service", "stable-pod", "10.0.0.1")
+	canary := serviceAgent("example-service-canary", "canary-pod", "10.0.0.2")
+	intercept := activeServiceIntercept(t, ctx, st, stable, canary)
+	selected := map[string]*interceptParticipant{
+		agentParticipantKey(stable.AgentInfo): {namespace: stable.Namespace, kind: stable.Kind, name: stable.Name},
+	}
+	st.fallbackServiceInterceptToSingleWorkload(intercept.Id, "selection cannot be expanded")
+	fallback, ok := st.GetIntercept(intercept.Id)
+	require.True(t, ok)
+	require.False(t, serviceScopedIntercept(fallback.Spec))
+
+	updated := st.reconcileServiceParticipantsWithSelection(intercept.Id, intercept, selected, true, true)
+	require.Same(t, fallback, updated)
+}
+
 func TestServiceInterceptFallsBackWhenServiceIdentityChanges(t *testing.T) {
 	for _, tt := range []struct {
 		name   string

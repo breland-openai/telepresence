@@ -134,6 +134,12 @@ Service intercepts waiting for multiple workloads no longer publish a new revisi
 Traffic-agents allow more time for registration and session restoration when a traffic-manager is slow to respond. Failed connections wait before retrying, reducing repeated work during recovery.
 </div>
 
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Resume service intercepts after workloads are selected again</div></div>
+<div style="margin-left: 15px">
+
+The traffic-manager no longer panics when a Service selects workloads after temporarily selecting none. Reselected workloads must approve before the intercept becomes active.
+</div>
+
 ## Version 2.31.2 <span style="font-size: 16px;">(August  2)</span>
 ## <div style="display:flex;"><img src="images/change.png" alt="change" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Namespaced installs no longer read ingresses cluster-wide</div></div>
 <div style="margin-left: 15px">
