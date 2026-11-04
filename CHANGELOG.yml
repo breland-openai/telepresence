@@ -262,6 +262,15 @@ items:
           The traffic-manager no longer panics when a Service selects workloads
           after temporarily selecting none. Reselected workloads must approve
           before the intercept becomes active.
+      - type: bugfix
+        title: Recover file sharing and QUIC after a traffic-manager restart
+        body: >-
+          When a traffic-agent reconnects to a restarted traffic-manager, it
+          refreshes its verification key and retries transient failures so file
+          sharing works again without replacing the agent pod. The client also
+          refreshes its QUIC credentials on reconnect, so it can use QUIC again
+          instead of staying on the port-forward fallback.
+        docs: reference/authentication
   - version: 2.31.2
     date: 2026-08-02
     notes:
