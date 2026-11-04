@@ -44,7 +44,7 @@ func (m *metricsManagerClient) ReportMetrics(
 func TestReportMetricsBeforeManagerConnection(t *testing.T) {
 	s := &state{}
 	s.ReportMetrics(context.Background(), &rpc.TunnelMetrics{ClientSessionId: "early-session"})
-	s.RefreshQuicAgentListener(context.Background(), context.Background())
+	require.NoError(t, s.RefreshQuicAgentListener(context.Background(), context.Background()))
 }
 
 func TestReportMetricsFollowsManagerReconnects(t *testing.T) {

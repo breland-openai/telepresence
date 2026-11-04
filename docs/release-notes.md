@@ -140,6 +140,12 @@ Traffic-agents allow more time for registration and session restoration when a t
 The traffic-manager no longer panics when a Service selects workloads after temporarily selecting none. Reselected workloads must approve before the intercept becomes active.
 </div>
 
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">[Recover file sharing and QUIC after a traffic-manager restart](reference/authentication)</div></div>
+<div style="margin-left: 15px">
+
+When a traffic-agent reconnects to a restarted traffic-manager, it refreshes its verification key and retries transient failures so file sharing works again without replacing the agent pod. The client also refreshes its QUIC credentials on reconnect, so it can use QUIC again instead of staying on the port-forward fallback.
+</div>
+
 ## Version 2.31.2 <span style="font-size: 16px;">(August  2)</span>
 ## <div style="display:flex;"><img src="images/change.png" alt="change" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Namespaced installs no longer read ingresses cluster-wide</div></div>
 <div style="margin-left: 15px">

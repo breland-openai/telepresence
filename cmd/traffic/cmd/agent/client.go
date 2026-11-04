@@ -237,15 +237,13 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 
 	state.SetManager(session, manager, mgrVer)
 
-	// Best-effort and non-blocking: a manager without QUIC enabled, or one that's
-	// briefly unreachable for this one RPC, must never delay or fail the rest of
-	// this session. Bounded independently of ctx's lifetime so a slow manager can't
-	// wedge this goroutine past the session's own teardown.
-	go func() {
-		fetchCtx, fetchCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer fetchCancel()
-		state.RefreshQuicAgentListener(processCtx, fetchCtx)
-	}()
+	// Best-effort and non-blocking: fetch the certificate at session start and after
+	// every ReconnectAgent, retrying each fetch until it succeeds or this manager
+	// session ends. Each attempt is bounded, and the retries cannot delay or fail the
+	// rest of the session.
+	refreshQuicCert := make(chan struct{}, 1)
+	refreshQuicCert <- struct{}{}
+	go quicAgentCertRefresher(processCtx, ctx, state, refreshQuicCert, 10*time.Second, time.Second)
 
 	// Create the /tmp/agent directory if it doesn't exist
 	// We use this to place a file which conveys 'readiness'
@@ -303,7 +301,12 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 	})
 	snapshots := make(chan interceptSnapshot, 1)
 	wg.Go("interceptWatch", func(ctx context.Context) error {
-		return interceptWatchLoop(ctx, manager, session, info, snapshots, retryInterval, readiness)
+		return interceptWatchLoop(ctx, manager, session, info, snapshots, retryInterval, readiness, func() {
+			select {
+			case refreshQuicCert <- struct{}{}:
+			default:
+			}
+		})
 	})
 	wg.Go("handleIntercept", func(ctx context.Context) error {
 		err := handleInterceptLoop(ctx, manager, session, snapshots, state, readiness)
@@ -358,6 +361,7 @@ func interceptWatchLoop(
 	snapshots chan interceptSnapshot,
 	retryInterval time.Duration,
 	readiness *interceptReadiness,
+	onReconnect func(),
 ) error {
 	// Call WatchIntercepts and publish the snapshots on the channel
 	snapMap := make(map[string]*rpc.InterceptInfo)
@@ -372,6 +376,9 @@ func interceptWatchLoop(
 			Session: session,
 			Agent:   info,
 		})
+		if err == nil {
+			onReconnect()
+		}
 		return err
 	}
 	err := watcher.WatchWithRetry(ctx, "WatchInterceptsDelta", retryInterval,
