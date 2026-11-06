@@ -15,6 +15,8 @@ import (
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
 	"github.com/telepresenceio/clog"
+	rpc "github.com/telepresenceio/telepresence/rpc/v2/manager"
+	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/mutator"
 	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/annotation"
@@ -197,6 +199,47 @@ func (s *sidecarAgentArrival) check(ctx context.Context, mm mutator.Map, arrived
 	clog.Debugf(ctx, "Agent %s(%s) belongs to workload %s and carries the requested configuration", agent.PodName, agent.PodIp, s.work)
 	arrived[agent.PodUid] = agent
 	return nil
+}
+
+func (s *State) cachedSidecarAgents(
+	ctx context.Context, wl k8sapi.Workload, spec *rpc.InterceptSpec, extended bool, rp agentconfig.ReplacePolicy,
+) (*agentconfig.Sidecar, string, []*AgentSession) {
+	mm := mutator.GetMap(ctx)
+	cfg := mm.Get(wl.GetName(), wl.GetNamespace())
+	if cfg == nil || cfg.AgentImage != managerutil.GetAgentImage(ctx) || serviceScopedIntercept(spec) && !sidecarClaimsService(cfg, spec) {
+		return nil, "", nil
+	}
+	if enabled, err := checkInterceptAnnotations(ctx, wl); err != nil || !enabled || s.ValidateAgentImage(cfg.AgentImage, extended) != nil {
+		return nil, "", nil
+	}
+	if spec != nil {
+		cn, err := interceptConfigContainer(cfg, spec)
+		if err != nil || cn.Replace != rp {
+			return nil, "", nil
+		}
+	}
+	encoded, err := agentconfig.MarshalTight(cfg)
+	if err != nil {
+		return nil, "", nil
+	}
+	pods := mm.VerifiedPods(wl, encoded)
+	if len(pods) == 0 || ctx.Err() != nil {
+		return nil, "", nil
+	}
+	matching := s.LoadMatchingAgents(func(_ tunnel.SessionID, a *AgentSession) bool {
+		uid := k8stypes.UID(a.PodUid)
+		return agentSessionMatches(a, cfg.AgentName, wl.GetNamespace(), false) && a.Kind == string(wl.GetKind()) &&
+			a.PodName != "" && pods[uid] == a.PodName && !mm.IsInactive(uid)
+	})
+	agents := make([]*AgentSession, 0, len(matching))
+	for _, a := range matching {
+		agents = append(agents, a)
+	}
+	if len(agents) > 0 {
+		clog.Debugf(ctx, "Verified %d traffic-agent sessions for %s from informer cache", len(agents), wl)
+		sortAgents(agents)
+	}
+	return cfg, encoded, agents
 }
 
 func transientSidecarLookup(err error) bool {
