@@ -58,8 +58,8 @@ func WithMintedTokens(m *MintedTokens) Option {
 }
 
 // WithMetrics makes the Authenticator record cache hits, first/fallback TokenReview
-// calls, invalid tokens, and API-server failures on m. Intended for the external
-// listener, whose Authenticator is otherwise unshared with the internal one.
+// calls, invalid tokens, and API-server failures on m. Each listener uses its
+// own Authenticator and metrics label.
 func WithMetrics(m *Metrics) Option {
 	return func(a *Authenticator) {
 		a.metrics = m

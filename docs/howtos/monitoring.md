@@ -53,7 +53,7 @@ To enable Prometheus metrics for your traffic manager, follow these steps:
    | `telepresence_auth_first_reviews`        | Counter  | Manager-audience `TokenReview` calls made.                                    | `listener`                               |
    | `telepresence_auth_fallback_reviews`     | Counter  | No-audience fallback `TokenReview` calls made.                                 | `listener`                               |
    | `telepresence_auth_rate_limited`         | Counter  | `TokenReview` attempts rejected by review admission; cached tokens never enter admission. | `listener`             |
-   | `telepresence_auth_invalid_tokens`       | Counter  | Bearer tokens the API server rejected.                                         | `listener`                               |
+   | `telepresence_auth_invalid_tokens`       | Counter  | Authentication attempts rejected as invalid, including cached decisions.        | `listener`                               |
    | `telepresence_auth_api_failures`         | Counter  | `TokenReview` calls that failed for infrastructure reasons.                    | `listener`                               |
 
 4. **Enable Scraping for Traffic Manager Metrics**

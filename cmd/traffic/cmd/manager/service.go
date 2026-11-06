@@ -141,7 +141,11 @@ func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, 
 		authorizer:    auth.NewAuthorizer(k8sapi.GetK8sInterface(ctx)),
 		mintedTokens:  auth.NewMintedTokens(),
 	}
-	ret.authenticator = auth.NewAuthenticator(tokenReviewClient, auth.WithMintedTokens(ret.mintedTokens))
+	ret.authenticator = auth.NewAuthenticator(tokenReviewClient,
+		auth.WithMintedTokens(ret.mintedTokens),
+		auth.WithMetrics(auth.NewMetrics("internal")),
+		auth.WithReviewAdmission(),
+	)
 
 	// These are context-dependent, so build them once the pool is up
 	var err error

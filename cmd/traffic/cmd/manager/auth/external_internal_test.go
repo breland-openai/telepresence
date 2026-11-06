@@ -97,6 +97,32 @@ func TestReviewAdmission_ConcurrencyCap_ResourceExhausted(t *testing.T) {
 	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
 }
 
+func TestReviewAdmission_InternalMode(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		mode        Mode
+		method      string
+		wantCode    codes.Code
+		unavailable bool
+	}{
+		{name: "permissive", mode: ModePermissive, method: "/m", wantCode: codes.OK, unavailable: true},
+		{name: "enforcing", mode: ModeEnforcing, method: "/m", wantCode: codes.ResourceExhausted},
+		{name: "permissive routing observer", mode: ModePermissive, method: watchInterceptRoutesMethod, wantCode: codes.ResourceExhausted},
+		{name: "disabled routing observer", mode: ModeDisabled, method: watchInterceptRoutesMethod, wantCode: codes.ResourceExhausted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := NewAuthenticator(fake.NewClientset(), WithReviewAdmission())
+			a.reviewer.limiter = rate.NewLimiter(0, 0)
+			i := NewInterceptor(a, tc.mode)
+
+			ctx, err := i.authenticate(externalCtxWithBearer("token"), tc.method)
+			assert.Equal(t, tc.wantCode, status.Code(err))
+			assert.Equal(t, tc.unavailable, AuthUnavailable(ctx))
+			assert.Nil(t, PrincipalFrom(ctx))
+		})
+	}
+}
+
 // TestReviewAdmission_CachedTokenUnthrottled pins the reason admission lives
 // on the review: a token served from the cache never pays the budget, so
 // steady-state authenticated traffic is not rate-limited.

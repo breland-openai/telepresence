@@ -20,6 +20,12 @@ Intercept creation now returns an error when throttling or a timeout prevents ve
 Pod eviction keeps the informer entry until Kubernetes reports its removal. Agent cleanup verifies that an accepted eviction has recovered before finishing.
 </div>
 
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Limit internal traffic-manager authentication load</div></div>
+<div style="margin-left: 15px">
+
+The traffic-manager now limits internal TokenReview requests and rate-limits warnings for invalid tokens and admission rejections. Authentication metrics distinguish the internal and external listeners, and permissive mode treats admission limits as authentication being unavailable.
+</div>
+
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Reject intercepts without a reverse connection to the traffic-agent</div></div>
 <div style="margin-left: 15px">
 
