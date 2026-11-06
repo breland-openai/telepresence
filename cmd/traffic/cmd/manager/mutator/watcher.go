@@ -209,6 +209,7 @@ func (c *configWatcher) regenerateAgentConfigs(ctx context.Context, ns string, g
 					podsOfInterest = append(podsOfInterest, pod)
 				}
 			} else {
+				gc.SetPodCreationFields(sc)
 				c.Store(sc)
 			}
 		}

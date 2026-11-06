@@ -27,6 +27,12 @@ items:
   - version: 2.32.0
     date: (TBD)
     notes:
+      - type: bugfix
+        title: Restore traffic-agent admission settings after a manager restart
+        body: >-
+          Replacement pods now receive the configured traffic-agent image, pull
+          settings, init container resources, and security contexts when the
+          traffic-manager restores a workload configuration from a pod annotation.
       - type: feature
         title: Verify healthy sidecars using watched pod and controller data
         body: >-

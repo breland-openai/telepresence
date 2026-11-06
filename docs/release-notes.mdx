@@ -9,6 +9,12 @@ import { Note, Title, Body } from '@site/src/components/ReleaseNotes'
 # Telepresence Release Notes
 ## Version 2.32.0
 <Note>
+	<Title type="bugfix">Restore traffic-agent admission settings after a manager restart</Title>
+	<Body>
+Replacement pods now receive the configured traffic-agent image, pull settings, init container resources, and security contexts when the traffic-manager restores a workload configuration from a pod annotation.
+  </Body>
+</Note>
+<Note>
 	<Title type="feature" docs="reference/cluster-config">Verify healthy sidecars using watched pod and controller data</Title>
 	<Body>
 An experimental traffic-manager setting, <code>CACHED_POD_CHECKS</code>, lets healthy sidecar intercepts reuse synchronized informer data. It defaults to false. Incomplete inventory or stale watch progress uses live Kubernetes checks.
