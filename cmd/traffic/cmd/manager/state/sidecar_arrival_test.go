@@ -902,3 +902,38 @@ func TestRemoveRestoredNodeInterceptDoesNotMutateSameWorkloadSidecar(t *testing.
 	assert.Equal(t, agentconfig.ReplacePolicyContainer, current.Containers[0].Replace, "node detach must not change same-workload cached sidecar")
 	assert.Empty(t, evicted, "node detach must not evict the independently configured physical sidecar pod")
 }
+
+type verifiedSidecarMap struct {
+	mutator.Map
+	pods map[k8stypes.UID]string
+}
+
+func (m *verifiedSidecarMap) VerifiedPods(k8sapi.Workload, string) map[k8stypes.UID]string {
+	return m.pods
+}
+
+func TestCachedSidecarQualifiesConnectedPhysicalPod(t *testing.T) {
+	f := newSidecarArrivalFixture(t)
+	sc := sidecarArrivalConfig(agentconfig.ReplacePolicyIntercept)
+	mm := &verifiedSidecarMap{Map: mutator.NewWatcher(), pods: map[k8stypes.UID]string{"new": "app-0", "inactive": "app-1", "other": "app-2"}}
+	mm.Store(sc)
+	mm.Inactivate("inactive")
+	ctx := mutator.WithMap(f.ctx, mm)
+	ctx = managerutil.WithEnv(ctx, &managerutil.Env{AgentInjectPolicy: agentconfig.OnDemand, CachedPodChecks: true, AgentArrivalTimeout: time.Second})
+	for _, a := range []*rpc.AgentInfo{
+		{Name: "app", Namespace: "testing", Kind: "Deployment", PodName: "app-0", PodUid: "new"},
+		{Name: "app", Namespace: "testing", Kind: "Deployment", PodName: "app-0", PodUid: "old"},
+		{Name: "app", Namespace: "testing", Kind: "Deployment", PodName: "app-1", PodUid: "inactive"},
+		{Name: "app", Namespace: "testing", Kind: "Deployment", PodName: "wrong", PodUid: "other"},
+		{Name: "app", Namespace: "testing", Kind: "Deployment", PodName: "app-2", PodUid: "other", NodeAgent: true},
+	} {
+		f.state.agents.Store(tunnel.SessionID(a.PodName+a.PodUid), &AgentSession{AgentInfo: a})
+	}
+	got, as, err := f.state.ensureAgent(ctx, k8sapi.Deployment(f.work), false, false, nil, agentconfig.ReplacePolicyIntercept)
+	require.NoError(t, err)
+	require.Equal(t, sc, got)
+	require.Len(t, as, 1)
+	require.Equal(t, "new", as[0].PodUid)
+	require.Empty(t, f.client.Actions())
+	sidecarWaitsRetired(t, f.state)
+}

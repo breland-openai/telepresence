@@ -33,6 +33,7 @@ import (
 )
 
 type Map interface {
+	VerifiedPods(k8sapi.Workload, string) map[types.UID]string
 	Get(string, string) *agentconfig.Sidecar
 	GetOrGenerate(context.Context, k8sapi.Workload) (*agentconfig.Sidecar, error)
 	Store(*agentconfig.Sidecar)
@@ -248,6 +249,7 @@ const (
 )
 
 type informersWithCancel struct {
+	inventory *podInventory
 	cancel    context.CancelFunc
 	informers [watcherMax]cache.SharedIndexInformer
 	eventRegs [watcherMax]cache.ResourceEventHandlerRegistration
@@ -320,6 +322,11 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 		}
 	}()
 
+	kf := informer.GetK8sFactory(ctx, ns)
+	var inventory *podInventory
+	if env := managerutil.GetEnv(ctx); env.CachedPodChecks {
+		inventory = observeInventory(kf, k8sapi.GetK8sInterface(ctx), ns, env.EnabledWorkloadKinds)
+	}
 	ifns := [watcherMax]cache.SharedIndexInformer{}
 	ifns[serviceWatcher] = c.startServices(ctx, ns)
 	for _, wlKind := range managerutil.GetEnv(ctx).EnabledWorkloadKinds {
@@ -336,7 +343,6 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 	}
 	ifns[podWatcher] = c.startPods(ctx, ns)
 	c.startIngresses(ctx, ns)
-	kf := informer.GetK8sFactory(ctx, ns)
 	kf.Start(ctx.Done())
 	kf.WaitForCacheSync(ctx.Done())
 	if ifns[rolloutWatcher] != nil {
@@ -347,6 +353,7 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 
 	return &informersWithCancel{
 		cancel:    cancel,
+		inventory: inventory,
 		informers: ifns,
 	}, nil
 }

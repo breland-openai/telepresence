@@ -27,6 +27,27 @@ items:
   - version: 2.32.0
     date: (TBD)
     notes:
+      - type: feature
+        title: Verify healthy sidecars using watched pod and controller data
+        body: >-
+          An experimental traffic-manager setting, <code>CACHED_POD_CHECKS</code>,
+          lets healthy sidecar intercepts reuse synchronized informer data. It
+          defaults to false. Incomplete inventory or stale watch progress uses
+          live Kubernetes checks.
+        docs: reference/cluster-config
+      - type: bugfix
+        title: Preserve shared Service scope on temporary verification failures
+        body: >-
+          Intercept creation now returns an error when throttling or a timeout
+          prevents verification of a shared Service. The manager checks for
+          cancellation before publishing a route. A retry verifies the current
+          participants of the requested Service.
+      - type: bugfix
+        title: Wait for physical pod replacement during agent cleanup
+        body: >-
+          Pod eviction keeps the informer entry until Kubernetes reports its
+          removal. Agent cleanup verifies that an accepted eviction has recovered
+          before finishing.
       - type: bugfix
         title: Reject intercepts without a reverse connection to the traffic-agent
         body: >-

@@ -51,6 +51,7 @@ type Env struct {
 	ManagerNamespace             string
 	AgentRestApiPort             uint16
 	AgentArrivalTimeout          time.Duration `default:"30s"`
+	CachedPodChecks              bool          `env:"CACHED_POD_CHECKS"`
 	MaxNamespaceSpecificWatchers int           `default:"10"`
 
 	GrpcMaxReceiveSize resource.Quantity
