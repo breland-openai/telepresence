@@ -543,3 +543,30 @@ func dequeueEvictionIntent(t *testing.T, queue workqueue.TypedRateLimitingInterf
 	queue.Forget(key)
 	queue.Done(key)
 }
+
+func TestTeardownWaitsForPhysicalEviction(t *testing.T) {
+	f := newEvictionIntentFixture(t)
+	desired, encoded := f.config(agentconfig.ReplacePolicyIntercept)
+	f.watcher.Store(desired)
+	old := reconciliationTestPod(f.wl, "old", "", true)
+	f.create(old)
+	require.NoError(t, f.watcher.EvictPodsWithAgentConfigMismatch(f.ctx, f.wl, desired))
+	require.Equal(t, old.UID, readReconciliationEviction(t, f.evictions))
+
+	cached, exists, err := f.pods.Get(old)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, old.UID, cached.(*core.Pod).UID)
+	stillPending := func() {
+		ctx, cancel := context.WithTimeout(f.ctx, 25*time.Millisecond)
+		defer cancel()
+		require.ErrorIs(t, f.watcher.waitForEvictionRecovery(ctx, f.wl), context.DeadlineExceeded)
+	}
+	stillPending()
+	f.delete(old)
+	replacement := reconciliationTestPod(f.wl, "new", encoded, false)
+	f.create(replacement)
+	stillPending()
+	f.ready(replacement)
+	require.NoError(t, f.watcher.waitForEvictionRecovery(f.ctx, f.wl))
+}
