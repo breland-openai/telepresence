@@ -53,6 +53,9 @@ items:
         body: >-
           The traffic-manager now limits internal TokenReview requests and
           rate-limits warnings for invalid tokens and admission rejections.
+          Short bursts can wait up to one second for a credential check
+          to start. An admitted check keeps its place through an audience
+          fallback.
           Authentication metrics distinguish the internal and external
           listeners, and permissive mode treats admission limits as
           authentication being unavailable.

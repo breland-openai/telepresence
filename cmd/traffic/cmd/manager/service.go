@@ -144,7 +144,7 @@ func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, 
 	ret.authenticator = auth.NewAuthenticator(tokenReviewClient,
 		auth.WithMintedTokens(ret.mintedTokens),
 		auth.WithMetrics(auth.NewMetrics("internal")),
-		auth.WithReviewAdmission(),
+		auth.WithInternalReviewAdmission(),
 	)
 
 	// These are context-dependent, so build them once the pool is up

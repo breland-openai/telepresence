@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -111,7 +112,7 @@ func TestReviewAdmission_InternalMode(t *testing.T) {
 		{name: "disabled routing observer", mode: ModeDisabled, method: watchInterceptRoutesMethod, wantCode: codes.ResourceExhausted},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := NewAuthenticator(fake.NewClientset(), WithReviewAdmission())
+			a := NewAuthenticator(fake.NewClientset(), WithInternalReviewAdmission())
 			a.reviewer.limiter = rate.NewLimiter(0, 0)
 			i := NewInterceptor(a, tc.mode)
 
@@ -123,9 +124,109 @@ func TestReviewAdmission_InternalMode(t *testing.T) {
 	}
 }
 
-// TestReviewAdmission_CachedTokenUnthrottled pins the reason admission lives
-// on the review: a token served from the cache never pays the budget, so
-// steady-state authenticated traffic is not rate-limited.
+func TestInternalReviewAdmissionWaitsForCapacity(t *testing.T) {
+	ci := fake.NewClientset()
+	k8sapi.InstallFakeTokenReviews(ci, func(string, []string) *authnv1.TokenReviewStatus {
+		return &authnv1.TokenReviewStatus{Authenticated: true, User: authnv1.UserInfo{Username: "test-user"}}
+	})
+	a := NewAuthenticator(ci, WithInternalReviewAdmission())
+	r := a.reviewer
+	r.sem = make(chan struct{}, 1)
+	r.sem <- struct{}{}
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Authenticate(t.Context(), "valid")
+		done <- err
+	}()
+	require.Eventually(t, func() bool { return len(r.waiters) == 1 }, time.Second, time.Millisecond)
+	require.Empty(t, ci.Actions())
+	<-r.sem
+	require.NoError(t, <-done)
+	require.Len(t, ci.Actions(), 1)
+	require.Empty(t, r.sem)
+	require.Empty(t, r.waiters)
+}
+
+func TestInternalReviewAdmissionReleasesWaiters(t *testing.T) {
+	r := NewAuthenticator(fake.NewClientset(), WithInternalReviewAdmission()).reviewer
+	r.sem = make(chan struct{}, 1)
+	r.waiters = make(chan struct{}, 1)
+	r.sem <- struct{}{}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.acquireInternalVerification(ctx) }()
+	require.Eventually(t, func() bool { return len(r.waiters) == 1 }, time.Second, time.Millisecond)
+	require.ErrorIs(t, r.acquireInternalVerification(t.Context()), errTooManyReviews)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.Empty(t, r.waiters)
+	<-r.sem
+}
+
+func TestInternalReviewAdmissionBoundsWaitingTime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := NewAuthenticator(fake.NewClientset(), WithInternalReviewAdmission()).reviewer
+		r.sem = make(chan struct{}, 1)
+		r.sem <- struct{}{}
+		start := time.Now()
+		require.ErrorIs(t, r.acquireInternalVerification(t.Context()), errTooManyReviews)
+		require.Equal(t, internalReviewMaxWait, time.Since(start))
+		require.Empty(t, r.waiters)
+		<-r.sem
+	})
+}
+
+func TestInternalReviewAdmissionReleasesActiveSlotOnCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ci := fake.NewClientset()
+		r := NewAuthenticator(ci, WithInternalReviewAdmission()).reviewer
+		r.limiter = rate.NewLimiter(rate.Every(time.Second), 1)
+		require.True(t, r.limiter.Allow())
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, _, err := r.AuthenticateToken(ctx, "token")
+			done <- err
+		}()
+		synctest.Wait()
+		require.Len(t, r.sem, 1)
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+		require.Empty(t, ci.Actions())
+		require.Empty(t, r.sem)
+	})
+}
+
+func TestInternalReviewAdmissionFinishesBothAudiences(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ci := fake.NewClientset()
+		k8sapi.InstallFakeTokenReviews(ci, func(_ string, audiences []string) *authnv1.TokenReviewStatus {
+			return &authnv1.TokenReviewStatus{Authenticated: len(audiences) == 0, User: authnv1.UserInfo{Username: "test-user"}}
+		})
+		a := NewAuthenticator(ci, WithInternalReviewAdmission())
+		a.reviewer.sem = make(chan struct{}, 1)
+		const interval = 400 * time.Millisecond
+		a.reviewer.limiter = rate.NewLimiter(rate.Every(interval), 1)
+		require.True(t, a.reviewer.limiter.Allow())
+		start := time.Now()
+		done := make(chan error, 1)
+		go func() { _, err := a.Authenticate(t.Context(), "api-only"); done <- err }()
+		synctest.Wait()
+		require.Len(t, a.reviewer.sem, 1)
+		require.Empty(t, ci.Actions())
+		time.Sleep(interval)
+		synctest.Wait()
+		require.Len(t, ci.Actions(), 1)
+		require.Len(t, a.reviewer.sem, 1, "the same credential owns its slot during the fallback")
+		require.NoError(t, <-done)
+		require.Equal(t, 2*interval, time.Since(start))
+		require.Len(t, ci.Actions(), 2)
+		require.Empty(t, a.reviewer.sem)
+	})
+}
+
 func TestReviewAdmission_CachedTokenUnthrottled(t *testing.T) {
 	ci := fake.NewClientset()
 	k8sapi.InstallFakeTokenReviews(ci, func(token string, audiences []string) *authnv1.TokenReviewStatus {
