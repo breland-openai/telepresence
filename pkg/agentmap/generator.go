@@ -55,6 +55,16 @@ type GeneratorConfig struct {
 	EnableMetrics       bool
 }
 
+// SetPodCreationFields supplies the manifest settings omitted by agentconfig.MarshalTight.
+func (cfg *GeneratorConfig) SetPodCreationFields(sc *agentconfig.Sidecar) {
+	sc.AgentImage = cfg.QualifiedAgentImage
+	sc.PullPolicy = cfg.PullPolicy
+	sc.PullSecrets = cfg.PullSecrets
+	sc.InitResources = cfg.InitResources
+	sc.SecurityContext = cfg.SecurityContext
+	sc.InitSecurityContext = cfg.InitSecurityContext
+}
+
 func portsFromContainerPortsAnnotation(ctx context.Context, wl k8sapi.Workload) (ports []types.PortIdentifier, err error) {
 	pod := wl.GetPodTemplate()
 	cpa := annotation.GetAnnotation(ctx, pod.GetAnnotations(), annotation.InjectContainerPorts, annotation.LegacyInjectContainerPorts)
@@ -185,8 +195,7 @@ func (cfg *GeneratorConfig) Generate(
 		return nil, err
 	}
 
-	return &agentconfig.Sidecar{
-		AgentImage:          cfg.QualifiedAgentImage,
+	sc := &agentconfig.Sidecar{
 		AgentName:           wl.GetName(),
 		LogLevel:            cfg.LogLevel,
 		Namespace:           wl.GetNamespace(),
@@ -200,16 +209,13 @@ func (cfg *GeneratorConfig) Generate(
 		MountPolicies:       cfg.MountPolicies,
 		MeshDialSubnets:     cfg.MeshDialSubnets,
 		Containers:          ccs,
-		InitResources:       cfg.InitResources,
 		Resources:           cfg.Resources,
-		PullPolicy:          cfg.PullPolicy,
-		PullSecrets:         cfg.PullSecrets,
-		SecurityContext:     cfg.SecurityContext,
-		InitSecurityContext: cfg.InitSecurityContext,
 		EnableH2cProbing:    cfg.EnableH2cProbing,
 		EnableMetrics:       cfg.EnableMetrics,
 		WatchRetryInterval:  cfg.WatchRetryInterval,
-	}, nil
+	}
+	cfg.SetPodCreationFields(sc)
+	return sc, nil
 }
 
 func applyInactivePortAnnotation(wl k8sapi.Workload, containers []*agentconfig.Container) error {
