@@ -2,14 +2,18 @@ package state
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
@@ -654,7 +658,7 @@ func TestServiceInterceptFallsBackForPodOnlySelectionAtCreation(t *testing.T) {
 	st.backgroundCtx = ctx
 
 	spec := sharedServiceSpec()
-	workloads := st.ensureServiceWorkloads(
+	workloads, err := st.ensureServiceWorkloads(
 		ctx,
 		spec,
 		k8sapi.Deployment(stable),
@@ -664,6 +668,7 @@ func TestServiceInterceptFallsBackForPodOnlySelectionAtCreation(t *testing.T) {
 		nil,
 	)
 
+	require.NoError(t, err)
 	require.Nil(t, workloads)
 	require.False(t, serviceScopedIntercept(spec))
 	require.Nil(t, mutator.GetMap(ctx).Get(canary.Name, canary.Namespace))
@@ -874,7 +879,7 @@ func TestServiceInterceptChecksSecondaryConflictsBeforeChangingConfig(t *testing
 	}})
 	client := newClientSessionState(ctx, "alice", &rpc.ClientInfo{Name: "alice"}, time.Now())
 
-	workloads := st.ensureServiceWorkloads(
+	workloads, err := st.ensureServiceWorkloads(
 		ctx,
 		spec,
 		k8sapi.Deployment(stable),
@@ -884,6 +889,7 @@ func TestServiceInterceptChecksSecondaryConflictsBeforeChangingConfig(t *testing
 		client,
 	)
 
+	require.NoError(t, err)
 	require.Nil(t, workloads)
 	require.False(t, serviceScopedIntercept(spec))
 	config := mutator.GetMap(ctx).Get(canary.Name, canary.Namespace)
@@ -1911,11 +1917,85 @@ func TestUnsupportedSharedServiceModeFallsBackToRequestedWorkload(t *testing.T) 
 	spec := sharedServiceSpec()
 	spec.Mechanism = "tcp"
 
-	st.ensureServiceWorkloads(ctx, spec, nil, nil, nil, agentconfig.ReplacePolicyIntercept, nil)
+	_, err := st.ensureServiceWorkloads(ctx, spec, nil, nil, nil, agentconfig.ReplacePolicyIntercept, nil)
+	require.NoError(t, err)
 
 	require.False(t, serviceScopedIntercept(spec))
 	require.Empty(t, spec.ServiceUid)
 	require.Zero(t, spec.ServicePort)
 	require.Empty(t, spec.ServicePortName)
 	require.Equal(t, "example-service", spec.ServiceName)
+}
+
+func TestSharedServiceVerificationFailureKeepsScope(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		code codes.Code
+	}{
+		{"throttled", apierrors.NewTooManyRequests("retry", 1), codes.ResourceExhausted},
+		{"server timeout", apierrors.NewTimeoutError("pod list", 1), codes.DeadlineExceeded},
+		{"deadline", context.DeadlineExceeded, codes.DeadlineExceeded},
+		{"canceled", context.Canceled, codes.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := sharedServiceSpec()
+			stable := serviceDeployment(spec.Agent, map[string]string{"app": "shared", "track": "stable"})
+			canary := serviceDeployment(spec.Agent+"-canary", map[string]string{"app": "shared", "track": "canary"})
+			svc := &core.Service{
+				ObjectMeta: meta.ObjectMeta{Name: spec.ServiceName, Namespace: spec.Namespace, UID: k8sTypes.UID(spec.ServiceUid)},
+				Spec:       core.ServiceSpec{Selector: map[string]string{"app": "shared"}, Ports: []core.ServicePort{{Name: "http", Port: 80, TargetPort: intstr.FromInt(8080)}}},
+			}
+			ctx := serviceDiscoveryContext(t, svc, stable, canary)
+			ctx = managerutil.WithResolvedAgentImageRetriever(ctx, managerutil.ImageFromEnv(sidecarArrivalImage))
+			_, st := newServiceInterceptState(t)
+			client := newClientSessionState(ctx, "client", &rpc.ClientInfo{Name: "client"}, time.Now())
+			mm := &sidecarRestoreObserver{Map: mutator.NewWatcher()}
+			ctx = mutator.WithMap(ctx, mm)
+			st.backgroundCtx = ctx
+			wl := k8sapi.Deployment(stable)
+			cfg, err := st.getOrCreateAgentConfig(ctx, wl, false, true, spec, agentconfig.ReplacePolicyIntercept)
+			require.NoError(t, err)
+			agents := []*AgentSession{serviceAgent(stable.Name, "primary", "10.0.0.1")}
+			mm.dispatch = func(context.Context, k8sapi.Workload, *agentconfig.Sidecar) error {
+				return errors.Join(errors.New("checking pods"), tc.err)
+			}
+			targets, err := st.ensureServiceWorkloads(ctx, spec, wl, cfg, agents, agentconfig.ReplacePolicyIntercept, client)
+			require.Equal(t, tc.code, status.Code(err))
+			require.ErrorContains(t, err, canary.Name)
+			require.Empty(t, targets)
+			require.Equal(t, sharedServiceSpec().ServiceUid, spec.ServiceUid)
+			require.Equal(t, sharedServiceSpec().ServicePort, spec.ServicePort)
+			require.Equal(t, sharedServiceSpec().ServicePortName, spec.ServicePortName)
+			mm.dispatch = func(context.Context, k8sapi.Workload, *agentconfig.Sidecar) error { return nil }
+			targets, err = st.ensureServiceWorkloads(ctx, spec, wl, cfg, agents, agentconfig.ReplacePolicyIntercept, client)
+			require.NoError(t, err)
+			require.Len(t, targets, 2)
+		})
+	}
+}
+
+func TestSharedServiceUnknownSelectionKeepsScope(t *testing.T) {
+	ctx, s := newServiceInterceptState(t)
+	spec := sharedServiceSpec()
+	deployment := serviceDeployment(spec.Agent, map[string]string{"app": "echo"})
+	targets, err := s.ensureServiceWorkloads(ctx, spec, k8sapi.Deployment(deployment), nil, nil, agentconfig.ReplacePolicyIntercept, nil)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Empty(t, targets)
+	require.True(t, serviceScopedIntercept(spec))
+}
+
+func TestSharedServiceAgentWaitDistinguishesDeadlineFromCancellation(t *testing.T) {
+	ctx, st := newServiceInterceptState(t)
+	expired, stop := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+	defer stop()
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	for _, tc := range []struct {
+		ctx  context.Context
+		code codes.Code
+	}{{expired, codes.DeadlineExceeded}, {canceled, codes.Canceled}} {
+		_, err := st.waitForAgentsMatching(tc.ctx, "echo", "default", false, 1, nil, nil)
+		require.Equal(t, tc.code, status.Code(serviceVerificationFailure(err, "echo")))
+	}
 }
