@@ -1272,6 +1272,13 @@ func (s *State) ensureAgent(parentCtx context.Context, wl k8sapi.Workload, exten
 	ctx, cancel := context.WithTimeout(parentCtx, managerutil.GetEnv(parentCtx).AgentArrivalTimeout)
 	defer cancel()
 
+	if managerutil.GetEnv(ctx).CachedPodChecks {
+		if sc, encoded, as := s.cachedSidecarAgents(ctx, wl, spec, extended, rp); len(as) > 0 {
+			cfgJSON, waitOutcome = encoded, sidecarAgentWaitSucceeded
+			return sc, as, nil
+		}
+	}
+
 	failedCreateCh, err := eventwatch.WatchWarnings(ctx, k8sapi.GetK8sInterface(ctx), wl.GetNamespace(), wl.GetName())
 	if err != nil {
 		return nil, nil, err
@@ -1501,12 +1508,7 @@ func (s *State) getOrCreateAgentConfig(
 		}
 
 		if spec != nil {
-			var cn *agentconfig.Container
-			if spec.NoDefaultPort {
-				cn, err = icept.FindContainer(sc, spec)
-			} else {
-				cn, _, err = icept.FindIntercept(sc, spec)
-			}
+			cn, err := interceptConfigContainer(sc, spec)
 			if err != nil {
 				return nil, err
 			}
@@ -1514,6 +1516,14 @@ func (s *State) getOrCreateAgentConfig(
 		}
 		return sc, nil
 	})
+}
+
+func interceptConfigContainer(sc *agentconfig.Sidecar, spec *rpc.InterceptSpec) (*agentconfig.Container, error) {
+	if spec.NoDefaultPort {
+		return icept.FindContainer(sc, spec)
+	}
+	cn, _, err := icept.FindIntercept(sc, spec)
+	return cn, err
 }
 
 func checkInterceptAnnotations(ctx context.Context, wl k8sapi.Workload) (bool, error) {
