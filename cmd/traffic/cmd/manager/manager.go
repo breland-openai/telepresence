@@ -146,7 +146,10 @@ func MainWithEnv(ctx context.Context) (err error) {
 
 		// We load the Map regardless of if the agent-injector is enabled or not. Intercepts can still
 		// be added manually.
+		started := time.Now()
+		clog.Info(ctx, "Setting up traffic-agent informers")
 		watcher := mutator.Load(ctx)
+		clog.Infof(ctx, "Traffic-agent informer setup finished in %s", time.Since(started))
 		ctx = mutator.WithMap(ctx, watcher)
 
 		if mgrFactory {
@@ -339,6 +342,7 @@ func SetGauge(ctx context.Context, metric *prometheus.GaugeVec, client, installI
 func (s *service) servePrometheus(ctx context.Context) error {
 	env := managerutil.GetEnv(ctx)
 	s.authenticator.RegisterMetrics(prometheus.DefaultRegisterer)
+	s.state.RegisterSidecarPodCheckMetrics(prometheus.DefaultRegisterer)
 	newGaugeFunc("telepresence_agent_count", "Number of connected traffic agents", s.state.CountAgents)
 	newGaugeFunc("telepresence_client_count", "Number of connected clients", s.state.CountClients)
 	newGaugeFunc("telepresence_active_intercept_count", "Number of active intercepts", s.state.CountIntercepts)

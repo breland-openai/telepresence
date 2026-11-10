@@ -150,6 +150,8 @@ func (c *configWatcher) SetConfigured() {
 // RegenerateAgentMaps regenerates all agent configurations and triggers pod evictions for all pods with
 // an agent config annotation different from the generated one.
 func (c *configWatcher) RegenerateAgentMaps(ctx context.Context, agentImage string) error {
+	started := time.Now()
+	clog.Info(ctx, "Regenerating traffic-agent configurations")
 	gc, err := managerutil.GetEnv(ctx).GeneratorConfig(agentImage)
 	if err != nil {
 		return err
@@ -160,6 +162,7 @@ func (c *configWatcher) RegenerateAgentMaps(ctx context.Context, agentImage stri
 			return err
 		}
 	}
+	clog.Infof(ctx, "Traffic-agent configuration regeneration finished in %s", time.Since(started))
 	return nil
 }
 
