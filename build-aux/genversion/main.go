@@ -102,31 +102,43 @@ func getLatestChangelogVersion() (v semver.Version, released bool, err error) {
 	return v, released, nil
 }
 
+func versionForDescription(description string) (semver.Version, error) {
+	changelog, released, changelogErr := getLatestChangelogVersion()
+	v := changelog
+	if tag, tagged := strings.CutPrefix(description, "v"); tagged {
+		var err error
+		v, err = semver.Parse(tag)
+		if err != nil {
+			return v, fmt.Errorf("unable to parse semver %s: %w", tag, err)
+		}
+		if changelogErr == nil {
+			v.Major, v.Minor, v.Patch = changelog.Major, changelog.Minor, changelog.Patch
+		} else {
+			released = isReleased(v)
+		}
+	} else {
+		// With no reachable v* tag, git describe --always returns the commit ID.
+		if changelogErr != nil {
+			return v, fmt.Errorf("determine version without a reachable tag: %w", changelogErr)
+		}
+		v.Pre = append(v.Pre, semver.PRVersion{VersionStr: "g" + description})
+	}
+	if released {
+		v.Patch++
+	}
+	return v, nil
+}
+
 func Main() error {
-	cmd := exec.Command("git", "describe", "--tags", "--match=v*")
+	cmd := exec.Command("git", "describe", "--tags", "--match=v*", "--always")
 	cmd.Stderr = os.Stderr
 	gitDescBytes, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("unable to git describe: %w", err)
 	}
-	gitDescStr := strings.TrimSuffix(strings.TrimPrefix(string(gitDescBytes), "v"), "\n")
-	gitDescVer, err := semver.Parse(gitDescStr)
+	gitDescVer, err := versionForDescription(strings.TrimSpace(string(gitDescBytes)))
 	if err != nil {
-		return fmt.Errorf("unable to parse semver %s: %w", gitDescStr, err)
-	}
-
-	clv, released, err := getLatestChangelogVersion()
-	if err == nil {
-		gitDescVer.Major = clv.Major
-		gitDescVer.Minor = clv.Minor
-		gitDescVer.Patch = clv.Patch
-	} else {
-		released = isReleased(gitDescVer)
-	}
-
-	// Bump to next patch version only if the version has been released.
-	if released {
-		gitDescVer.Patch++
+		return err
 	}
 
 	out := os.Stdout

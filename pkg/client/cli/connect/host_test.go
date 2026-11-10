@@ -509,18 +509,19 @@ func TestHostStaleRequiresHardRefusalAndUnchangedHeartbeat(t *testing.T) {
 			host, err := daemon.ReadHostInfo(ctx)
 			require.NoError(t, err)
 			if tc.advance {
-				go func() {
-					time.Sleep(20 * time.Millisecond)
-					now := time.Now()
-					_ = os.Chtimes(path, now, now)
-				}()
+				now := time.Now()
+				require.NoError(t, os.Chtimes(path, now, now))
 			}
 			initial := tc.initial
 			if initial == nil {
 				initial = probeHostPort(ctx, port)
 				require.Error(t, initial)
 			}
-			stale, staleErr := hostDefinitelyStale(ctx, host, initial, 80*time.Millisecond)
+			grace := 80 * time.Millisecond
+			if tc.fresh {
+				grace = daemon.HostInfoGrace
+			}
+			stale, staleErr := hostDefinitelyStale(ctx, host, initial, grace)
 			require.Equal(t, tc.wantStale, stale, "initial probe: %T %v; stale check: %T %v", initial, initial, staleErr, staleErr)
 			if tc.wantStale {
 				require.NoError(t, staleErr)
