@@ -32,6 +32,12 @@ Kubernetes pod addresses now use Telepresence DNS when the machine's physical ne
 Repeating <code>telepresence connect</code> with the same mapped namespaces now reuses the existing connection regardless of their order or duplicates. Previously, a non-alphabetical list could be mistaken for a configuration change and ask the user to reconnect.
 </div>
 
+## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Avoid repeated or stale intercept approvals</div></div>
+<div style="margin-left: 15px">
+
+Traffic-agents reuse successful approvals when unrelated intercepts change. Service intercepts wait for every required workload to recover before accepting fresh approvals, and expired agents can no longer claim a replacement pod's intercept.
+</div>
+
 ## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Recover promptly from stalled manager sessions</div></div>
 <div style="margin-left: 15px">
 
@@ -126,12 +132,6 @@ The <code>--replace</code> flag of <code>telepresence intercept</code>, deprecat
 <div style="margin-left: 15px">
 
 Service intercepts waiting for multiple workloads no longer publish a new revision for each sibling approval. Traffic-agents keep intercept watch updates flowing during reviews and attempt to reconnect unready sessions after repeated manager heartbeat failures.
-</div>
-
-## <div style="display:flex;"><img src="images/bugfix.png" alt="bugfix" style="width:30px;height:fit-content;"/><div style="display:flex;margin-left:7px;">Avoid repeated or stale intercept approvals</div></div>
-<div style="margin-left: 15px">
-
-Traffic-agents reuse successful approvals when unrelated intercepts change. Service intercepts wait for every required workload to recover before accepting fresh approvals, and expired agents can no longer claim a replacement pod's intercept.
 </div>
 
 ## Version 2.31.2 <span style="font-size: 16px;">(August  2)</span>
