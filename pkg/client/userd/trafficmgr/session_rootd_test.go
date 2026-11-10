@@ -210,24 +210,22 @@ func TestRootDaemonActivityWatcherReconnectsRootDaemon(t *testing.T) {
 
 	require.NoError(t, s.connectRootDaemon(ctx, nc, nil, false))
 	require.Eventually(t, func() bool {
-		return second.connectCount.Load() == 1
-	}, time.Second, 10*time.Millisecond)
+		var name string
+		err := s.WithRootClient(ctx, func(ctx context.Context, rd rootdRpc.DaemonClient) error {
+			st, err := rd.Status(ctx, &emptypb.Empty{})
+			name = st.GetOutboundConfig().GetManagerNamespace()
+			return err
+		})
+		return err == nil && name == "second"
+	}, 5*time.Second, 10*time.Millisecond)
 
 	require.Equal(t, int32(2), dialCount.Load())
 	require.Equal(t, int32(1), first.connectCount.Load())
 	require.Equal(t, int32(1), second.connectCount.Load())
-
-	err := s.WithRootClient(ctx, func(ctx context.Context, rd rootdRpc.DaemonClient) error {
-		st, err := rd.Status(ctx, &emptypb.Empty{})
-		require.NoError(t, err)
-		require.Equal(t, "second", st.GetOutboundConfig().GetManagerNamespace())
-		return nil
-	})
-	require.NoError(t, err)
 }
 
 func TestReconnectRootDaemonStopsWhenRootDaemonIsGone(t *testing.T) {
-	quit, dialCount := startFailingRootDaemonReconnect(t, false)
+	quit, dialCount := startFailingRootDaemonReconnect(t, t.Context(), func(context.Context) bool { return false })
 	select {
 	case <-quit:
 	case <-time.After(2 * time.Second):
@@ -237,7 +235,7 @@ func TestReconnectRootDaemonStopsWhenRootDaemonIsGone(t *testing.T) {
 }
 
 func TestReconnectRootDaemonKeepsRetryingWhileRootDaemonIsRunning(t *testing.T) {
-	quit, dialCount := startFailingRootDaemonReconnect(t, true)
+	quit, dialCount := startFailingRootDaemonReconnect(t, t.Context(), func(context.Context) bool { return true })
 	select {
 	case <-quit:
 		t.Fatal("the user daemon quit while the root daemon was running")
@@ -246,13 +244,34 @@ func TestReconnectRootDaemonKeepsRetryingWhileRootDaemonIsRunning(t *testing.T) 
 	require.Greater(t, dialCount.Load(), int32(2))
 }
 
+func TestCanceledReconnectPreservesUserDaemon(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	checked := make(chan struct{})
+	quit, _ := startFailingRootDaemonReconnect(t, ctx, func(context.Context) bool {
+		cancel()
+		close(checked)
+		return false
+	})
+	select {
+	case <-checked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("root daemon liveness was never checked")
+	}
+	select {
+	case <-quit:
+		t.Fatal("canceling the session stopped the user daemon")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 // startFailingRootDaemonReconnect connects a session to a root daemon whose activity
 // watcher fails at once, and fails every later dial. The returned channel closes when
 // the session asks the user daemon to quit.
-func startFailingRootDaemonReconnect(t *testing.T, running bool) (<-chan struct{}, *atomic.Int32) {
+func startFailingRootDaemonReconnect(t *testing.T, parent context.Context, running func(context.Context) bool) (<-chan struct{}, *atomic.Int32) {
 	const sessionID = "test-session"
 
-	ctx, cancel := context.WithCancel(client.WithConfig(context.Background(), client.GetDefaultConfig()))
+	ctx, cancel := context.WithCancel(client.WithConfig(parent, client.GetDefaultConfig()))
 	t.Cleanup(cancel)
 
 	first := &rootDaemonReconnectTestServer{
@@ -286,7 +305,7 @@ func startFailingRootDaemonReconnect(t *testing.T, running bool) (<-chan struct{
 		service:           quitTestService{quitter: quitter},
 		sessionInfo:       &manager.SessionInfo{SessionId: sessionID},
 		dialRootDaemon:    dialRootDaemon,
-		rootDaemonRunning: func(context.Context) bool { return running },
+		rootDaemonRunning: running,
 	}
 	nc := &rootdRpc.NetworkConfig{
 		Namespace: "default",

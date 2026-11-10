@@ -1694,6 +1694,9 @@ func (s *session) reconnectRootDaemon(failedGeneration uint64, cause error) {
 				running = isRootDaemonRunning
 			}
 			if !running(s) {
+				if s.Err() != nil || s.closing.Load() {
+					return
+				}
 				clog.Error(s, "the root daemon has exited; quitting the user daemon. Run 'telepresence connect' to start both again")
 				go func() {
 					_, _ = s.service.ConnectorServer().Quit(context.WithoutCancel(s), &empty.Empty{})
