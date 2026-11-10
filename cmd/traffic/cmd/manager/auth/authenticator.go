@@ -33,6 +33,9 @@ const (
 
 	successCacheTTL = 2 * time.Minute
 	failureCacheTTL = 10 * time.Second
+
+	// Bound the backlog before an internal credential check starts.
+	internalReviewMaxWait = time.Second
 )
 
 // Authenticator validates bearer tokens using cached Kubernetes TokenReviews, or,
@@ -58,8 +61,8 @@ func WithMintedTokens(m *MintedTokens) Option {
 }
 
 // WithMetrics makes the Authenticator record cache hits, first/fallback TokenReview
-// calls, invalid tokens, and API-server failures on m. Intended for the external
-// listener, whose Authenticator is otherwise unshared with the internal one.
+// calls, invalid tokens, and API-server failures on m. Each listener uses its
+// own Authenticator and metrics label.
 func WithMetrics(m *Metrics) Option {
 	return func(a *Authenticator) {
 		a.metrics = m
@@ -70,9 +73,25 @@ func WithMetrics(m *Metrics) Option {
 // expensive, API-server-bound step -- with the external admission constants.
 // Cached tokens never enter admission; only a review pays it.
 func WithReviewAdmission() Option {
+	return withReviewAdmission(0)
+}
+
+// WithInternalReviewAdmission bounds the queue of uncached internal
+// credentials. Each admitted credential holds a concurrency slot through
+// its audience checks. Each TokenReview consumes a rate token.
+func WithInternalReviewAdmission() Option {
+	return withReviewAdmission(externalAuthBurst)
+}
+
+func withReviewAdmission(maxWaiting int) Option {
 	return func(a *Authenticator) {
-		a.reviewer.limiter = rate.NewLimiter(rate.Limit(externalAuthQPS), externalAuthBurst)
-		a.reviewer.sem = make(chan struct{}, externalMaxConcurrentAuth)
+		t := a.reviewer
+		t.limiter = rate.NewLimiter(rate.Limit(externalAuthQPS), externalAuthBurst)
+		t.sem = make(chan struct{}, externalMaxConcurrentAuth)
+		t.waiters = nil
+		if maxWaiting > 0 {
+			t.waiters = make(chan struct{}, maxWaiting)
+		}
 	}
 }
 
@@ -166,15 +185,36 @@ type tokenReviewer struct {
 	reviewMetrics *tokenReviewMetrics
 	// calls counts AuthenticateToken invocations -- i.e. cache misses.
 	calls atomic.Uint64
-	// limiter and sem, when set by WithReviewAdmission, bound the rate and
-	// concurrency of reviews.
+	// The external listener holds a slot per review. The internal listener
+	// holds it for a credential's sequential audience checks.
 	limiter *rate.Limiter
 	sem     chan struct{}
+	waiters chan struct{} // non-nil for the internal listener
 }
 
 func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
-	resp, ok, err := t.authenticateManager(ctx, token)
-	if err != nil || ok {
+	return t.authenticate(ctx, token, false)
+}
+
+func (t *tokenReviewer) authenticateManager(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+	return t.authenticate(ctx, token, true)
+}
+
+func (t *tokenReviewer) authenticate(ctx context.Context, token string, managerOnly bool) (*authenticator.Response, bool, error) {
+	t.calls.Add(1)
+	if t.waiters != nil {
+		if err := t.acquireInternalVerification(ctx); err != nil {
+			if errors.Is(err, errTooManyReviews) {
+				t.metrics.RateLimited.Inc()
+			}
+			return nil, false, err
+		}
+		// Keep this slot through the fallback so a new miss cannot crowd
+		// out a credential whose manager-audience check already ran.
+		defer func() { <-t.sem }()
+	}
+	resp, ok, err := t.review(ctx, token, []string{agentconfig.ManagerTokenAudience}, "manager")
+	if managerOnly || err != nil || ok {
 		return resp, ok, err
 	}
 	// API-audience client credentials share one cached decision with the manager-audience attempt.
@@ -182,13 +222,18 @@ func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*a
 	return t.review(ctx, token, auds, "api")
 }
 
-func (t *tokenReviewer) authenticateManager(ctx context.Context, token string) (*authenticator.Response, bool, error) {
-	t.calls.Add(1)
-	return t.review(ctx, token, []string{agentconfig.ManagerTokenAudience}, "manager")
-}
-
 func (t *tokenReviewer) review(ctx context.Context, token string, audiences []string, audienceLabel string) (*authenticator.Response, bool, error) {
-	if t.limiter != nil {
+	if t.waiters != nil {
+		// Every HTTP review, including an audience fallback, pays for a
+		// rate token. Only active credential checks can wait here.
+		if err := t.limiter.Wait(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, false, ctxErr
+			}
+			t.metrics.RateLimited.Inc()
+			return nil, false, errTooManyReviews
+		}
+	} else if t.limiter != nil {
 		if !t.limiter.Allow() {
 			t.metrics.RateLimited.Inc()
 			return nil, false, errTooManyReviews
@@ -243,4 +288,34 @@ func (t *tokenReviewer) review(ctx context.Context, token string, audiences []st
 		Audiences: status.Audiences,
 	}
 	return resp, true, nil
+}
+
+// acquireInternalVerification bounds both active cache misses and the
+// backlog waiting to start. Each active miss sends at most one TokenReview
+// at a time, including when a second audience must be checked.
+func (t *tokenReviewer) acquireInternalVerification(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case t.sem <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case t.waiters <- struct{}{}:
+		defer func() { <-t.waiters }()
+	default:
+		return errTooManyReviews
+	}
+	timer := time.NewTimer(internalReviewMaxWait)
+	defer timer.Stop()
+	select {
+	case t.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return errTooManyReviews
+	}
 }

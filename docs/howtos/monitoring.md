@@ -54,8 +54,18 @@ To enable Prometheus metrics for your traffic manager, follow these steps:
    | `telepresence_auth_first_reviews`        | Counter  | Manager-audience `TokenReview` calls made.                                    | `listener`                               |
    | `telepresence_auth_fallback_reviews`     | Counter  | No-audience fallback `TokenReview` calls made.                                 | `listener`                               |
    | `telepresence_auth_rate_limited`         | Counter  | `TokenReview` attempts rejected by review admission; cached tokens never enter admission. | `listener`             |
-   | `telepresence_auth_invalid_tokens`       | Counter  | Bearer tokens the API server rejected.                                         | `listener`                               |
+   | `telepresence_auth_invalid_tokens`       | Counter  | Authentication attempts rejected as invalid, including cached decisions.        | `listener`                               |
    | `telepresence_auth_api_failures`         | Counter  | `TokenReview` calls that failed for infrastructure reasons.                    | `listener`                               |
+
+   The internal listener runs up to 64 uncached credential checks at once.
+   Up to 100 more can wait for one second to start. An admitted credential
+   keeps its slot through both audience checks. Every TokenReview uses the
+   same 50-per-second budget with a burst of 100.
+   If admission rejects a check, the token cache
+   can reuse that result for ten seconds. Check
+   `telepresence_auth_rate_limited{listener="internal"}` alongside
+   `telepresence_token_review_requests_total` and RPC outcomes. A review
+   rejected at admission never reaches the Kubernetes client.
 
 4. **Enable Scraping for Traffic Manager Metrics**
    To ensure that these metrics are collected regularly by your Prometheus server and to maintain a historical record, it's essential to enable scraping. If you're using the default Prometheus configuration, you can achieve this by specifying specific pod annotations as follows:
