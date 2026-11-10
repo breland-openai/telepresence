@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apps "k8s.io/api/apps/v1"
@@ -935,5 +936,46 @@ func TestCachedSidecarQualifiesConnectedPhysicalPod(t *testing.T) {
 	require.Len(t, as, 1)
 	require.Equal(t, "new", as[0].PodUid)
 	require.Empty(t, f.client.Actions())
+	assertSidecarPodCheckMetrics(t, f.state, 1, 0, 0)
 	sidecarWaitsRetired(t, f.state)
+}
+
+func assertSidecarPodCheckMetrics(t *testing.T, s *State, hit, fallback, disabled float64) {
+	t.Helper()
+	reg := prometheus.NewPedanticRegistry()
+	s.RegisterSidecarPodCheckMetrics(reg)
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	require.Len(t, families, 1)
+	family := families[0]
+	require.Equal(t, "telepresence_sidecar_pod_checks_total", family.GetName())
+	values := make(map[string]float64)
+	for _, metric := range family.Metric {
+		require.Len(t, metric.Label, 1)
+		require.Equal(t, "path", metric.Label[0].GetName())
+		require.NotNil(t, metric.Counter)
+		values[metric.Label[0].GetValue()] = metric.Counter.GetValue()
+	}
+	require.Equal(t, map[string]float64{"hit": hit, "fallback": fallback, "disabled": disabled}, values)
+}
+
+func TestSidecarPodCheckMetricsCountLiveDecisions(t *testing.T) {
+	t.Parallel()
+	f := newSidecarArrivalFixture(t)
+	wl := k8sapi.Deployment(f.work)
+	f.watcher.Store(sidecarArrivalConfig(agentconfig.ReplacePolicyIntercept))
+	watchErr := errors.New("warning watch unavailable")
+	f.client.PrependWatchReactor("events", func(ktesting.Action) (bool, watch.Interface, error) {
+		return true, nil, watchErr
+	})
+	for _, enabled := range []bool{false, true} {
+		ctx := managerutil.WithEnv(f.ctx, &managerutil.Env{
+			AgentInjectPolicy: agentconfig.OnDemand, AgentArrivalTimeout: time.Second, CachedPodChecks: enabled,
+		})
+		_, _, err := f.state.ensureAgent(ctx, wl, false, true, nil, agentconfig.ReplacePolicyIntercept)
+		require.NoError(t, err)
+		_, _, err = f.state.ensureAgent(ctx, wl, false, false, nil, agentconfig.ReplacePolicyIntercept)
+		require.ErrorIs(t, err, watchErr)
+	}
+	assertSidecarPodCheckMetrics(t, f.state, 0, 1, 1)
 }

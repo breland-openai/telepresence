@@ -36,6 +36,7 @@ To enable Prometheus metrics for your traffic manager, follow these steps:
 
    | **Name**                    | **Type** | **Description**                                                               | **Labels**                               |
    |-----------------------------|----------|-------------------------------------------------------------------------------|------------------------------------------|
+   | `telepresence_sidecar_pod_checks_total` | Counter | Workload sidecar verification decisions. | `path` (`hit`, `fallback`, `disabled`) |
    | `telepresence_agent_count`               | Gauge    | Number of connected traffic agents.                                           |                                          |
    | `telepresence_client_count`              | Gauge    | Number of connected clients.                                                  |                                          |
    | `telepresence_active_intercept_count`    | Gauge    | Number of active intercepts.                                                  |                                          |
@@ -55,6 +56,15 @@ To enable Prometheus metrics for your traffic manager, follow these steps:
    | `telepresence_auth_rate_limited`         | Counter  | `TokenReview` attempts rejected by review admission; cached tokens never enter admission. | `listener`             |
    | `telepresence_auth_invalid_tokens`       | Counter  | Bearer tokens the API server rejected.                                         | `listener`                               |
    | `telepresence_auth_api_failures`         | Counter  | `TokenReview` calls that failed for infrastructure reasons.                    | `listener`                               |
+
+   A shared Service can contribute one verification decision for each participating workload.
+   A `hit` reuses verified pod identities and a connected sidecar. A `fallback` enters live
+   reconciliation with cached checks enabled, and `disabled` enters it with cached checks
+   disabled. Live reconciliation can still fail. Dry runs and manually configured agents
+   that bypass this verification do not contribute to the counter.
+
+   Before the metrics server starts, the manager logs the start and elapsed time of
+   traffic-agent informer setup and initial agent configuration regeneration at info level.
 
 4. **Enable Scraping for Traffic Manager Metrics**
    To ensure that these metrics are collected regularly by your Prometheus server and to maintain a historical record, it's essential to enable scraping. If you're using the default Prometheus configuration, you can achieve this by specifying specific pod annotations as follows:

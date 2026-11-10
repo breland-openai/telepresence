@@ -92,6 +92,7 @@ type State struct {
 	workloadWatchers           *xsync.Map[string, Watcher] // workload watchers, created on demand and keyed by namespace
 	serviceInterceptWatchers   *xsync.Map[string, struct{}]
 	sidecarAgentWaits          sync.Map
+	sidecarPodChecks           struct{ hit, fallback, disabled atomic.Uint64 }
 
 	// nodeAgentPodWatchers tracks the running per-workload node-agent pod-set
 	// watchers (nodeAgentPodWatchLoop), one per name+namespace with at least
@@ -795,6 +796,23 @@ func ClientOwnershipError(ctx context.Context, sessionID tunnel.SessionID, clien
 
 func (s *State) EachClient(f func(tunnel.SessionID, *ClientSession) bool) {
 	s.clients.Range(f)
+}
+
+// RegisterSidecarPodCheckMetrics exposes one decision per workload entering sidecar
+// verification. Keep the counters on State so early requests and concurrent scrapes
+// see the same totals regardless of when the metrics server starts.
+func (s *State) RegisterSidecarPodCheckMetrics(reg prometheus.Registerer) {
+	for path, count := range map[string]*atomic.Uint64{
+		"hit":      &s.sidecarPodChecks.hit,
+		"fallback": &s.sidecarPodChecks.fallback,
+		"disabled": &s.sidecarPodChecks.disabled,
+	} {
+		reg.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name:        "telepresence_sidecar_pod_checks_total",
+			Help:        "Workload sidecar verification decisions by cache path.",
+			ConstLabels: prometheus.Labels{"path": path},
+		}, func() float64 { return float64(count.Load()) }))
+	}
 }
 
 func (s *State) CountAgents() int {

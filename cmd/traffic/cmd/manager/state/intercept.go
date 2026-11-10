@@ -1275,8 +1275,12 @@ func (s *State) ensureAgent(parentCtx context.Context, wl k8sapi.Workload, exten
 	if managerutil.GetEnv(ctx).CachedPodChecks {
 		if sc, encoded, as := s.cachedSidecarAgents(ctx, wl, spec, extended, rp); len(as) > 0 {
 			cfgJSON, waitOutcome = encoded, sidecarAgentWaitSucceeded
+			s.sidecarPodChecks.hit.Add(1)
 			return sc, as, nil
 		}
+		s.sidecarPodChecks.fallback.Add(1)
+	} else {
+		s.sidecarPodChecks.disabled.Add(1)
 	}
 
 	failedCreateCh, err := eventwatch.WatchWarnings(ctx, k8sapi.GetK8sInterface(ctx), wl.GetNamespace(), wl.GetName())
