@@ -102,6 +102,13 @@ items:
           or duplicates. Previously, a non-alphabetical list could be mistaken
           for a configuration change and ask the user to reconnect.
       - type: bugfix
+        title: Avoid repeated or stale intercept approvals
+        body: >-
+          Traffic-agents reuse successful approvals when unrelated intercepts
+          change. Service intercepts wait for every required workload to recover
+          before accepting fresh approvals, and expired agents can no longer
+          claim a replacement pod's intercept.
+      - type: bugfix
         title: Recover promptly from stalled manager sessions
         body: >-
           Manager keepalive failures now use the existing session repair path

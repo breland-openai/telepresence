@@ -69,6 +69,12 @@ Repeating <code>telepresence connect</code> with the same mapped namespaces now 
   </Body>
 </Note>
 <Note>
+	<Title type="bugfix">Avoid repeated or stale intercept approvals</Title>
+	<Body>
+Traffic-agents reuse successful approvals when unrelated intercepts change. Service intercepts wait for every required workload to recover before accepting fresh approvals, and expired agents can no longer claim a replacement pod's intercept.
+  </Body>
+</Note>
+<Note>
 	<Title type="bugfix">Recover promptly from stalled manager sessions</Title>
 	<Body>
 Manager keepalive failures now use the existing session repair path instead of ending the client session. Expired sessions recover immediately, while repeated transient failures trigger repair without dropping active intercepts.
