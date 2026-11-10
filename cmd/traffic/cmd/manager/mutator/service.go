@@ -208,13 +208,7 @@ func ServeMutator(ctx context.Context, g log.Group, injectorCertGetter InjectorC
 		rx: regexp.MustCompile(`http: TLS handshake error from .*: EOF\s*\z`),
 		wr: lg.Writer(),
 	})
-	server := http.Server{
-		Handler:  mux,
-		ErrorLog: lg,
-		BaseContext: func(n net.Listener) context.Context {
-			return ctx
-		},
-	}
+	server := http.Server{Handler: mux, ErrorLog: lg}
 	listener, err := listenTLS(ctx, fmt.Sprintf(":%d", port), injectorCertGetter)
 	if err != nil {
 		return err
@@ -305,29 +299,40 @@ func listenTLS(ctx context.Context, addr string, certGetter InjectorCertGetter) 
 }
 
 func serveWebhook(ctx context.Context, s *http.Server, listener net.Listener, onReady func()) error {
-	serveDone := make(chan struct{})
+	// Admission requests keep the manager values while accepted connections drain.
+	requests, cancelRequests := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelRequests()
+	s.BaseContext = func(net.Listener) context.Context { return requests }
+
+	serving, stop := context.WithCancel(ctx)
+	defer stop()
+	drained := make(chan error, 1)
 	go func() {
-		defer close(serveDone)
-		if err := s.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			clog.Errorf(ctx, "failed to serve: %v", err)
+		select {
+		case <-serving.Done():
+		case <-time.After(3 * time.Second):
+			if serving.Err() == nil {
+				onReady()
+			}
+			<-serving.Done()
 		}
+
+		drain, cancel := context.WithTimeout(requests, 5*time.Second)
+		defer cancel()
+		err := s.Shutdown(drain)
+		if err != nil {
+			cancelRequests()
+			err = errors.Join(err, s.Close())
+		}
+		drained <- err
 	}()
 
-	select {
-	case <-ctx.Done():
-	case <-time.After(3 * time.Second):
-		// Let the webhook accept admission requests before watchers initiate rollouts.
-		onReady()
-		<-ctx.Done()
+	err := s.Serve(listener)
+	stop()
+	if errors.Is(err, http.ErrServerClosed) {
+		err = nil
 	}
-	drain, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	err := s.Shutdown(drain)
-	if err != nil {
-		err = errors.Join(err, s.Close())
-	}
-	<-serveDone
-	return err
+	return errors.Join(err, <-drained)
 }
 
 // Skip mutate requests in these namespaces.

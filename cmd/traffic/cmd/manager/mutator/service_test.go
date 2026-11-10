@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,6 +37,37 @@ func TestWebhookShutdownBeforeReady(t *testing.T) {
 	})
 }
 
+func TestWebhookReturnsServeError(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		beforeReady bool
+	}{
+		{"before readiness", true},
+		{"after readiness", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+				defer cancel()
+				listener := bufconn.Listen(1024)
+				if tc.beforeReady {
+					require.NoError(t, listener.Close())
+				}
+				started := false
+				err := serveWebhook(ctx, &http.Server{}, listener, func() {
+					started = true
+					_ = listener.Close()
+				})
+				_, listenErr := listener.Accept()
+				require.Error(t, listenErr)
+				require.ErrorIs(t, err, listenErr)
+				require.NoError(t, ctx.Err())
+				require.Equal(t, !tc.beforeReady, started)
+			})
+		})
+	}
+}
+
 func TestWebhookShutdownAfterReady(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -46,12 +78,14 @@ func TestWebhookShutdownAfterReady(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				ctx, cancel := context.WithCancel(t.Context())
+				type contextKey struct{}
+				ctx, cancel := context.WithCancel(context.WithValue(t.Context(), contextKey{}, "manager"))
 				defer cancel()
 				handling := make(chan struct{})
 				handled := make(chan struct{})
 				finish := make(chan struct{})
 				server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, "manager", r.Context().Value(contextKey{}))
 					close(handling)
 					defer close(handled)
 					select {
@@ -79,6 +113,8 @@ func TestWebhookShutdownAfterReady(t *testing.T) {
 				_, err = listener.DialContext(t.Context())
 				require.Error(t, err, "the listener must be closed while the request drains")
 				select {
+				case <-handled:
+					t.Fatal("request context canceled before the drain deadline")
 				case err := <-done:
 					t.Fatalf("returned with an active request: %v", err)
 				default:
