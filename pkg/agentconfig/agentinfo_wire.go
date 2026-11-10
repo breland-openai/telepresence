@@ -26,7 +26,7 @@ func UsesForkAgentFields(version string) bool {
 // AgentInfoForPeer adds the fork's wire types alongside the canonical fields.
 // Full agent records can be shared by several sessions, so projection is immutable.
 func AgentInfoForPeer(agent *manager.AgentInfo, forkFields bool) (*manager.AgentInfo, error) {
-	if !forkFields || agent == nil || len(agent.InterceptTargets) == 0 && !agent.ContainerEnvironmentOmitted {
+	if !forkFields || agent == nil || len(agent.InterceptTargets) == 0 && !agent.ContainerEnvironmentOmitted && len(agent.ProtoReflect().GetUnknown()) == 0 {
 		return agent, nil
 	}
 	out := proto.CloneOf(agent)
@@ -34,7 +34,7 @@ func AgentInfoForPeer(agent *manager.AgentInfo, forkFields bool) (*manager.Agent
 		return nil, err
 	}
 	unknown := out.ProtoReflect().GetUnknown()
-	for _, target := range agent.InterceptTargets {
+	for _, target := range out.InterceptTargets {
 		data, err := proto.Marshal(target)
 		if err != nil {
 			return nil, err
@@ -42,7 +42,7 @@ func AgentInfoForPeer(agent *manager.AgentInfo, forkFields bool) (*manager.Agent
 		unknown = protowire.AppendTag(unknown, forkTargetField, protowire.BytesType)
 		unknown = protowire.AppendBytes(unknown, data)
 	}
-	if agent.ContainerEnvironmentOmitted {
+	if out.ContainerEnvironmentOmitted {
 		unknown = protowire.AppendTag(unknown, forkOmittedField, protowire.VarintType)
 		unknown = protowire.AppendVarint(unknown, 1)
 	}

@@ -687,8 +687,15 @@ func (s *State) AddClient(client *rpc.ClientInfo, principal *auth.Principal, now
 	return sessionID
 }
 
-func (s *State) RestoreClient(sessionID tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) {
-	s.addClient(sessionID, client, principal, now)
+// RestoreClient returns the session and whether another request already restored it.
+func (s *State) RestoreClient(sessionID tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) (*ClientSession, bool) {
+	return s.clients.LoadOrCompute(sessionID, func() (*ClientSession, bool) {
+		cs := newClientSessionState(s.backgroundCtx, sessionID, client, now)
+		if principal != nil {
+			cs.SetPrincipal(principal)
+		}
+		return cs, false
+	})
 }
 
 func (s *State) RestoreAgents(agents []*rpc.AgentInfo, now time.Time) {
@@ -778,13 +785,9 @@ func (s *State) restoreChildIntercepts(parent *Intercept, now time.Time) {
 }
 
 // addClient is like AddClient but takes a sessionID, for testing purposes.
-func (s *State) addClient(id tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) {
-	cs := newClientSessionState(s.backgroundCtx, id, client, now)
-	if principal != nil {
-		cs.SetPrincipal(principal)
-	}
-	if oldClient, hasConflict := s.clients.LoadOrStore(id, cs); hasConflict {
-		panic(fmt.Errorf("duplicate id %q, existing %+v, new %+v", id, oldClient, client))
+func (s *State) addClient(sessionID tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) {
+	if old, loaded := s.RestoreClient(sessionID, client, principal, now); loaded {
+		panic(fmt.Errorf("duplicate id %q, existing %+v, new %+v", sessionID, old, client))
 	}
 }
 

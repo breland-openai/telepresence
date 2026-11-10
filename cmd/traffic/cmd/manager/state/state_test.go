@@ -150,6 +150,36 @@ func (s *suiteState) TestStateInternal() {
 	})
 }
 
+func (s *suiteState) TestConcurrentClientRestore() {
+	client := testdata.GetTestClients(s.T())["alice"]
+	const id tunnel.SessionID = "reconnecting-client"
+	now := time.Now()
+	type result struct {
+		session *ClientSession
+		loaded  bool
+	}
+	const attempts = 8
+	start := make(chan struct{})
+	results := make(chan result, attempts)
+	for range attempts {
+		go func() {
+			<-start
+			session, loaded := s.state.RestoreClient(id, client, nil, now)
+			results <- result{session, loaded}
+		}()
+	}
+	close(start)
+	var created int
+	for range attempts {
+		r := <-results
+		s.Require().Same(s.state.GetClient(id), r.session)
+		if !r.loaded {
+			created++
+		}
+	}
+	s.Equal(1, created)
+}
+
 func (s *suiteState) TestAddClient() {
 	// given
 	now := time.Now()

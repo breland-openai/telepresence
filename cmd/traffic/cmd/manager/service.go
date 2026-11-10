@@ -353,7 +353,13 @@ func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClient
 	if err != nil {
 		return nil, err
 	}
-	st.RestoreClient(sessionID, client, auth.PrincipalFrom(ctx), now)
+	if session, loaded := st.RestoreClient(sessionID, client, auth.PrincipalFrom(ctx), now); loaded {
+		// An overlapping reconnect completed its reviews first.
+		if err := state.ClientOwnershipError(ctx, sessionID, session); err != nil {
+			return nil, err
+		}
+		return &empty.Empty{}, nil
+	}
 	agents := slices.DeleteFunc(slices.Clone(restoredAgents), func(agent *rpc.AgentInfo) bool {
 		if agent.GetContainerEnvironmentOmitted() {
 			// Compact watch snapshots are intentionally incomplete. Restoring

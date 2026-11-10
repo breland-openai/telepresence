@@ -434,6 +434,11 @@ func TestNext5AgentWireRoundTrip(t *testing.T) {
 			base.NodeAgent = true
 			base.QuicPort = 7787
 			in := encodeLegacyForkAgent(t, next5, base, targets, compact)
+			projectedRaw, err := agentconfig.AgentInfoForPeer(in, true)
+			require.NoError(t, err)
+			requireLegacyForkTargetsEqual(t, targets, projectedRaw.InterceptTargets)
+			require.Equal(t, compact, projectedRaw.ContainerEnvironmentOmitted)
+			require.Equal(t, len(targets), decodeLegacyForkAgent(t, next5, projectedRaw).Get(next5.Fields().ByName("intercept_targets")).List().Len())
 			require.Empty(t, in.InterceptTargets)
 			future := protowire.AppendVarint(protowire.AppendTag(nil, 1000, protowire.VarintType), 123)
 			in.ProtoReflect().SetUnknown(append(in.ProtoReflect().GetUnknown(), future...))
