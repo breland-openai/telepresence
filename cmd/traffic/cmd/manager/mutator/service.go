@@ -208,24 +208,16 @@ func ServeMutator(ctx context.Context, g log.Group, injectorCertGetter InjectorC
 		rx: regexp.MustCompile(`http: TLS handshake error from .*: EOF\s*\z`),
 		wr: lg.Writer(),
 	})
-	server := http.Server{
-		Handler:  mux,
-		ErrorLog: lg,
-		BaseContext: func(n net.Listener) context.Context {
-			return ctx
-		},
+	server := http.Server{Handler: mux, ErrorLog: lg}
+	listener, err := listenTLS(ctx, fmt.Sprintf(":%d", port), injectorCertGetter)
+	if err != nil {
+		return err
 	}
-	injectorReady := make(chan error)
-	g.Go("agent-configs", func(ctx context.Context) error {
-		if _, ok := <-injectorReady; ok {
-			// An error was posted on the injectorReady channel. We don't report the
-			// error from here, but we refrain from waiting on the watchers.
-			return nil
-		}
-		// the injectorReady was closed with no errors.
-		return cw.Wait(ctx)
+	defer clog.Debug(ctx, "service stopped")
+	clog.Debug(ctx, "service started")
+	return serveWebhook(ctx, &server, listener, func() {
+		g.Go("agent-configs", cw.Wait)
 	})
-	return serveAndWatchTLS(ctx, &server, fmt.Sprintf(":%d", port), injectorCertGetter, injectorReady)
 }
 
 // ServeNodeAgentUninstall serves only /uninstall and /healthz over plain
@@ -282,54 +274,65 @@ func (l *logFilter) Write(data []byte) (int, error) {
 	return l.wr.Write(data)
 }
 
-func serveAndWatchTLS(ctx context.Context, s *http.Server, addr string, certGetter InjectorCertGetter, rdy chan error) (err error) {
-	var rdyClose sync.Once
-	defer func() {
-		if err != nil {
-			rdy <- err
-		}
-		rdyClose.Do(func() { close(rdy) })
-	}()
-
+func listenTLS(ctx context.Context, addr string, certGetter InjectorCertGetter) (net.Listener, error) {
 	certPEM, keyPEM, err := certGetter.LoadCert()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer clog.Debug(ctx, "service stopped")
-	clog.Debug(ctx, "service started")
-
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return fmt.Errorf("failed to create TLS listener: %v", err)
+		return nil, fmt.Errorf("failed to create TLS listener: %w", err)
 	}
 	lc := net.ListenConfig{}
 	tcpListener, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	return &tlsListener{
+		ctx:         ctx,
+		certGetter:  certGetter,
+		cert:        cert,
+		certPEM:     certPEM,
+		keyPEM:      keyPEM,
+		tcpListener: tcpListener,
+	}, nil
+}
 
+func serveWebhook(ctx context.Context, s *http.Server, listener net.Listener, onReady func()) error {
+	// Admission requests keep the manager values while accepted connections drain.
+	requests, cancelRequests := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelRequests()
+	s.BaseContext = func(net.Listener) context.Context { return requests }
+
+	serving, stop := context.WithCancel(ctx)
+	defer stop()
+	drained := make(chan error, 1)
 	go func() {
-		err := s.Serve(
-			&tlsListener{
-				ctx:         ctx,
-				certGetter:  certGetter,
-				cert:        cert,
-				certPEM:     certPEM,
-				keyPEM:      keyPEM,
-				tcpListener: tcpListener,
-			},
-		)
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			clog.Errorf(ctx, "failed to serve: %v", err)
+		select {
+		case <-serving.Done():
+		case <-time.After(3 * time.Second):
+			if serving.Err() == nil {
+				onReady()
+			}
+			<-serving.Done()
 		}
+
+		drain, cancel := context.WithTimeout(requests, 5*time.Second)
+		defer cancel()
+		err := s.Shutdown(drain)
+		if err != nil {
+			cancelRequests()
+			err = errors.Join(err, s.Close())
+		}
+		drained <- err
 	}()
 
-	// Give the http server some time to start accepting calls from the listener. We don't want
-	// our own rollouts to happen before we are able to receive events from the mutating webhook.
-	time.Sleep(3 * time.Second)
-	rdyClose.Do(func() { close(rdy) })
-	<-ctx.Done()
-	return s.Shutdown(ctx)
+	err := s.Serve(listener)
+	stop()
+	if errors.Is(err, http.ErrServerClosed) {
+		err = nil
+	}
+	return errors.Join(err, <-drained)
 }
 
 // Skip mutate requests in these namespaces.
