@@ -220,12 +220,11 @@ func (s *Server) dnsListeners(c context.Context) ([]net.PacketConn, error) {
 	return []net.PacketConn{listener}, nil
 }
 
-// runNatTableCmd runs "iptables -t nat ...".
-func runNatTableCmd(c context.Context, args ...string) error {
+func runIPTablesCmd(c context.Context, table string, args ...string) error {
 	// We specifically don't want to use the cancellation of 'ctx' here, because we don't ever
 	// want to leave things in a half-cleaned-up state.
 	c = context.WithoutCancel(c)
-	args = append([]string{"-t", "nat"}, args...)
+	args = append([]string{"-t", table}, args...)
 	cmd := exec.CommandContext(c, "iptables", args...)
 	if clog.Enabled(c, clog.LevelTrace) {
 		clog.Trace(c, shellquote.ShellString("iptables", args))
@@ -233,7 +232,19 @@ func runNatTableCmd(c context.Context, args ...string) error {
 	return cmd.Run()
 }
 
-const tpDNSChain = "TELEPRESENCE_DNS"
+// runNatTableCmd runs "iptables -t nat ...".
+func runNatTableCmd(c context.Context, args ...string) error {
+	return runIPTablesCmd(c, "nat", args...)
+}
+
+const (
+	tpDNSChain                = "TELEPRESENCE_DNS"
+	tpDNSRawChain             = "TELEPRESENCE_DNS_RAW"
+	istioOutputChain          = "ISTIO_OUTPUT"
+	istioDNSOutputChain       = "ISTIO_OUTPUT_DNS"
+	defaultIstioProxyUID      = uint32(1337)
+	defaultIstioConntrackZone = uint16(2)
+)
 
 // CleanupRouting removes DNS routing state that might have been left behind by
 // a previous root daemon process.
@@ -246,12 +257,45 @@ func CleanupRouting(c context.Context) {
 // DNS service. Another rule ensures that when our local DNS service cannot resolve and
 // uses a fallback, that fallback reaches the original DNS service.
 func routeDNS(c context.Context, dnsAddress netip.AddrPort, toAddr netip.AddrPort, localDNSs []netip.AddrPort) (err error) {
-	// create the chain
 	unrouteDNS(c)
+	defer func() {
+		if err != nil {
+			unrouteDNS(c)
+		}
+	}()
+
+	proxyUID, conntrackZone := istioDNSSettings(c)
+	if conntrackZone != 0 {
+		if err = runIPTablesCmd(c, "raw", "-N", tpDNSRawChain); err != nil {
+			return err
+		}
+		if err = runIPTablesCmd(c, "raw", "-A", tpDNSRawChain,
+			"-p", "udp",
+			"--source", toAddr.Addr().String()+"/32",
+			"--sport", strconv.Itoa(int(toAddr.Port())),
+			"-j", "CT", "--zone", strconv.Itoa(int(conntrackZone)),
+		); err != nil {
+			return err
+		}
+		if err = runIPTablesCmd(c, "raw", "-I", "OUTPUT", "1", "-j", tpDNSRawChain); err != nil {
+			return err
+		}
+	}
 
 	// Create the TELEPRESENCE_DNS chain
 	if err = runNatTableCmd(c, "-N", tpDNSChain); err != nil {
 		return err
+	}
+	if proxyUID != 0 {
+		if err = runNatTableCmd(c, "-A", tpDNSChain,
+			"-p", "udp",
+			"--dest", dnsAddress.Addr().String()+"/32",
+			"--dport", strconv.Itoa(int(dnsAddress.Port())),
+			"-m", "owner", "--uid-owner", strconv.FormatUint(uint64(proxyUID), 10),
+			"-j", "RETURN",
+		); err != nil {
+			return err
+		}
 	}
 
 	// This rule prevents that any rules in this table applies to the localDNS address when
@@ -281,10 +325,46 @@ func routeDNS(c context.Context, dnsAddress netip.AddrPort, toAddr netip.AddrPor
 	return runNatTableCmd(c, "-I", "OUTPUT", "1", "-j", tpDNSChain)
 }
 
+func istioDNSSettings(c context.Context) (uint32, uint16) {
+	present, err := iptablesJumpExists(c, "nat", istioOutputChain)
+	if err != nil {
+		clog.Warnf(c, "Unable to detect Istio sidecar; using standard DNS routing: %v", err)
+		return 0, 0
+	}
+	if !present {
+		return 0, 0
+	}
+
+	dnsCapture, err := iptablesJumpExists(c, "raw", istioDNSOutputChain)
+	if err != nil {
+		clog.Warnf(c, "Unable to detect Istio DNS capture; using proxy UID exclusion only: %v", err)
+		return defaultIstioProxyUID, 0
+	}
+	if !dnsCapture {
+		return defaultIstioProxyUID, 0
+	}
+	return defaultIstioProxyUID, defaultIstioConntrackZone
+}
+
+func iptablesJumpExists(c context.Context, table, target string) (bool, error) {
+	err := runIPTablesCmd(c, table, "-C", "OUTPUT", "-j", target)
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
 // unrouteDNS removes the chain installed by routeDNS.
 func unrouteDNS(c context.Context) {
 	// The errors returned by these commands aren't of any interest besides logging.
 	_ = runNatTableCmd(c, "-D", "OUTPUT", "-j", tpDNSChain)
 	_ = runNatTableCmd(c, "-F", tpDNSChain)
 	_ = runNatTableCmd(c, "-X", tpDNSChain)
+	_ = runIPTablesCmd(c, "raw", "-D", "OUTPUT", "-j", tpDNSRawChain)
+	_ = runIPTablesCmd(c, "raw", "-F", tpDNSRawChain)
+	_ = runIPTablesCmd(c, "raw", "-X", tpDNSRawChain)
 }

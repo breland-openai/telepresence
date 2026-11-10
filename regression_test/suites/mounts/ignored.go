@@ -12,7 +12,7 @@ import (
 
 // Ignored proves the telepresence.io/inject-ignore-volume-mounts annotation
 // (pkg/annotation/annotation.go's InjectIgnoreVolumeMounts) excludes a named
-// volume from both TELEPRESENCE_MOUNTS (the attach's reported environment)
+// volume from both remote mount metadata (the attach's reported environment)
 // and the local mount, trimmed to the two cases that isolate the
 // annotation's own effect: ignored and not-ignored.
 type Ignored struct {
@@ -25,7 +25,7 @@ func init() {
 }
 
 // Test_NotIgnored intercepts an unannotated EchoWithConfigVolume: the
-// ConfigMap's mount path is present in TELEPRESENCE_MOUNTS and its content is
+// ConfigMap's mount path is present in remote mount metadata and its content is
 // readable through the mount.
 func (s *Ignored) Test_NotIgnored() {
 	t := s.T()
@@ -37,7 +37,7 @@ func (s *Ignored) Test_NotIgnored() {
 
 	root, ok := rt.MountRoot(a)
 	if !ok {
-		t.Fatalf("intercept for %s carries no TELEPRESENCE_ROOT", wl.Name)
+		t.Fatalf("intercept for %s carries no local mount directory", wl.Name)
 	}
 	// A guaranteed mount confirms the FUSE/SFTP layer is fully up before
 	// checking the ConfigVolume-specific paths below.
@@ -45,14 +45,14 @@ func (s *Ignored) Test_NotIgnored() {
 
 	paths := mountedPaths(a)
 	s.True(containsPath(paths, workloads.ConfigVolumeMountPath),
-		"TELEPRESENCE_MOUNTS %q should contain %s", paths, workloads.ConfigVolumeMountPath)
+		"remote mount metadata %q should contain %s", paths, workloads.ConfigVolumeMountPath)
 
 	check.EventuallyFile(t, configFilePath(root), isConfigContent, mountTimeout)
 }
 
 // Test_Ignored intercepts an EchoWithConfigVolume annotated to ignore its
 // ConfigMap volume (by Kubernetes Volume name, configVolumeK8sName): the
-// ConfigMap's mount path is absent from TELEPRESENCE_MOUNTS and never
+// ConfigMap's mount path is absent from remote mount metadata and never
 // appears under the local mount.
 func (s *Ignored) Test_Ignored() {
 	t := s.T()
@@ -66,7 +66,7 @@ func (s *Ignored) Test_Ignored() {
 
 	root, ok := rt.MountRoot(a)
 	if !ok {
-		t.Fatalf("intercept for %s carries no TELEPRESENCE_ROOT", wl.Name)
+		t.Fatalf("intercept for %s carries no local mount directory", wl.Name)
 	}
 	// A guaranteed mount confirms the FUSE/SFTP layer is fully up, so the
 	// immediate stat below reliably distinguishes "not mounted" from "not
@@ -75,7 +75,7 @@ func (s *Ignored) Test_Ignored() {
 
 	paths := mountedPaths(a)
 	s.False(containsPath(paths, workloads.ConfigVolumeMountPath),
-		"TELEPRESENCE_MOUNTS %q should not contain ignored %s", paths, workloads.ConfigVolumeMountPath)
+		"remote mount metadata %q should not contain ignored %s", paths, workloads.ConfigVolumeMountPath)
 
 	_, err := os.Stat(configFilePath(root))
 	s.Error(err, "ignored ConfigMap path should not appear under the mount")

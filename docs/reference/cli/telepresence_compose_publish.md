@@ -13,7 +13,8 @@ Publish compose application
 
 ### Flags:
 ```
-  -h, --help   help for publish
+  -h, --help       help for publish
+      --show-env   Include remote environment values in output. WARNING: may expose sensitive values
 ```
 
 ### Compose flags:

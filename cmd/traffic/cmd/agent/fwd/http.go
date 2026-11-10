@@ -3,6 +3,7 @@ package fwd
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/json/v2"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,10 +25,14 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
 )
 
-// httpInterceptMaxIdleConnsPerHost replaces the transport's default of two idle
-// connections per host, which would otherwise close most reusable connections
-// to the intercept handler as soon as a burst of requests ends.
-const httpInterceptMaxIdleConnsPerHost = 128
+const (
+	httpInterceptMaxIdleConns        = 512
+	httpInterceptMaxIdleConnsPerHost = 128
+	httpInterceptMaxConnsPerHost     = 128
+	httpInterceptSlowAfter           = 2 * time.Second
+	httpInterceptVerySlow            = 10 * time.Second
+	httpWiretapFallbackTimeout       = 5 * time.Second
+)
 
 type httpInterceptDialContextKey struct{}
 
@@ -51,11 +57,6 @@ func (c *metricsReportingConn) Close() error {
 	c.once.Do(c.report)
 	return err
 }
-
-const (
-	httpInterceptSlowAfter = 2 * time.Second
-	httpInterceptVerySlow  = 10 * time.Second
-)
 
 type observedResponseWriter struct {
 	http.ResponseWriter
@@ -282,11 +283,35 @@ func shouldInterceptRequest(req *http.Request, headerFilters map[string]string, 
 	return matcher.NewRequest(pathFilters, headerFilters).Matches(req)
 }
 
+func ensureGRPCTrailersHeader(request *http.Request) *http.Request {
+	contentType := strings.ToLower(strings.TrimSpace(strings.SplitN(request.Header.Get("Content-Type"), ";", 2)[0]))
+	if contentType != "application/grpc" && !strings.HasPrefix(contentType, "application/grpc+") {
+		return request
+	}
+	for _, value := range request.Header.Values("Te") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "trailers") {
+				return request
+			}
+		}
+	}
+
+	// TE is hop-by-hop, so an upstream proxy may remove it before the
+	// traffic-agent sees the request. ReverseProxy only forwards Te: trailers
+	// when it is present on the inbound request, and local gRPC servers require
+	// it to accept the forwarded request.
+	request = request.Clone(request.Context())
+	request.Header.Set("Te", "trailers")
+	return request
+}
+
 func (f *tcp) configureUpstreamTransport(ctx context.Context, plaintext bool) *http.Transport {
 	tm := f.tlsManager
 	tp := f.Target().Port()
 	trn := f.configureTransport(ctx, plaintext)
+	trn.MaxIdleConns = max(trn.MaxIdleConns, httpInterceptMaxIdleConns)
 	trn.MaxIdleConnsPerHost = max(trn.MaxIdleConnsPerHost, httpInterceptMaxIdleConnsPerHost)
+	trn.MaxConnsPerHost = max(trn.MaxConnsPerHost, httpInterceptMaxConnsPerHost)
 	if plaintext {
 		return trn
 	}
@@ -471,6 +496,7 @@ func (f *tcp) serveHTTPIntercept(
 		proxyErrorHandler(rw, req, err)
 	}
 	targetProxy.Transport = hit.transport
+	request = ensureGRPCTrailersHeader(request)
 	request = request.WithContext(context.WithValue(request.Context(), httpInterceptDialContextKey{}, &httpInterceptDialContext{
 		src: src,
 		ii:  ii,
@@ -526,8 +552,20 @@ func proxyErrorHandler(rw http.ResponseWriter, _ *http.Request, err error) {
 }
 
 func (f *tcp) serveTap(ctx context.Context, src netip.AddrPort, tap io.Reader, ii *manager.InterceptInfo) {
-	s, err := f.createStream(ctx, src, ii)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if closer, ok := tap.(io.Closer); ok {
+		defer closer.Close()
+	}
+	timeout := time.Duration(ii.Spec.DialTimeout) + time.Duration(ii.Spec.RoundtripLatency)
+	if timeout <= 0 {
+		timeout = httpWiretapFallbackTimeout
+	}
+	establish := time.AfterFunc(timeout, cancel)
+	s, err := f.createStream(ctx, uniqueHTTPWiretapSource(src), ii)
+	establish.Stop()
 	if err != nil {
+		clog.Debugf(ctx, "Unable to create HTTP wiretap tunnel for request from %s: %v", src, err)
 		return
 	}
 	buf := make([]byte, 4096)
@@ -545,4 +583,40 @@ func (f *tcp) serveTap(ctx context.Context, src netip.AddrPort, tap io.Reader, i
 			break
 		}
 	}
+
+	// Closing this direction tells the client to finish writing the request to the
+	// observer. Keep the reverse server context alive while the client drains the
+	// observer's reply; immediately canceling can discard queued request bytes. A
+	// peer that never closes must not keep this request tunnel alive indefinitely.
+	finish := time.AfterFunc(timeout, cancel)
+	defer finish.Stop()
+	if err := s.CloseSend(ctx); err != nil {
+		if ctx.Err() == nil {
+			clog.Debugf(ctx, "Failed to close HTTP wiretap stream: %v", err)
+		}
+		return
+	}
+	for {
+		message, err := s.Receive(ctx)
+		if err != nil {
+			if ctx.Err() == nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+				clog.Debugf(ctx, "Failed to drain HTTP wiretap stream: %v", err)
+			}
+			return
+		}
+		if message.Code() == tunnel.DialReject || message.Code() == tunnel.Disconnect {
+			return
+		}
+	}
+}
+
+// Each HTTP request opens a separate observer tunnel, even when the original
+// connection carries multiple requests. Its source address is only a tunnel key;
+// the client dials the unchanged destination. A random local IPv6 address avoids
+// collisions across connections, ports, and forwarders without binding a socket.
+func uniqueHTTPWiretapSource(src netip.AddrPort) netip.AddrPort {
+	var address [16]byte
+	_, _ = rand.Read(address[:])
+	address[0] = 0xfd
+	return netip.AddrPortFrom(netip.AddrFrom16(address), src.Port())
 }

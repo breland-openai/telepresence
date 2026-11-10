@@ -5,8 +5,12 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -21,6 +25,7 @@ import (
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/clog/handler"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/auth"
+	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
 )
 
@@ -128,6 +133,175 @@ func TestInterceptor_Stream(t *testing.T) {
 	assert.Equal(t, "u", seen.Username)
 }
 
+func TestInterceptor_InterceptRouteObserverRequiresBearerInEveryMode(t *testing.T) {
+	const method = "/telepresence.manager.Manager/WatchInterceptRoutes"
+	for _, mode := range []auth.Mode{auth.ModeDisabled, auth.ModePermissive, auth.ModeEnforcing} {
+		t.Run(mode.String(), func(t *testing.T) {
+			ci := fake.NewClientset()
+			k8sapi.InstallFakeTokenReviews(ci, func(token string, audiences []string) *authnv1.TokenReviewStatus {
+				if (token == "good" && len(audiences) == 1 && audiences[0] == agentconfig.ManagerTokenAudience) || (token == "api-only" && len(audiences) == 0) {
+					s := authenticatedStatus("system:serviceaccount:routing:observer", "observer-uid")
+					s.Audiences = audiences
+					return s
+				}
+				return &authnv1.TokenReviewStatus{Authenticated: false}
+			})
+			a := auth.NewAuthenticator(ci)
+			ordinary, err := a.Authenticate(context.Background(), "api-only")
+			require.NoError(t, err)
+			require.Equal(t, "observer-uid", ordinary.UID)
+			i := auth.NewInterceptor(a, mode)
+			info := &grpc.StreamServerInfo{FullMethod: method, IsServerStream: true}
+			for _, tc := range []struct {
+				name, credential string
+				want             codes.Code
+			}{
+				{name: "no bearer", want: codes.Unauthenticated},
+				{name: "invalid bearer", credential: "Bearer bad", want: codes.Unauthenticated},
+				{name: "cached ordinary API audience bearer", credential: "Bearer api-only", want: codes.Unauthenticated},
+				{name: "verified bearer", credential: "Bearer good", want: codes.OK},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					ctx := context.Background()
+					if tc.credential != "" {
+						ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("authorization", tc.credential))
+					}
+					called := false
+					err := i.Stream()(nil, &fakeServerStream{ctx: ctx}, info, func(_ any, ss grpc.ServerStream) error {
+						called = true
+						p := auth.PrincipalFrom(ss.Context())
+						require.NotNil(t, p)
+						require.Equal(t, "observer-uid", p.UID)
+						return nil
+					})
+					require.Equal(t, tc.want, status.Code(err))
+					require.Equal(t, tc.want == codes.OK, called)
+				})
+			}
+			t.Run("token review outage", func(t *testing.T) {
+				failed := fake.NewClientset()
+				failed.PrependReactor("create", "tokenreviews", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("Kubernetes unavailable")
+				})
+				i := auth.NewInterceptor(auth.NewAuthenticator(failed), mode)
+				ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer outage"))
+				called := false
+				err := i.Stream()(nil, &fakeServerStream{ctx: ctx}, info, func(any, grpc.ServerStream) error {
+					called = true
+					return nil
+				})
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.False(t, called)
+			})
+		})
+	}
+}
+
+func TestInterceptorExpiredCallerSkipsHandler(t *testing.T) {
+	for _, mode := range []auth.Mode{auth.ModeDisabled, auth.ModePermissive, auth.ModeEnforcing} {
+		for _, rpcType := range []string{"unary", "stream"} {
+			for _, expired := range []bool{false, true} {
+				name := "canceled"
+				if expired {
+					name = "deadline"
+				}
+				t.Run(string(mode)+"/"+rpcType+"/"+name, func(t *testing.T) {
+					ci := fake.NewClientset()
+					i := auth.NewInterceptor(auth.NewAuthenticator(ci), mode)
+					ctx, cancel := context.WithCancel(context.Background())
+					cancel()
+					wantCode := codes.Canceled
+					if expired {
+						ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+						defer cancel()
+						wantCode = codes.DeadlineExceeded
+					}
+					called := false
+					var err error
+					if rpcType == "unary" {
+						_, err = i.Unary()(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/telepresence.manager.Manager/LookupDNS"},
+							func(context.Context, any) (any, error) {
+								called = true
+								return nil, nil
+							})
+					} else {
+						err = i.Stream()(nil, &fakeServerStream{ctx: ctx}, &grpc.StreamServerInfo{FullMethod: "/telepresence.manager.Manager/WatchAgentPods"},
+							func(any, grpc.ServerStream) error {
+								called = true
+								return nil
+							})
+					}
+					assert.Equal(t, wantCode, status.Code(err))
+					assert.False(t, called)
+					assert.Empty(t, ci.Actions())
+				})
+			}
+		}
+	}
+}
+
+func TestInterceptorCanceledAuthenticationWait(t *testing.T) {
+	for _, mode := range []auth.Mode{auth.ModePermissive, auth.ModeEnforcing} {
+		for _, rpcType := range []string{"unary", "stream"} {
+			for _, expired := range []bool{false, true} {
+				name := "canceled"
+				if expired {
+					name = "deadline"
+				}
+				t.Run(string(mode)+"/"+rpcType+"/"+name, func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						ci := fake.NewClientset()
+						started := make(chan struct{})
+						release := make(chan struct{})
+						k8sapi.InstallFakeTokenReviews(ci, func(string, []string) *authnv1.TokenReviewStatus {
+							close(started)
+							<-release
+							return authenticatedStatus("user", "uid")
+						})
+						buf := &bytes.Buffer{}
+						ctx, cancel := context.WithCancel(loggingContext(buf))
+						defer cancel()
+						wantCode := codes.Canceled
+						if expired {
+							ctx, cancel = context.WithTimeout(ctx, time.Second)
+							defer cancel()
+							wantCode = codes.DeadlineExceeded
+						} else {
+							go func() {
+								<-started
+								cancel()
+							}()
+						}
+						ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("authorization", "Bearer secret-token"))
+						i := auth.NewInterceptor(auth.NewAuthenticator(ci), mode)
+						called := false
+						var err error
+						if rpcType == "unary" {
+							_, err = i.Unary()(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/telepresence.manager.Manager/LookupDNS"},
+								func(context.Context, any) (any, error) {
+									called = true
+									return nil, nil
+								})
+						} else {
+							err = i.Stream()(nil, &fakeServerStream{ctx: ctx}, &grpc.StreamServerInfo{FullMethod: "/telepresence.manager.Manager/WatchAgentPods"},
+								func(any, grpc.ServerStream) error {
+									called = true
+									return nil
+								})
+						}
+						close(release)
+						synctest.Wait()
+						assert.Equal(t, wantCode, status.Code(err))
+						assert.False(t, called)
+						assert.NotContains(t, buf.String(), "token authentication unavailable")
+						assert.NotContains(t, buf.String(), "secret-token")
+					})
+				})
+			}
+		}
+	}
+}
+
 func TestInterceptor_LogsNeverContainToken(t *testing.T) {
 	const secretInvalid = "super-secret-invalid-token-value"
 	const secretUnavailable = "super-secret-unavailable-token-value"
@@ -169,6 +343,33 @@ func TestInterceptor_LogsNeverContainToken(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotContains(t, buf.String(), secretUnavailable)
 		assert.Contains(t, buf.String(), "unavailable")
+	})
+}
+
+func TestInterceptor_InvalidTokenWarningsAreRateLimited(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ci := fake.NewClientset()
+		k8sapi.InstallFakeTokenReviews(ci, nil)
+		metrics := auth.NewMetrics("test-invalid-token-warnings")
+		initialInvalid := testutil.ToFloat64(metrics.InvalidTokens)
+		i := auth.NewInterceptor(auth.NewAuthenticator(ci, auth.WithMetrics(metrics)), auth.ModePermissive)
+		buf := &bytes.Buffer{}
+		ctx := metadata.NewIncomingContext(loggingContext(buf), metadata.Pairs("authorization", "Bearer bad"))
+		info := &grpc.UnaryServerInfo{FullMethod: "/telepresence.manager.Manager/Connect"}
+		handler := func(context.Context, any) (any, error) { return nil, nil }
+
+		for range 20 {
+			_, err := i.Unary()(ctx, nil, info, handler)
+			require.NoError(t, err)
+		}
+		assert.Equal(t, 1, strings.Count(buf.String(), "invalid bearer token"))
+		assert.Equal(t, initialInvalid+20, testutil.ToFloat64(metrics.InvalidTokens))
+
+		time.Sleep(10 * time.Second)
+		_, err := i.Unary()(ctx, nil, info, handler)
+		require.NoError(t, err)
+		assert.Equal(t, 2, strings.Count(buf.String(), "invalid bearer token"))
+		assert.Equal(t, initialInvalid+21, testutil.ToFloat64(metrics.InvalidTokens))
 	})
 }
 

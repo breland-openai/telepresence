@@ -79,6 +79,9 @@ func TestAgentInfoForWatchCompactsContainerEnvironments(t *testing.T) {
 				Mounts:      map[string]int32{"/tmp": 1},
 			},
 		},
+		InterceptTargets: []*rpc.AgentInfo_InterceptTarget{
+			{ServiceName: "echo", ServicePort: 8080, ContainerPort: 8080},
+		},
 	}
 
 	require.Same(t, full, agentInfoForWatch(full, false))
@@ -87,6 +90,7 @@ func TestAgentInfoForWatchCompactsContainerEnvironments(t *testing.T) {
 	require.Nil(t, compact.Containers["app"].Environment)
 	require.Equal(t, full.Containers["app"].MountPoint, compact.Containers["app"].MountPoint)
 	require.Equal(t, full.Containers["app"].Mounts, compact.Containers["app"].Mounts)
+	require.Equal(t, full.InterceptTargets, compact.InterceptTargets)
 	require.Equal(t, map[string]string{"TOKEN": "large-value"}, full.Containers["app"].Environment)
 	require.Less(t, proto.Size(compact), proto.Size(full))
 }
@@ -1289,11 +1293,13 @@ matchExpressions:
 	ctx = informer.WithFactory(ctx, "")
 
 	configWatcher := config.NewWatcher(mgrNs)
-	go func() {
-		if err := configWatcher.Run(ctx); err != nil {
+	configWatcherDone := make(chan struct{})
+	go func(watcherCtx context.Context) {
+		defer close(configWatcherDone)
+		if err := configWatcher.Run(watcherCtx); err != nil {
 			t.Error(err)
 		}
-	}()
+	}(ctx)
 	if err = configWatcher.ForceEvent(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1340,7 +1346,7 @@ matchExpressions:
 	}
 	s := server.New(ctx)
 	g := log.NewGroup(ctx)
-	mgr, err := NewService(ctx, g, configWatcher)
+	mgr, err := NewService(ctx, g, configWatcher, k8sapi.GetK8sInterface(ctx))
 	if err != nil {
 		t.Fatalf("failed to build manager: %v", err)
 	}
@@ -1362,6 +1368,7 @@ matchExpressions:
 		if err := g.Wait(); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			t.Error(err)
 		}
+		<-configWatcherDone
 	})
 	return conn, mgr, ctx
 }

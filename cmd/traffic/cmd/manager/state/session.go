@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -97,6 +98,8 @@ func newClientSessionState(ctx context.Context, id tunnel.SessionID, ci *rpc.Cli
 type AgentSession struct {
 	*rpc.AgentInfo
 	sessionState
+	// Finish in-flight reviews before removal reconciles this pod's intercepts.
+	reviewMu sync.RWMutex
 }
 
 func newAgentSessionState(ctx context.Context, id tunnel.SessionID, ai *rpc.AgentInfo, ts time.Time) *AgentSession {

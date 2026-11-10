@@ -75,6 +75,10 @@ properties:
       port:
         description: Port number of the first port that the agent will use
         type: integer
+      preStopDrainTimeout:
+        description: Maximum time an injected traffic-agent continues serving during pod termination. Set to 0s to disable.
+        type: string
+        pattern: "^(\\d+(\\.\\d+)?(h|m|s|ms|us|µs))+$"
       resources:
         description: Resource requirements for the agent
         $ref: "#/$defs/resourceRequirements"
@@ -277,6 +281,19 @@ properties:
               Suffixes for which the client DNS resolver will always attempt to do a lookup. Includes have higher priority
               than excludes
             type: array
+            items:
+              type: string
+          preserveLocalClusterDNS:
+            description: >-
+              Preserve the host cluster's Kubernetes API names and configured additional hostnames on Linux.
+              Defaults to true
+            type: boolean
+          preserveLocalClusterDNSNames:
+            description: >-
+              Additional exact hostnames to resolve through the host cluster's physical DNS before connecting.
+              Requires preserveLocalClusterDNS to be enabled
+            type: array
+            maxItems: 32
             items:
               type: string
       intercept:

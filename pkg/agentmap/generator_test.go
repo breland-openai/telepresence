@@ -1,6 +1,7 @@
 package agentmap
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -13,6 +14,34 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
 	"github.com/telepresenceio/telepresence/v2/pkg/types"
 )
+
+func TestGenerateDoesNotMutateSharedWorkloadTemplate(t *testing.T) {
+	workload := deploymentWithInactivePort("")
+	workload.GetPodTemplate().Spec.Containers = []core.Container{{
+		Name:  "app",
+		Ports: []core.ContainerPort{{ContainerPort: 9900}},
+	}}
+	config := &GeneratorConfig{AgentPort: 9900}
+	start := make(chan struct{})
+	errs := make(chan error, 16)
+
+	for range cap(errs) {
+		go func() {
+			<-start
+			_, err := config.Generate(context.Background(), workload, nil)
+			errs <- err
+		}()
+	}
+	close(start)
+	for range cap(errs) {
+		if err := <-errs; err == nil || !strings.Contains(err.Error(), "same port") {
+			t.Fatalf("Generate() error = %v, want the conflicting agent port", err)
+		}
+	}
+	if namespace := workload.GetPodTemplate().Namespace; namespace != "" {
+		t.Fatalf("Generate() mutated the shared pod template namespace to %q", namespace)
+	}
+}
 
 func TestApplyInactivePortAnnotation(t *testing.T) {
 	workload := deploymentWithInactivePort("8399")

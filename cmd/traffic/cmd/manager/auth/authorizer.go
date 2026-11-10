@@ -245,6 +245,17 @@ func (a *Authorizer) CanGetLogs(ctx context.Context, p *Principal, namespace, su
 	})
 }
 
+// CanWatchInterceptRoutes reports whether p may watch routing information in
+// namespace. The grant is independent of client connect and attachment grants.
+func (a *Authorizer) CanWatchInterceptRoutes(ctx context.Context, p *Principal, namespace string) (bool, error) {
+	return a.review(ctx, p, &authorizationv1.ResourceAttributes{
+		Namespace: namespace,
+		Verb:      "watch",
+		Group:     "telepresence.io",
+		Resource:  "interceptroutes",
+	})
+}
+
 // review returns the cached verdict for the principal and attribute set, or
 // performs a SubjectAccessReview and caches its outcome.
 func (a *Authorizer) review(ctx context.Context, p *Principal, ra *authorizationv1.ResourceAttributes) (bool, error) {

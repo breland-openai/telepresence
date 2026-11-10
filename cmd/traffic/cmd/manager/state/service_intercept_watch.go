@@ -213,13 +213,12 @@ func (s *State) reconcileServiceInterceptWorkloads(ctx context.Context, intercep
 			(intercept.Spec.WorkloadKind == "" || string(workload.GetKind()) == intercept.Spec.WorkloadKind) {
 			continue
 		}
-		if reason := s.secondaryExcluded(ctx, client, workload); reason != "" {
-			s.fallbackServiceInterceptToSingleWorkload(interceptID, reason)
-			return
-		}
-		if err = s.checkServiceWorkloadConflictsIgnoring(ctx, intercept.Spec, workload, client, interceptID); err != nil {
-			s.fallbackServiceInterceptToSingleWorkload(interceptID,
-				fmt.Sprintf("workload %s conflicts with an existing intercept: %v", workload, err))
+		if err := s.verifySecondaryWorkload(ctx, intercept.Spec, workload, client, interceptID); err != nil {
+			if failure := serviceVerificationFailure(err, workload); failure != nil {
+				clog.Debug(ctx, failure)
+				return
+			}
+			s.fallbackServiceInterceptToSingleWorkload(interceptID, err.Error())
 			return
 		}
 	}

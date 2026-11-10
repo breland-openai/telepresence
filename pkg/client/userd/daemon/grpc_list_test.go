@@ -19,9 +19,11 @@ type pendingWorkloadSession struct {
 	waiting chan struct{}
 }
 
-func (s *pendingWorkloadSession) Done() <-chan struct{} { return s.ctx.Done() }
-func (s *pendingWorkloadSession) Err() error            { return s.ctx.Err() }
-func (s *pendingWorkloadSession) MarkActivity()         {}
+func (s *pendingWorkloadSession) Value(k any) any             { return s.ctx.Value(k) }
+func (s *pendingWorkloadSession) Deadline() (time.Time, bool) { return s.ctx.Deadline() }
+func (s *pendingWorkloadSession) Done() <-chan struct{}       { return s.ctx.Done() }
+func (s *pendingWorkloadSession) Err() error                  { return s.ctx.Err() }
+func (s *pendingWorkloadSession) MarkActivity()               {}
 
 func (s *pendingWorkloadSession) WorkloadInfoSnapshot(ctx context.Context, _ []string, _ rpc.ListRequest_Filter) (*rpc.WorkloadInfoSnapshot, error) {
 	close(s.waiting)

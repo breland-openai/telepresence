@@ -3,6 +3,7 @@ package helm
 import (
 	"context"
 	"encoding/json/v2"
+	"strings"
 	"testing"
 
 	"github.com/blang/semver/v4"
@@ -10,6 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
+	appsv1 "k8s.io/api/apps/v1"
+	"sigs.k8s.io/yaml"
 )
 
 // renderCoreChart renders the embedded telepresence-oss chart with vals coalesced
@@ -159,4 +162,98 @@ func TestCoalesceValues(t *testing.T) {
 		_, err := coalesceValues(t.Context(), req)
 		require.Error(t, err)
 	})
+}
+
+func TestAgentPreStopDrainTimeout(t *testing.T) {
+	for _, timeout := range []string{"0s", "25s", "2m", "1m30s"} {
+		t.Run(timeout, func(t *testing.T) {
+			require.NoError(t, renderCoreChart(t, map[string]any{
+				"agent": map[string]any{"preStopDrainTimeout": timeout},
+			}, true))
+		})
+	}
+
+	for _, timeout := range []string{"-1s", "+1s", "2", "2minutes"} {
+		t.Run("invalid "+timeout, func(t *testing.T) {
+			err := renderCoreChart(t, map[string]any{
+				"agent": map[string]any{"preStopDrainTimeout": timeout},
+			}, true)
+			require.Error(t, err)
+			require.ErrorContains(t, err, "preStopDrainTimeout")
+		})
+	}
+}
+
+func TestAgentPreStopDrainTimeoutManagerEnvironment(t *testing.T) {
+	tests := []struct {
+		name  string
+		vals  map[string]any
+		value string
+	}{
+		{
+			name:  "default",
+			value: "2m",
+		},
+		{
+			name:  "configured",
+			vals:  map[string]any{"agent": map[string]any{"preStopDrainTimeout": "45s"}},
+			value: "45s",
+		},
+		{
+			name:  "disabled",
+			vals:  map[string]any{"agent": map[string]any{"preStopDrainTimeout": "0s"}},
+			value: "0s",
+		},
+		{
+			name: "injector disabled",
+			vals: map[string]any{"agentInjector": map[string]any{"enabled": false}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chrt, err := LoadCoreChart(semver.MustParse("2.32.0"))
+			require.NoError(t, err)
+			values, err := chartutil.ToRenderValues(chrt, tt.vals,
+				chartutil.ReleaseOptions{Name: "traffic-manager", Namespace: "ambassador", IsInstall: true},
+				chartutil.DefaultCapabilities)
+			require.NoError(t, err)
+			rendered, err := engine.Engine{}.Render(chrt, values)
+			require.NoError(t, err)
+			const managerTemplate = "telepresence-oss/templates/statefulset.yaml"
+			require.Contains(t, rendered, managerTemplate)
+			manifest := rendered[managerTemplate]
+			lf := strings.ReplaceAll(manifest, "\r\n", "\n")
+			for _, format := range []struct{ name, manifest string }{
+				{"rendered", manifest}, {"LF", lf}, {"CRLF", strings.ReplaceAll(lf, "\n", "\r\n")},
+			} {
+				t.Run(format.name, func(t *testing.T) {
+					var statefulSet appsv1.StatefulSet
+					require.NoError(t, yaml.Unmarshal([]byte(format.manifest), &statefulSet))
+					require.Equal(t, "StatefulSet", statefulSet.Kind)
+					var foundManager, foundVariable bool
+					var actual string
+					for _, container := range statefulSet.Spec.Template.Spec.Containers {
+						if container.Name != "traffic-manager" {
+							continue
+						}
+						foundManager = true
+						for _, env := range container.Env {
+							if env.Name == "AGENT_PRE_STOP_DRAIN_TIMEOUT" {
+								require.False(t, foundVariable, "drain timeout must be rendered exactly once")
+								foundVariable, actual = true, env.Value
+							}
+						}
+					}
+					require.True(t, foundManager, "manager container must exist")
+					if tt.value == "" {
+						require.False(t, foundVariable)
+						return
+					}
+					require.True(t, foundVariable)
+					require.Equal(t, tt.value, actual)
+				})
+			}
+		})
+	}
 }

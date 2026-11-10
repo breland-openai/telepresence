@@ -45,17 +45,17 @@ func TestManagerInstallID(t *testing.T) {
 	t.Run("uses the ID reported by the traffic-manager", func(t *testing.T) {
 		s, cs := newSession(t, "", &manager.SessionInfo{ManagerInstallId: "from-manager"})
 		failOnAPICall(t, cs)
-		require.Equal(t, "from-manager", s.managerInstallID())
+		require.Equal(t, "from-manager", s.managerInstallID(s))
 	})
 
 	t.Run("external manager without reported ID makes no API call", func(t *testing.T) {
 		s, cs := newSession(t, "tls://tm.example.com:443", &manager.SessionInfo{})
 		failOnAPICall(t, cs)
-		require.Equal(t, k8sapi.ZeroNamespaceID, s.managerInstallID())
+		require.Equal(t, k8sapi.ZeroNamespaceID, s.managerInstallID(s))
 	})
 
 	t.Run("falls back to the namespace UID for managers that don't report it", func(t *testing.T) {
 		s, _ := newSession(t, "", &manager.SessionInfo{})
-		require.Equal(t, nsUID, s.managerInstallID())
+		require.Equal(t, nsUID, s.managerInstallID(s))
 	})
 }

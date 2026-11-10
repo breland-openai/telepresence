@@ -58,7 +58,7 @@ func TestReconcileBatchesByAllowedUnavailability(t *testing.T) {
 	assert.False(t, pending, "every pod carries the wanted config")
 	assert.Equal(t, int32(6), f.evictions.Load())
 	assert.Zero(t, f.patches("deployments"), "no rollout was needed")
-	assert.Zero(t, f.gets("deployments"), "workloads are read from the cache")
+	assert.Positive(t, f.gets("deployments"), "the worker verifies physical workload identity")
 	assert.Zero(t, f.cw.pendingRequests.Load())
 }
 
@@ -268,6 +268,9 @@ func TestMissedTransitionIsRecoveredByRequeue(t *testing.T) {
 	podStore := f.store(&core.Pod{})
 	f.evictionReactor(func(eviction *policy.Eviction) error {
 		replacement := agentPod(ns, "new-"+eviction.Name, name, k8sapi.DeploymentKind, wantedJSON, true)
+		if err := f.client.Tracker().Add(replacement); err != nil {
+			return err
+		}
 		return podStore.Add(replacement)
 	})
 
@@ -295,7 +298,7 @@ func TestPodReadyEventWakesPendingWorkload(t *testing.T) {
 		q.Forget(key)
 	}
 
-	f.cw.podChanged(f.ctx, pod)
+	f.cw.enqueueEvictionPod(pod)
 	assert.Zero(t, q.Len(), "a pod of a workload without a request is ignored")
 
 	wl := k8sapi.Deployment(deployment)
@@ -303,12 +306,12 @@ func TestPodReadyEventWakesPendingWorkload(t *testing.T) {
 	require.Equal(t, 1, q.Len())
 	drain()
 
-	f.cw.podChanged(f.ctx, pod)
+	f.cw.enqueueEvictionPod(pod)
 	assert.Equal(t, 1, q.Len(), "a pod of a requested workload wakes it")
 	drain()
 
 	other := agentPod(ns, "other-0", "other", k8sapi.DeploymentKind, "", true)
-	f.cw.podChanged(f.ctx, other)
+	f.cw.enqueueEvictionPod(other)
 	assert.Zero(t, q.Len(), "a pod of another workload does not")
 }
 

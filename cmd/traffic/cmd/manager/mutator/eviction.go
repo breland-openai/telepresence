@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	argoRolloutsAPI "github.com/datawire/argo-rollouts-go-client/pkg/apis/rollouts"
 	argoRollouts "github.com/datawire/argo-rollouts-go-client/pkg/apis/rollouts/v1alpha1"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -20,6 +21,7 @@ import (
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -70,7 +72,7 @@ func (c *configWatcher) EvictPodsWithAgentConfig(ctx context.Context, wl k8sapi.
 // teardown path, bounded by the Helm hook's request timeout, so it is not paced.
 func (c *configWatcher) EvictAllPodsWithAgentConfig(ctx context.Context, namespace string) error {
 	c.deleteNamespaceAgentConfigs(namespace)
-	evictMap, err := podList(ctx, namespace)
+	evictMap, err := liveAgentPodList(ctx, namespace)
 	if err != nil {
 		return err
 	}
@@ -170,9 +172,14 @@ const (
 
 // evictBatch evicts up to budget of the pods. The batch ends at the first pod whose eviction the
 // disruption budget refuses, and that pod is returned.
-func (c *configWatcher) evictBatch(ctx context.Context, pods []*core.Pod, budget int) (evicted int, refused *core.Pod, err error) {
+func (c *configWatcher) evictBatch(ctx context.Context, pods []*core.Pod, budget int) (int, *core.Pod, error) {
+	accepted, refused, err := c.evictPodBatch(ctx, pods, budget)
+	return len(accepted), refused, err
+}
+
+func (c *configWatcher) evictPodBatch(ctx context.Context, pods []*core.Pod, budget int) (accepted []*core.Pod, refused *core.Pod, err error) {
 	for _, pod := range pods {
-		if evicted >= budget {
+		if len(accepted) >= budget {
 			break
 		}
 		podID := pod.UID
@@ -192,17 +199,17 @@ func (c *configWatcher) evictBatch(ctx context.Context, pods []*core.Pod, budget
 			return inactivation{Time: time.Now(), deleted: true}, xsync.UpdateOp
 		})
 		if err != nil {
-			return evicted, nil, err
+			return accepted, nil, err
 		}
 		switch result {
 		case podEvictionAccepted:
-			evicted++
+			accepted = append(accepted, pod)
 		case podEvictionRefused:
-			return evicted, pod, nil
+			return accepted, pod, nil
 		case podEvictionNone, podEvictionGone:
 		}
 	}
-	return evicted, nil, nil
+	return accepted, nil, nil
 }
 
 type disruptionBudgetError struct {
@@ -476,12 +483,6 @@ func evictPod(ctx context.Context, pod *core.Pod) (bool, error) {
 		},
 	})
 	if err == nil || k8sErrors.IsNotFound(err) {
-		store := informer.GetK8sFactory(ctx, pod.Namespace).Core().V1().Pods().Informer().GetStore()
-		if cached, exists, getErr := store.Get(pod); getErr == nil && exists {
-			if cachedPod, ok := cached.(*core.Pod); ok && cachedPod.UID == pod.UID {
-				_ = store.Delete(cachedPod)
-			}
-		}
 		clog.Debugf(ctx, "Pod %s was evicted or already replaced", pod.Name)
 		return err == nil, nil
 	}
@@ -520,7 +521,7 @@ func getPodLister(ctx context.Context, namespace string) (lister podLister) {
 	return lister
 }
 
-func podList(ctx context.Context, namespace string) (wlPodMap, error) {
+func podList(ctx context.Context, namespace string, include func(*core.Pod) bool) (wlPodMap, error) {
 	lister := getPodLister(ctx, namespace)
 	pods, err := lister.List(labels.Everything())
 	if err != nil {
@@ -529,7 +530,7 @@ func podList(ctx context.Context, namespace string) (wlPodMap, error) {
 	enabledWorkloads := managerutil.GetEnv(ctx).EnabledWorkloadKinds
 	podMap := make(wlPodMap)
 	for _, pod := range pods {
-		if !podIsPendingOrRunning(pod) {
+		if !include(pod) {
 			continue
 		}
 		wl, err := podOwnerWorkload(ctx, pod, enabledWorkloads)
@@ -537,6 +538,35 @@ func podList(ctx context.Context, namespace string) (wlPodMap, error) {
 			if k8sErrors.IsNotFound(err) {
 				continue
 			}
+			return nil, err
+		}
+		podMap.add(wl, pod)
+	}
+	return podMap, nil
+}
+
+func liveAgentPodList(ctx context.Context, namespace string) (wlPodMap, error) {
+	list, err := k8sapi.GetK8sInterface(ctx).CoreV1().Pods(namespace).List(ctx, meta.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("unable to list physical agent pods %s: %w", whereWeWatch(namespace), err)
+	}
+	resolver := &liveOwnerResolver{workloads: make(map[WorkloadKey]k8sapi.Workload)}
+	enabled := managerutil.GetEnv(ctx).EnabledWorkloadKinds
+	podMap := make(wlPodMap)
+	for i := range list.Items {
+		pod := &list.Items[i]
+		if !podIsPendingOrRunning(pod) || pod.Annotations[annotation.Config] == "" || podIsManuallyInjected(ctx, pod) {
+			continue
+		}
+		kinds := enabled
+		if kind := k8sapi.Kind(pod.Labels[agentconfig.WorkloadKindLabel]); kind != "" && !kinds.Contains(kind) {
+			kinds = append(slices.Clone(kinds), kind)
+		}
+		wl, err := resolver.owner(ctx, k8sapi.Pod(pod), kinds)
+		if k8sErrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
 			return nil, err
 		}
 		podMap.add(wl, pod)
@@ -583,24 +613,180 @@ func workloadPods(ctx context.Context, wl k8sapi.Workload) ([]*core.Pod, error) 
 	if err != nil {
 		return nil, err
 	}
+	return ownedWorkloadPods(ctx, wl, pods, podOwnerWorkload)
+}
+
+func liveWorkloadPods(ctx context.Context, wl k8sapi.Workload) ([]*core.Pod, error) {
+	selector, err := wl.Selector()
+	if err != nil {
+		return nil, err
+	}
+	if _, selectable := selector.Requirements(); !selectable {
+		return nil, nil
+	}
+	list, err := k8sapi.GetK8sInterface(ctx).CoreV1().Pods(wl.GetNamespace()).List(ctx, meta.ListOptions{LabelSelector: selector.String()})
+	if err != nil {
+		return nil, err
+	}
+	pods := make([]*core.Pod, len(list.Items))
+	for i := range list.Items {
+		pods[i] = &list.Items[i]
+	}
+	resolver := &liveOwnerResolver{workloads: make(map[WorkloadKey]k8sapi.Workload)}
+	return ownedWorkloadPods(ctx, wl, pods, func(ctx context.Context, pod *core.Pod, enabledWorkloads k8sapi.Kinds) (k8sapi.Workload, error) {
+		if !enabledWorkloads.Contains(wl.GetKind()) {
+			enabledWorkloads = append(slices.Clone(enabledWorkloads), wl.GetKind())
+		}
+		return resolver.ownerFor(ctx, k8sapi.Pod(pod), enabledWorkloads, wl)
+	})
+}
+
+// PodOwnedByWorkload verifies the current workload through native controller references.
+func PodOwnedByWorkload(ctx context.Context, wl k8sapi.Workload, pod *core.Pod) (bool, error) {
+	if pod.Namespace != wl.GetNamespace() || wl.GetUID() == "" {
+		return false, nil
+	}
+	kinds := managerutil.GetEnv(ctx).EnabledWorkloadKinds
+	if !kinds.Contains(wl.GetKind()) {
+		kinds = append(slices.Clone(kinds), wl.GetKind())
+	}
+	resolver := &liveOwnerResolver{workloads: make(map[WorkloadKey]k8sapi.Workload)}
+	owner, err := resolver.ownerFor(ctx, k8sapi.Pod(pod), kinds, wl)
+	if err != nil {
+		return false, err
+	}
+	return sameLiveWorkload(owner, wl), nil
+}
+
+type liveOwnerResolver struct {
+	workloads map[WorkloadKey]k8sapi.Workload
+}
+
+type liveOwnerIdentity struct {
+	group string
+	key   WorkloadKey
+	uid   types.UID
+}
+
+func liveOwnerGroup(kind k8sapi.Kind) string {
+	switch kind {
+	case k8sapi.DeploymentKind, k8sapi.ReplicaSetKind, k8sapi.StatefulSetKind:
+		return apps.GroupName
+	case k8sapi.RolloutKind:
+		return argoRolloutsAPI.Group
+	default:
+		return ""
+	}
+}
+
+func liveControllerKind(ref meta.OwnerReference) (k8sapi.Kind, bool) {
+	if ref.UID == "" {
+		return "", false
+	}
+	version, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil || version.Version == "" {
+		return "", false
+	}
+	kind := k8sapi.Kind(ref.Kind)
+	group := liveOwnerGroup(kind)
+	return kind, group != "" && version.Group == group
+}
+
+func liveCustomController(ref meta.OwnerReference) bool {
+	version, err := schema.ParseGroupVersion(ref.APIVersion)
+	return ref.UID != "" && err == nil && version.Version != "" && version.Group != "" &&
+		version.Group != apps.GroupName && version.Group != argoRolloutsAPI.Group
+}
+
+func sameLiveWorkload(actual, wanted k8sapi.Workload) bool {
+	return wanted.GetUID() != "" && actual.GetName() == wanted.GetName() && actual.GetNamespace() == wanted.GetNamespace() &&
+		actual.GetKind() == wanted.GetKind() && actual.GetUID() == wanted.GetUID()
+}
+
+func (r *liveOwnerResolver) workload(ctx context.Context, key WorkloadKey) (k8sapi.Workload, error) {
+	if wl := r.workloads[key]; wl != nil {
+		return wl, nil
+	}
+	wl, err := k8sapi.GetWorkload(ctx, key.Name, key.Namespace, key.Kind)
+	if err == nil {
+		r.workloads[key] = wl
+	}
+	return wl, err
+}
+
+func (r *liveOwnerResolver) owner(ctx context.Context, obj k8sapi.Object, enabledWorkloads k8sapi.Kinds) (k8sapi.Workload, error) {
+	return r.ownerFor(ctx, obj, enabledWorkloads, nil)
+}
+
+func (r *liveOwnerResolver) ownerFor(ctx context.Context, obj k8sapi.Object, kinds k8sapi.Kinds, wanted k8sapi.Workload) (k8sapi.Workload, error) {
+	visited := make(map[liveOwnerIdentity]struct{})
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		wl, isWorkload := obj.(k8sapi.Workload)
+		if isWorkload && wanted != nil && sameLiveWorkload(wl, wanted) {
+			return wl, nil
+		}
+		key := WorkloadKey{Kind: obj.GetKind(), Name: obj.GetName(), Namespace: obj.GetNamespace()}
+		identity := liveOwnerIdentity{group: liveOwnerGroup(key.Kind), key: key, uid: obj.GetUID()}
+		if _, seen := visited[identity]; seen {
+			return nil, fmt.Errorf("cyclic workload controller ownership at %s: %w", key, k8sErrors.NewNotFound(obj.GetGroupResource(), key.Name))
+		}
+		visited[identity] = struct{}{}
+		ref := meta.GetControllerOf(obj)
+		if ref == nil {
+			if wanted == nil && isWorkload && kinds.Contains(wl.GetKind()) {
+				return wl, nil
+			}
+			return nil, k8sErrors.NewNotFound(obj.GetGroupResource(), obj.GetName())
+		}
+		kind, valid := liveControllerKind(*ref)
+		if !valid {
+			if wanted == nil && isWorkload && kinds.Contains(wl.GetKind()) && liveCustomController(*ref) {
+				return wl, nil
+			}
+			return nil, k8sErrors.NewNotFound(obj.GetGroupResource(), obj.GetName())
+		}
+		if !kinds.Contains(kind) && (kind != k8sapi.ReplicaSetKind || (!kinds.Contains(k8sapi.DeploymentKind) && !kinds.Contains(k8sapi.RolloutKind))) {
+			return nil, k8sErrors.NewNotFound(obj.GetGroupResource(), obj.GetName())
+		}
+		owner, err := r.workload(ctx, WorkloadKey{Kind: kind, Name: ref.Name, Namespace: obj.GetNamespace()})
+		if err != nil {
+			return nil, err
+		}
+		if owner.GetUID() != ref.UID {
+			return nil, k8sErrors.NewNotFound(owner.GetGroupResource(), ref.Name)
+		}
+		obj = owner
+	}
+}
+
+func ownedWorkloadPods(ctx context.Context, wl k8sapi.Workload, pods []*core.Pod,
+	resolveOwner func(context.Context, *core.Pod, k8sapi.Kinds) (k8sapi.Workload, error),
+) ([]*core.Pod, error) {
+	if len(pods) == 0 {
+		return nil, nil
+	}
 	// A selector is not always unique to one workload. Stable and canary
 	// Deployments commonly share one and distinguish their pods only by
 	// template labels, so verify ownership before evicting a candidate pod.
 	enabledWorkloads := managerutil.GetEnv(ctx).EnabledWorkloadKinds
-	workloadKey := workloadKeyOf(wl)
+	workloadKey := WorkloadKey{Kind: wl.GetKind(), Name: wl.GetName(), Namespace: wl.GetNamespace()}
 	ownedPods := make([]*core.Pod, 0, len(pods))
 	for _, pod := range pods {
 		if !podIsPendingOrRunning(pod) {
 			continue
 		}
-		owner, err := podOwnerWorkload(ctx, pod, enabledWorkloads)
+		owner, err := resolveOwner(ctx, pod, enabledWorkloads)
 		if err != nil {
 			if k8sErrors.IsNotFound(err) {
 				continue
 			}
 			return nil, err
 		}
-		if workloadKeyOf(owner) == workloadKey {
+		if workloadKeyOf(owner) == workloadKey &&
+			(wl.GetUID() == "" || owner.GetUID() == wl.GetUID()) {
 			ownedPods = append(ownedPods, pod)
 		}
 	}

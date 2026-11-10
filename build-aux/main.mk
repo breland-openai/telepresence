@@ -295,7 +295,7 @@ endif
 .PHONY: setup-build-dir
 setup-build-dir:
 	mkdir -p $(BUILDDIR)
-	printf $(TELEPRESENCE_VERSION) > $(BUILDDIR)/version.txt ## Pass version in a file instead of a --build-arg to maximize cache usage
+	printf $(TELEPRESENCE_VERSION) > $(BUILDDIR)/version.txt ## Client and route-controller images still read the version file
 	printf $(HELM_VERSION) > $(BUILDDIR)/helm-version.txt
 
 TELEPRESENCE_SEMVER=$(patsubst v%,%,$(TELEPRESENCE_VERSION))
@@ -309,7 +309,21 @@ images-deps: build-deps setup-build-dir
 tel2-image: images-deps
 	$(eval PLATFORM_ARG := $(if $(TELEPRESENCE_TEL2_IMAGE_PLATFORM), --platform=$(TELEPRESENCE_TEL2_IMAGE_PLATFORM),))
 	$(eval COVER_BUILD_ARG := $(if $(TELEPRESENCE_COVER), --build-arg TEL_COVER=-cover,))
-	docker build $(PLATFORM_ARG) $(COVER_BUILD_ARG) --target tel2 --tag tel2 --tag $(TEL2_IMAGE_FQN) -f build-aux/docker/images/Dockerfile.traffic .
+	docker build $(PLATFORM_ARG) $(COVER_BUILD_ARG) --build-arg TELEPRESENCE_VERSION=$(TELEPRESENCE_VERSION) --target tel2 --tag tel2 --tag $(TEL2_IMAGE_FQN) -f build-aux/docker/images/Dockerfile.traffic .
+
+TELEPRESENCE_SOURCE_URL ?= https://github.com/telepresenceio/telepresence
+.PHONY: push-tel2-release-image
+push-tel2-release-image: ## (Build) Push both manager/agent architectures from the exact remote Git commit with full provenance
+	@case "$(TELEPRESENCE_SOURCE_URL)" in https://*.git|https://*/) printf '%s\n' 'TELEPRESENCE_SOURCE_URL must omit .git and the trailing slash' >&2; exit 1 ;; https://*) ;; *) printf '%s\n' 'TELEPRESENCE_SOURCE_URL must be an HTTPS repository URL' >&2; exit 1 ;; esac; \
+	  printf '%s\n' "$(TELEPRESENCE_SOURCE_URL)" | grep -Eq '^https://[A-Za-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$$' || { printf '%s\n' 'TELEPRESENCE_SOURCE_URL must name one HTTPS host/owner/repository without credentials, query or fragment' >&2; exit 1; }; \
+	  printf '%s\n' "$(TELEPRESENCE_SOURCE_COMMIT)" | grep -Eq '^[0-9a-f]{40}$$' || { printf '%s\n' 'the full verified TELEPRESENCE_SOURCE_COMMIT is required' >&2; exit 1; }
+	docker buildx build --platform=linux/amd64,linux/arm64 --target tel2 --provenance=mode=max \
+	  --build-arg "TELEPRESENCE_VERSION=$(TELEPRESENCE_VERSION)" \
+	  --label "org.opencontainers.image.source=$(TELEPRESENCE_SOURCE_URL).git" \
+	  --label "org.opencontainers.image.revision=$(TELEPRESENCE_SOURCE_COMMIT)" \
+	  --label "org.opencontainers.image.version=$(TELEPRESENCE_SEMVER)" \
+	  --push --tag "$(TEL2_IMAGE_FQN)" -f build-aux/docker/images/Dockerfile.traffic \
+	  "$(TELEPRESENCE_SOURCE_URL).git#$(TELEPRESENCE_SOURCE_COMMIT)"
 
 .PHONY: client-image
 client-image: images-deps
@@ -492,19 +506,29 @@ shellscripts += ./build-aux/vagrant-rtest/run-shards.sh
 
 lint: lint-rpc lint-go lint-docs
 
+define resolve-golangci-lint-version
+ver="$${GOLANGCI_LINT_VERSION:-}"; \
+if [ -z "$$ver" ]; then \
+  ver=$$(curl -fsSL 'https://api.github.com/repos/golangci/golangci-lint/releases/latest' | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4); \
+fi; \
+if [ -z "$$ver" ]; then \
+  echo 'Unable to resolve golangci-lint version; set GOLANGCI_LINT_VERSION explicitly.' >&2; exit 1; \
+fi;
+endef
+
 lint-docs: $(tools/docslint) ## (QA) Lint the documentation
 	$(tools/docslint) docs
 	docker run --rm -v $$(pwd):/docs -w /docs jdkato/vale:latest docs
 
 lint-go: lint-deps ## (QA) Run the golangci-lint
 ifeq ($(GOOS),windows)
-	@ver=$$(curl -fsSL 'https://api.github.com/repos/golangci/golangci-lint/releases/latest' | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) && \
+	@$(resolve-golangci-lint-version) \
 	docker run -e GOOS=$(GOOS) --rm -v $$(pwd):/app -v ~/.cache/golangci-lint/$$ver:/root/.cache -w /app golangci/golangci-lint:$$ver golangci-lint \
 	run --timeout 8m ./cmd/telepresence/... ./pkg/...
 else
 	# libfuse-dev provides fuse.h, which cgofuse needs to typecheck the linked
 	# fuseftp file system on Linux.
-	@ver=$$(curl -fsSL 'https://api.github.com/repos/golangci/golangci-lint/releases/latest' | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) && \
+	@$(resolve-golangci-lint-version) \
 	docker run -e GOOS=$(GOOS) --rm -v $$(pwd):/app -v ~/.cache/golangci-lint/$$ver:/root/.cache -w /app --entrypoint bash golangci/golangci-lint:$$ver \
 	-c "apt-get update -qq && apt-get install -y -qq libfuse-dev && golangci-lint run --timeout 8m ./..."
 endif
@@ -518,11 +542,11 @@ endif
 .PHONY: format
 format: lint-deps ## (QA) Automatically fix linter complaints
 ifeq ($(GOHOSTOS),windows)
-	@ver=$$(curl -fsSL 'https://api.github.com/repos/golangci/golangci-lint/releases/latest' | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) && \
+	@$(resolve-golangci-lint-version) \
 	docker run -e GOOS=$(GOOS) --rm -v $$(pwd):/app -v ~/.cache/golangci-lint/$$ver:/root/.cache -w /app golangci/golangci-lint:$$ver golangci-lint \
 	run --timeout 8m --fix ./cmd/telepresence/... ./pkg/...
 else
-	@ver=$$(curl -fsSL 'https://api.github.com/repos/golangci/golangci-lint/releases/latest' | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) && \
+	@$(resolve-golangci-lint-version) \
 	docker run -e GOOS=$(GOOS) --rm -v $$(pwd):/app -v ~/.cache/golangci-lint/$$ver:/root/.cache -w /app golangci/golangci-lint:$$ver golangci-lint \
 	run --timeout 8m --fix ./...
 endif

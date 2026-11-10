@@ -5,26 +5,28 @@ import (
 	"github.com/telepresenceio/telepresence/v2/regression_test/framework/rt"
 )
 
-// clientConfigSuffix/clientConfigAlsoProxy are the distinctive
-// dns.includeSuffixes and routing.alsoProxySubnets values the shared
-// release serves for this suite's spec, chosen so they cannot collide with
-// anything the cluster itself would ever discover: clientConfigAlsoProxy is
-// a TEST-NET-3 (RFC 5737) documentation range. An also-proxy is the served
-// routing value with an observable effect (it ADDS a routed subnet); a
-// served never-proxy of a non-cluster CIDR changes nothing visible.
+// clientConfigSuffix, clientConfigAlsoProxy, and clientConfigLocalDNS are
+// distinctive cluster-served DNS and routing values. clientConfigAlsoProxy
+// is a TEST-NET-3 (RFC 5737) documentation range. An also-proxy is the
+// served routing value with an observable effect (it ADDS a routed subnet);
+// a served never-proxy of a non-cluster CIDR changes nothing visible.
 const (
 	clientConfigSuffix    = "rtest-clientconfig.internal"
 	clientConfigAlsoProxy = "203.0.113.0/24"
+	clientConfigLocalDNS  = "artifact-gateway.platform.svc.cluster.local"
 )
 
 // clientConfigSpec is the manager spec ClientConfig declares: the cluster
-// serves a distinctive dns.includeSuffixes entry and a
-// routing.alsoProxySubnets entry.
+// serves distinctive dns.includeSuffixes, dns.preserveLocalClusterDNSNames,
+// and routing.alsoProxySubnets entries.
 //
 //nolint:gochecknoglobals // catalog spec, referenced by both Register and the test
 var clientConfigSpec = managers.ClientConfig("dns-routing", managers.Values{
 	Client: managers.Client{
-		DNS:     managers.ClientDNS{IncludeSuffixes: []string{clientConfigSuffix}},
+		DNS: managers.ClientDNS{
+			IncludeSuffixes:              []string{clientConfigSuffix},
+			PreserveLocalClusterDNSNames: []string{clientConfigLocalDNS},
+		},
 		Routing: managers.ClientRouting{AlsoProxySubnets: []string{clientConfigAlsoProxy}},
 	},
 })
@@ -46,8 +48,8 @@ func init() {
 // (freeDefaultConnection + rt.Reconnect, not Suite.Connect: the default
 // connection fixture may already be memoized from a connection made before
 // this suite's manager spec went live, and a manager spec switch alone never
-// invalidates it) and checks that `status --format json` reflects both
-// served values.
+// invalidates it) and checks that `status --format json` reflects all served
+// values.
 func (s *ClientConfig) Test_ServedConfigReflectsOnConnect() {
 	t := s.T()
 	ctx := s.Ctx()
@@ -62,6 +64,8 @@ func (s *ClientConfig) Test_ServedConfigReflectsOnConnect() {
 
 	s.Contains(st.RootDaemon.DNS.IncludeSuffixes, clientConfigSuffix,
 		"served dns.includeSuffixes should reach the connecting client")
+	s.Contains(st.RootDaemon.DNS.PreserveLocalClusterDNSNames, clientConfigLocalDNS,
+		"served dns.preserveLocalClusterDNSNames should reach the root daemon")
 	s.Contains(st.RootDaemon.AlsoProxy, clientConfigAlsoProxy,
 		"served routing.alsoProxySubnets should reach the connecting client")
 }

@@ -33,6 +33,11 @@ const (
 	slowDialResponse = 2 * time.Second
 )
 
+// DNSConnTTL keeps DNS forwarding endpoints alive throughout a lookup.
+func DNSConnTTL(lookupTimeout time.Duration) time.Duration {
+	return lookupTimeout + time.Second
+}
+
 // Limit selected-intercept dial responders so bursty workloads cannot create
 // unbounded goroutines and gRPC tunnels in the client daemon.
 const (
@@ -571,6 +576,12 @@ func dialRespond(ctx context.Context, tag Tag, tunnelProvider Provider, dr *rpc.
 	id := ConnID(dr.ConnId)
 	ctx, cancel := context.WithCancel(ctx)
 	respondStart := time.Now()
+	var slowLogged atomic.Bool
+	slowTimer := time.AfterFunc(slowDialResponse, func() {
+		slowLogged.Store(true)
+		clog.Warnf(ctx, "!! %s %s, dial response still active after %s for session %s", tag, id, time.Since(respondStart).Round(time.Millisecond), sessionID)
+	})
+	defer slowTimer.Stop()
 
 	tunnelStart := time.Now()
 	mt, err := tunnelProvider.Tunnel(ctx)

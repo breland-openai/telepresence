@@ -13,6 +13,7 @@ import (
 	rpc "github.com/telepresenceio/telepresence/rpc/v2/connector"
 	"github.com/telepresenceio/telepresence/rpc/v2/daemon"
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
+	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/remotefs"
 	"github.com/telepresenceio/telepresence/v2/pkg/errcat"
@@ -31,6 +32,7 @@ func (ik ingestKey) String() string {
 type ingest struct {
 	*manager.AgentInfo
 	ingestKey
+	agentMu          sync.RWMutex
 	wg               sync.WaitGroup
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -46,17 +48,30 @@ type ingest struct {
 	ownsMountPoint atomic.Bool
 }
 
-func (ig *ingest) podAccess(rd daemon.DaemonClient) *podAccess {
-	ni := ig.Containers[ig.container]
+func (ig *ingest) getAgentInfo() *manager.AgentInfo {
+	ig.agentMu.RLock()
+	defer ig.agentMu.RUnlock()
+	return ig.AgentInfo
+}
+
+func (ig *ingest) setAgentInfo(ai *manager.AgentInfo) {
+	ig.agentMu.Lock()
+	ig.AgentInfo = ai
+	ig.agentMu.Unlock()
+}
+
+func (ig *ingest) podAccess(ctx context.Context, rd daemon.DaemonClient) *podAccess {
+	ai := ig.getAgentInfo()
+	ni := ai.Containers[ig.container]
 	pa := &podAccess{
 		ctx:              ig.ctx,
 		localPorts:       ig.localPorts,
 		workload:         ig.workload,
-		namespace:        ig.Namespace,
+		namespace:        ai.Namespace,
 		container:        ig.container,
-		podIP:            ig.PodIp,
-		sftpPort:         ig.SftpPort,
-		ftpPort:          ig.FtpPort,
+		podIP:            ai.PodIp,
+		sftpPort:         ai.SftpPort,
+		ftpPort:          ai.FtpPort,
 		mountPoint:       ni.MountPoint,
 		clientMountPoint: ig.localMountPoint,
 		localMountPort:   ig.localMountPort,
@@ -65,22 +80,23 @@ func (ig *ingest) podAccess(rd daemon.DaemonClient) *podAccess {
 		wg:               &ig.wg,
 	}
 	// An ingest needs no direct agent path: its mounts reach the pod over the tunnel.
-	if err := pa.ensureAccess(ig.ctx, rd); err != nil {
+	if err := pa.ensureAccess(ctx, rd); err != nil {
 		clog.Infof(ig.ctx, "ingest %s continues without direct agent access: %v", ig.container, err)
 	}
 	return pa
 }
 
 func (ig *ingest) response() *rpc.IngestInfo {
-	cn := ig.Containers[ig.container]
+	ai := ig.getAgentInfo()
+	cn := ai.Containers[ig.container]
 	ii := &rpc.IngestInfo{
 		Workload:         ig.workload,
-		WorkloadKind:     ig.Kind,
+		WorkloadKind:     ai.Kind,
 		Container:        ig.container,
 		Namespace:        ig.namespace,
-		PodIp:            ig.PodIp,
-		SftpPort:         ig.SftpPort,
-		FtpPort:          ig.FtpPort,
+		PodIp:            ai.PodIp,
+		SftpPort:         ai.SftpPort,
+		FtpPort:          ai.FtpPort,
 		MountPoint:       cn.MountPoint,
 		Mounts:           cn.Mounts,
 		ClientMountPoint: ig.localMountPoint,
@@ -155,32 +171,12 @@ func (s *session) Ingest(ctx context.Context, rq *rpc.IngestRequest) (ir *rpc.In
 		namespace: ns,
 	}
 
-	// Fast path: an ingest already exists for this key -- or, when the
-	// container is unspecified, exactly one ingest exists for this
-	// workload+namespace.
-	if ik.container != "" {
-		if ig, loaded := s.currentIngests.Load(ik); loaded {
-			return ig.response(), nil
-		}
-	} else {
-		var found *ingest
-		s.currentIngests.Range(func(key ingestKey, ig *ingest) bool {
-			if key.workload != ik.workload || key.namespace != ik.namespace {
-				return true
-			}
-			if found != nil {
-				err = status.Error(codes.NotFound, fmt.Sprintf("workload %s has multiple ingests. Please specify which one to use", ik.workload))
-				return false
-			}
-			found = ig
-			return true
-		})
-		if err != nil {
-			return nil, err
-		}
-		if found != nil {
-			return found.response(), nil
-		}
+	existing, err := s.lookupIngest(ik)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		return existing.response(), nil
 	}
 
 	// Node-agent semantics via the pod cache: existence and node-agent flag
@@ -233,6 +229,9 @@ func (s *session) Ingest(ctx context.Context, rq *rpc.IngestRequest) (ir *rpc.In
 		return nil, err
 	}
 	ai := as.Agents[0]
+	if err := agentconfig.NormalizeAgentInfo(ai); err != nil {
+		return nil, err
+	}
 	// A sidecar returned when a node-agent was explicitly requested must
 	// never be used silently: its env/mounts assume no sidecar was
 	// injected, so a mismatch here means the traffic-manager did not
@@ -289,11 +288,14 @@ func (s *session) Ingest(ctx context.Context, rq *rpc.IngestRequest) (ir *rpc.In
 }
 
 func (s *session) startIngestPodAccess(ctx context.Context, ig *ingest, initial bool) {
-	err := s.WithRootClient(ctx, func(_ context.Context, rd daemon.DaemonClient) error {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(ig.ctx, cancel)
+	defer func() { stop(); cancel() }()
+	err := s.WithRootClient(ctx, func(ctx context.Context, rd daemon.DaemonClient) error {
 		if initial {
-			s.ingestTracker.initialStart(ig.podAccess(rd))
+			s.ingestTracker.initialStart(ig.podAccess(ctx, rd))
 		} else {
-			s.ingestTracker.start(ig.podAccess(rd))
+			s.ingestTracker.start(ig.podAccess(ctx, rd))
 		}
 		return nil
 	})
@@ -325,51 +327,41 @@ func (s *session) getCurrentIngests() []*rpc.IngestInfo {
 	return ingests
 }
 
-// findIngest returns the ingest matching the given (workload, container, namespace) tuple.
-// Empty containerName or namespace is treated as "any" — the ingest is resolved by scanning
-// currentIngests, and an error is returned if the remaining filters match more than one ingest.
-func (s *session) findIngest(workloadName, containerName, namespace string) (ig *ingest, err error) {
-	if containerName == "" || namespace == "" {
-		var foundIngest *ingest
-		var err error
-
-		s.currentIngests.Range(func(key ingestKey, value *ingest) bool {
-			if key.workload != workloadName {
-				return true
-			}
-			if containerName != "" && key.container != containerName {
-				return true
-			}
-			if namespace != "" && key.namespace != namespace {
-				return true
-			}
-			if foundIngest != nil {
-				err = status.Error(codes.NotFound, fmt.Sprintf("workload %s has multiple ingests. Please specify which one to use", workloadName))
-				return false
-			}
-			foundIngest = value
+// lookupIngest resolves an optional container or namespace and reports ambiguous matches.
+func (s *session) lookupIngest(ik ingestKey) (*ingest, error) {
+	if ik.container != "" && ik.namespace != "" {
+		existing, _ := s.currentIngests.Load(ik)
+		return existing, nil
+	}
+	var found *ingest
+	var err error
+	s.currentIngests.Range(func(key ingestKey, value *ingest) bool {
+		if key.workload != ik.workload || (ik.container != "" && key.container != ik.container) || (ik.namespace != "" && key.namespace != ik.namespace) {
 			return true
-		})
-		if err != nil {
-			return nil, err
 		}
-
-		if foundIngest == nil {
-			return nil, status.Error(codes.NotFound, fmt.Sprintf("no ingest found for workload %s", workloadName))
+		if found != nil {
+			err = status.Errorf(codes.NotFound, "workload %s has multiple ingests. Please specify which one to use", ik.workload)
+			return false
 		}
+		found = value
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return found, nil
+}
 
-		return foundIngest, nil
+func (s *session) findIngest(workloadName, containerName, namespace string) (*ingest, error) {
+	ik := ingestKey{workload: workloadName, container: containerName, namespace: namespace}
+	found, err := s.lookupIngest(ik)
+	if found != nil || err != nil {
+		return found, err
 	}
-
-	ik := ingestKey{
-		workload:  workloadName,
-		container: containerName,
-		namespace: namespace,
+	if containerName == "" || namespace == "" {
+		return nil, status.Errorf(codes.NotFound, "no ingest found for workload %s", workloadName)
 	}
-	if ig, ok := s.currentIngests.Load(ik); ok {
-		return ig, nil
-	}
-	return nil, status.Error(codes.NotFound, fmt.Sprintf("ingest %s doesn't exist", ik))
+	return nil, status.Errorf(codes.NotFound, "ingest %s doesn't exist", ik)
 }
 
 func (s *session) getIngest(rq *rpc.IngestIdentifier) (ig *ingest, err error) {
@@ -416,7 +408,7 @@ func (s *session) removeIngestMount(ig *ingest) {
 // The call is best-effort: the manager's reconciler reaps orphaned node-agent Jobs on its
 // own, so a failed or skipped release must never fail the leave.
 func (s *session) releaseNodeAgentIfLast(ig *ingest) {
-	if ig.AgentInfo == nil || !ig.NodeAgent {
+	if !ig.getAgentInfo().GetNodeAgent() {
 		return
 	}
 	stillClaimed := false

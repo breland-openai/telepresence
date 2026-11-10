@@ -1,4 +1,4 @@
-# syntax = docker/dockerfile:1.3
+# syntax = docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 # Copyright 2020-2022 Datawire. All rights reserved.
 #
@@ -14,20 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM --platform=$BUILDPLATFORM golang:alpine as tel2-build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS tel2-build
 
 RUN apk add --no-cache gcc musl-dev fuse-dev libcap binutils-gold
 
-WORKDIR telepresence
+WORKDIR /go/telepresence
 COPY go.mod go.sum .
 COPY cmd/ cmd/
 COPY pkg/ pkg/
 COPY rpc/ rpc/
 COPY charts/ charts/
-COPY build-output/version.txt .
+# This ignored input must also be present when BuildKit reads the source directly from Git.
+ADD --checksum=sha256:e1d22fd4a24696a48ed62cbc5facd39b3ff64293f8605b0dc6e7df0f32ed0c40 --chmod=0644 https://raw.githubusercontent.com/yannh/kubernetes-json-schema/a6f9a32d2ccb64b6e4f5b41419b9c2e8ee0cce18/v1.37.1-standalone/_definitions.json charts/telepresence-oss/k8s-defs.json
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG TELEPRESENCE_VERSION
 
 # TEL_COVER is "-cover" when the image is built with `make tel2-image
 # TELEPRESENCE_COVER=1`, and empty (today's behavior) otherwise.
@@ -36,10 +38,12 @@ ARG TEL_COVER=
 RUN \
     --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    GOOS=$TARGETOS GOARCH=$TARGETARCH go build $TEL_COVER -o /usr/local/bin/ -trimpath -ldflags="-s -w -X=$(go list ./pkg/version).Version=$(cat version.txt)" ./cmd/traffic/...
+    test -n "$TELEPRESENCE_VERSION" && \
+    test "$(go list -m -f '{{.Version}}' k8s.io/client-go)" = v0.37.1 && \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build $TEL_COVER -o /usr/local/bin/ -trimpath -ldflags="-s -w -X=$(go list ./pkg/version).Version=$TELEPRESENCE_VERSION" ./cmd/traffic/...
 
 # The tel2 target is the one that gets published. It aims to be a small as possible.
-FROM alpine as tel2
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS tel2
 
 RUN apk add --no-cache ca-certificates
 

@@ -80,7 +80,8 @@ telepresence gather-logs --daemons=None
 	flags.BoolVar(&gl.trafficManager, "traffic-manager", true, "If you want to collect logs from the traffic-manager")
 	flags.StringVar(&gl.trafficAgents, "traffic-agents", "all", "Traffic-agents to collect logs from: all, name substring, None")
 	flags.BoolVarP(&gl.anon, "anonymize", "a", false, "To anonymize pod names + namespaces from the logs")
-	flags.BoolVarP(&gl.podYaml, "get-pod-yaml", "y", false, "Get the yaml of any pods you are getting logs for")
+	flags.BoolVarP(&gl.podYaml, "get-pod-yaml", "y", false,
+		"Export the YAML of collected pods. Explicitly includes environment values and other potentially sensitive pod configuration")
 	return cmd
 }
 

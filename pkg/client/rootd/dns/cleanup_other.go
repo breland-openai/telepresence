@@ -8,3 +8,8 @@ import "context"
 // a previous root daemon process.
 func CleanupRouting(context.Context) {
 }
+
+// CleanupStaleRouting removes stale platform-specific DNS redirects.
+func CleanupStaleRouting(context.Context) error {
+	return nil
+}

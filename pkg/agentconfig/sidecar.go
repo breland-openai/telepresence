@@ -3,8 +3,10 @@ package agentconfig
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"time"
 
@@ -409,13 +411,32 @@ func LoopbackFor(ip netip.Addr) netip.Addr {
 
 // Clone returns a deep copy of the Sidecar.
 func (s *Sidecar) Clone() *Sidecar {
+	if s == nil {
+		return nil
+	}
 	cs := *s
-	for ci, cn := range cs.Containers {
+	cs.PullSecrets = slices.Clone(s.PullSecrets)
+	cs.Resources = s.Resources.DeepCopy()
+	cs.InitResources = s.InitResources.DeepCopy()
+	cs.MountPolicies = maps.Clone(s.MountPolicies)
+	cs.MeshDialSubnets = slices.Clone(s.MeshDialSubnets)
+	cs.SecurityContext = s.SecurityContext.DeepCopy()
+	cs.InitSecurityContext = s.InitSecurityContext.DeepCopy()
+	cs.Containers = slices.Clone(s.Containers)
+	for ci, cn := range s.Containers {
+		if cn == nil {
+			continue
+		}
 		ccn := *cn
+		ccn.Mounts = maps.Clone(cn.Mounts)
+		ccn.MountPaths = slices.Clone(cn.MountPaths)
+		ccn.Intercepts = slices.Clone(cn.Intercepts)
 		cs.Containers[ci] = &ccn
-		for ii, ic := range ccn.Intercepts {
-			cic := *ic
-			ccn.Intercepts[ii] = &cic
+		for ii, ic := range cn.Intercepts {
+			if ic != nil {
+				cic := *ic
+				ccn.Intercepts[ii] = &cic
+			}
 		}
 	}
 	return &cs

@@ -29,6 +29,17 @@ type suiteState struct {
 	state *State
 }
 
+func newTestState(t *testing.T, ctx context.Context) *State {
+	t.Helper()
+	ctx, cancel := context.WithCancel(ctx)
+	g := log.NewGroup(ctx)
+	t.Cleanup(func() {
+		cancel()
+		require.NoError(t, g.Wait())
+	})
+	return NewState(ctx, g, nil)
+}
+
 func (s *suiteState) SetupTest() {
 	s.ctx = testutil.NewContext(s.T(), false)
 	s.state = &State{
@@ -71,8 +82,7 @@ func (s *suiteState) TestStateInternal() {
 		clock := &FakeClock{}
 		m := mutator.NewWatcher()
 		ctx = mutator.WithMap(ctx, m)
-		g := log.NewGroup(ctx)
-		st := NewState(ctx, g, nil)
+		st := newTestState(t, ctx)
 
 		h, err := st.AddAgent(ctx, helloAgent, nil, clock.Now())
 		require.NoError(t, err)
@@ -94,8 +104,7 @@ func (s *suiteState) TestStateInternal() {
 
 		clock := &FakeClock{}
 		epoch := clock.Now()
-		g := log.NewGroup(ctx)
-		s := NewState(ctx, g, nil)
+		s := newTestState(t, ctx)
 
 		s1 := s.AddClient(testClients["alice"], nil, clock.Now())
 		s2 := s.AddClient(testClients["bob"], nil, clock.Now())

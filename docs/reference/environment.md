@@ -35,6 +35,42 @@ There are several options available to do this:
 
    This will ensure that the environment is propagated to the container. Will also work for `--docker-build` and `--docker-debug`.
 
+## Environment values in output
+
+Remote environment values are hidden by default, regardless of the variable name.
+Structured output from `list`, `ingest`, and detailed `intercept`, `replace`, and
+`wiretap` output retains variable names and replaces each value with `[REDACTED]`.
+This applies to JSON, YAML, JSON streams, and the deprecated `--output` formats.
+Other metadata and the output structure remain unchanged. Plain text output does
+not list environment values; `--debug` and debug logging do not enable them.
+
+Use `--show-env` to include values in structured output. For example:
+
+```sh
+telepresence list --format json --show-env
+telepresence intercept example --detailed-output --format json --show-env
+```
+
+**Warning:** Values can contain credentials. Only enable this flag when the output
+destination is suitable for sensitive data.
+
+The following exports are also explicit opt-ins, limited to their destination:
+
+- `--env-file FILE` and `--env-json FILE` write actual values without needing
+  `--show-env`. Set `FILE` to `-` to write them to stdout. These flags do not enable
+  values in the command's other output. `--env-syntax` alone is not an opt-in.
+- `gather-logs --get-pod-yaml` includes pod manifests, including literal environment
+  values and other sensitive configuration. `--anonymize` only anonymizes names
+  and namespaces; it does not remove values.
+- Compose configuration exports require `--show-env`: `compose config`,
+  `compose bridge`, `compose publish`, and `compose build --print`. This prevents exporting the
+  generated runtime configuration by accident.
+
+Rejected environment values are excluded from error messages even after opt-in.
+Runtime environments passed to local commands and Docker remain unchanged.
+Commands you launch and application logs can still print their own environment;
+Telepresence does not filter their output or scrub previously written log files.
+
 ## Telepresence Environment Variables
 
 Telepresence adds some useful environment variables in addition to the ones imported from the attached container:

@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -17,11 +19,12 @@ const (
 	versionMethod = "/telepresence.manager.Manager/Version"
 	// watchQuicBackendsMethod is consumed by the quic-forwarder, which runs without
 	// cluster credentials.
-	watchQuicBackendsMethod = "/telepresence.manager.Manager/WatchQuicBackends"
-	healthMethodPrefix      = "/grpc.health.v1.Health/"
-	authorizationHeader     = "authorization"
-	bearerPrefix            = "bearer "
-	bearerPrefixLen         = len(bearerPrefix)
+	watchQuicBackendsMethod    = "/telepresence.manager.Manager/WatchQuicBackends"
+	watchInterceptRoutesMethod = "/telepresence.manager.Manager/WatchInterceptRoutes"
+	healthMethodPrefix         = "/grpc.health.v1.Health/"
+	authorizationHeader        = "authorization"
+	bearerPrefix               = "bearer "
+	bearerPrefixLen            = len(bearerPrefix)
 )
 
 // unauthenticatedMessage is returned to callers rejected in ModeEnforcing for
@@ -29,24 +32,36 @@ const (
 const unauthenticatedMessage = "this traffic-manager requires an authenticated caller; the telepresence client must present a Kubernetes bearer token"
 
 // Interceptor authenticates bearer tokens on incoming gRPC calls. Its behavior is
-// governed by a Mode: ModeDisabled skips authentication entirely, ModePermissive
-// authenticates but never rejects a call, and ModeEnforcing rejects calls that
-// lack a valid token.
+// governed by a Mode: ModeDisabled skips general authentication, ModePermissive
+// authenticates without generally rejecting failures, and ModeEnforcing rejects
+// calls that lack a valid token. Internal routing observers always require a
+// Kubernetes token for the traffic-manager audience. Canceled calls never reach
+// application handlers.
 type Interceptor struct {
-	auth *Authenticator
-	mode Mode
+	auth                    *Authenticator
+	mode                    Mode
+	invalidTokenWarnings    *rate.Limiter
+	reviewAdmissionWarnings *rate.Limiter
 }
 
 // NewInterceptor creates an Interceptor that authenticates calls using a, behaving
 // according to mode.
 func NewInterceptor(a *Authenticator, mode Mode) *Interceptor {
-	return &Interceptor{auth: a, mode: mode}
+	return &Interceptor{
+		auth:                    a,
+		mode:                    mode,
+		invalidTokenWarnings:    rate.NewLimiter(rate.Every(10*time.Second), 1),
+		reviewAdmissionWarnings: rate.NewLimiter(rate.Every(10*time.Second), 1),
+	}
 }
 
 // Unary returns a grpc.UnaryServerInterceptor that authenticates the call.
 func (i *Interceptor) Unary() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if i.mode == ModeDisabled || skipAuth(info.FullMethod) {
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+		if skipAuth(info.FullMethod) || i.mode == ModeDisabled && !alwaysAuthenticate(info.FullMethod) {
 			return handler(ctx, req)
 		}
 		ctx, err := i.authenticate(ctx, info.FullMethod)
@@ -60,7 +75,10 @@ func (i *Interceptor) Unary() grpc.UnaryServerInterceptor {
 // Stream returns a grpc.StreamServerInterceptor that authenticates the call.
 func (i *Interceptor) Stream() grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if i.mode == ModeDisabled || skipAuth(info.FullMethod) {
+		if err := ss.Context().Err(); err != nil {
+			return status.FromContextError(err).Err()
+		}
+		if skipAuth(info.FullMethod) || i.mode == ModeDisabled && !alwaysAuthenticate(info.FullMethod) {
 			return handler(srv, ss)
 		}
 		ctx, err := i.authenticate(ss.Context(), info.FullMethod)
@@ -75,12 +93,17 @@ func skipAuth(method string) bool {
 	return method == versionMethod || method == watchQuicBackendsMethod || strings.HasPrefix(method, healthMethodPrefix)
 }
 
+func alwaysAuthenticate(method string) bool {
+	return method == watchInterceptRoutesMethod
+}
+
 // authenticate reads the bearer token from ctx's incoming metadata and returns a context carrying
-// the resulting Principal. In ModePermissive, failures are logged and never fatal to the call. In
-// ModeEnforcing, a missing or invalid token is rejected and an infrastructure failure is reported
-// as Unavailable.
+// the resulting Principal. In ModePermissive, authentication failures are logged but allowed.
+// In ModeEnforcing and for routing observers, missing or invalid tokens are rejected and
+// infrastructure failures return Unavailable. A canceled authentication wait returns the
+// caller's context status in either mode.
 func (i *Interceptor) authenticate(ctx context.Context, method string) (context.Context, error) {
-	enforcing := i.mode == ModeEnforcing
+	enforcing := i.mode == ModeEnforcing || alwaysAuthenticate(method)
 	token, present := bearerTokenFrom(ctx)
 	if token == "" {
 		if present {
@@ -93,18 +116,34 @@ func (i *Interceptor) authenticate(ctx context.Context, method string) (context.
 		}
 		return ctx, nil
 	}
-	p, err := i.auth.Authenticate(ctx, token)
+	var p *Principal
+	var err error
+	if alwaysAuthenticate(method) {
+		p, err = i.auth.AuthenticateManagerKubernetes(ctx, token)
+	} else {
+		p, err = i.auth.Authenticate(ctx, token)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctx, status.FromContextError(ctxErr).Err()
+	}
 	switch {
 	case err == nil:
 		return WithPrincipal(ctx, p), nil
 	case errors.Is(err, ErrInvalidToken):
-		clog.Warnf(ctx, "call to %s presented an invalid bearer token", method)
+		if i.invalidTokenWarnings.Allow() {
+			clog.Warnf(ctx, "call to %s presented an invalid bearer token (warnings rate-limited)", method)
+		}
 		if enforcing {
 			return ctx, status.Error(codes.Unauthenticated, unauthenticatedMessage)
 		}
 	case errors.Is(err, errTooManyReviews):
-		clog.Warnf(ctx, "call to %s was rejected by review admission", method)
-		return ctx, status.Error(codes.ResourceExhausted, "too many authentication attempts")
+		if i.reviewAdmissionWarnings.Allow() {
+			clog.Warnf(ctx, "call to %s was rejected by review admission (warnings rate-limited)", method)
+		}
+		if enforcing {
+			return ctx, status.Error(codes.ResourceExhausted, "too many authentication attempts")
+		}
+		ctx = WithAuthUnavailable(ctx)
 	default:
 		clog.Errorf(ctx, "token authentication unavailable for %s: %v", method, err)
 		if enforcing {

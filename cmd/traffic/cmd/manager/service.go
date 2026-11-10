@@ -28,6 +28,7 @@ import (
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/yaml"
 
 	"github.com/telepresenceio/clog"
@@ -78,6 +79,7 @@ type service struct {
 	state              *state.State
 	clusterInfo        cluster.Info
 	configWatcher      config.Watcher
+	authenticator      *auth.Authenticator
 	authorizer         *auth.Authorizer
 	authMode           auth.Mode
 	authGrant          auth.Grant
@@ -103,7 +105,7 @@ type service struct {
 	quicDiscovery *quictunnel.Discovery
 
 	// mintedTokens holds the bearer tokens the x509 auth listener has issued, shared
-	// with the Authenticator constructed in serveHTTP so a token minted there is
+	// with the Authenticator so a token minted there is
 	// accepted on the regular gRPC channel. It exists regardless of whether the
 	// listener is enabled; an always-empty store is harmless.
 	mintedTokens *auth.MintedTokens
@@ -132,13 +134,18 @@ func checkCompat(ctx context.Context, name, requiredVersion string) error {
 	return nil
 }
 
-func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher) (Service, error) {
+func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, tokenReviewClient kubernetes.Interface) (Service, error) {
 	ret := &service{
 		id:            uuid.New().String(),
 		configWatcher: configWatcher,
 		authorizer:    auth.NewAuthorizer(k8sapi.GetK8sInterface(ctx)),
 		mintedTokens:  auth.NewMintedTokens(),
 	}
+	ret.authenticator = auth.NewAuthenticator(tokenReviewClient,
+		auth.WithMintedTokens(ret.mintedTokens),
+		auth.WithMetrics(auth.NewMetrics("internal")),
+		auth.WithInternalReviewAdmission(),
+	)
 
 	// These are context-dependent, so build them once the pool is up
 	var err error
@@ -324,9 +331,30 @@ func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClient
 		clog.Warnf(ctx, "reconnect: %v (not enforced)", err)
 	}
 
+	restoredAgents := info.Agents
+	if legacyForkClient(client) && len(restoredAgents) != 0 {
+		// Legacy compact snapshots encode their omitted-environment marker at
+		// the field number now used by the QUIC port. They therefore look
+		// complete after decoding, so let the real traffic-agents reconnect
+		// instead of restoring incomplete client-owned snapshots.
+		clog.Debugf(ctx, "Not restoring %d agents supplied by a legacy client; waiting for the traffic-agents to reconnect", len(restoredAgents))
+		restoredAgents = nil
+	}
+	for _, agent := range restoredAgents {
+		if agent == nil {
+			return nil, status.Error(codes.InvalidArgument, "missing agent information")
+		}
+		if err := agentconfig.NormalizeAgentInfo(agent); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid restored agent information: %v", err)
+		}
+	}
 	now := time.Now()
+	intercepts, err := s.reviewRestoredIntercepts(ctx, info, now)
+	if err != nil {
+		return nil, err
+	}
 	st.RestoreClient(sessionID, client, auth.PrincipalFrom(ctx), now)
-	agents := slices.DeleteFunc(slices.Clone(info.Agents), func(agent *rpc.AgentInfo) bool {
+	agents := slices.DeleteFunc(slices.Clone(restoredAgents), func(agent *rpc.AgentInfo) bool {
 		if agent.GetContainerEnvironmentOmitted() {
 			// Compact watch snapshots are intentionally incomplete. Restoring
 			// one after a manager restart would make the omitted container
@@ -343,10 +371,6 @@ func (s *service) ReconnectClient(ctx context.Context, info *rpc.ReconnectClient
 	})
 	st.RestoreAgents(agents, now)
 
-	intercepts, err := s.reviewRestoredIntercepts(ctx, info, now)
-	if err != nil {
-		return nil, err
-	}
 	st.RestoreIntercepts(ctx, intercepts, now)
 	return &empty.Empty{}, nil
 }
@@ -390,6 +414,13 @@ func (s *service) reviewRestoredIntercepts(
 			clog.Infof(ctx, "Not restoring intercept %s: %v", spec.Name, err)
 			continue
 		}
+		if agentconfig.UsesForkAgentFields(info.GetClient().GetVersion()) && len(intercept.ServiceWorkloads) > 0 {
+			// Older fork clients carried the expansion in ServiceWorkloads. Only
+			// use its presence; the watcher rebuilds membership from Kubernetes.
+			spec.SharedService = true
+		}
+		spec.SharedService = spec.SharedService && !spec.NodeAgent && !spec.Replace && spec.Mechanism == "http" &&
+			spec.ServiceUid != "" && (spec.ServicePort != 0 || spec.ServicePortName != "")
 		accepted = append(accepted, &rpc.InterceptInfo{
 			Id:            fmt.Sprintf("%s:%s", sessionID, spec.Name),
 			Spec:          spec,
@@ -406,6 +437,9 @@ func (s *service) ArriveAsAgent(ctx context.Context, agent *rpc.AgentInfo) (*rpc
 	clog.Debugf(ctx, "Name %s, IP %s", agent.PodName, agent.PodIp)
 	if val := validateAgent(agent); val != "" {
 		return nil, status.Error(codes.InvalidArgument, val)
+	}
+	if err := normalizeLegacyAgentInfo(agent); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid legacy agent information: %v", err)
 	}
 
 	for _, cn := range agent.Containers {
@@ -433,6 +467,9 @@ func (s *service) ReconnectAgent(ctx context.Context, rq *rpc.ReconnectAgentRequ
 	sessionID := tunnel.SessionID(rq.GetSession().SessionId)
 	if _, _, err := s.ensureAgentSession(ctx, rq.Session); err != nil && status.Code(err) != codes.NotFound {
 		return nil, err
+	}
+	if err := normalizeLegacyAgentInfo(rq.Agent); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid legacy agent information: %v", err)
 	}
 	principal, mismatch := verifiedAgentPrincipal(ctx, rq.Agent)
 	if mismatch && s.authMode == auth.ModeEnforcing {
@@ -554,13 +591,15 @@ func (s *service) Depart(ctx context.Context, session *rpc.SessionInfo) (*empty.
 		if err := agentOwnershipError(ctx, sessionID, agent); err != nil {
 			return nil, err
 		}
+		go s.state.RemoveAgentSession(agent)
+		return &empty.Empty{}, nil
 	} else if client := s.state.GetClient(sessionID); client != nil {
 		if err := state.ClientOwnershipError(ctx, sessionID, client); err != nil {
 			return nil, err
 		}
+		// There's no reason for the caller to wait for this removal to complete.
+		go s.state.RemoveSession(context.WithoutCancel(ctx), sessionID)
 	}
-	// There's no reason for the caller to wait for this removal to complete.
-	go s.state.RemoveSession(context.WithoutCancel(ctx), sessionID)
 	return &empty.Empty{}, nil
 }
 
@@ -952,7 +991,7 @@ func (s *service) WatchAgents(session *rpc.SessionInfo, stream grpc.ServerStream
 		return err
 	}
 	ns := clientInfo.Namespace
-	return s.watchAgents(ctx, clientInfo.SupportsCompactAgentInfo,
+	return s.watchAgents(ctx, clientInfo.SupportsCompactAgentInfo, legacyForkClient(clientInfo.ClientInfo), agentconfig.UsesForkAgentFields(clientInfo.Version),
 		func(_ tunnel.SessionID, a *state.AgentSession) bool { return a.Namespace == ns }, stream)
 }
 
@@ -994,13 +1033,14 @@ func agentInfoForWatch(ai *rpc.AgentInfo, compact bool) *rpc.AgentInfo {
 		Containers:                  containers,
 		NodeAgent:                   ai.NodeAgent,
 		QuicPort:                    ai.QuicPort,
+		InterceptTargets:            ai.InterceptTargets,
 		ContainerEnvironmentOmitted: true,
 	}
 }
 
 func (s *service) watchAgents(
 	ctx context.Context,
-	compact bool,
+	compact, legacy, forkFields bool,
 	includeAgent func(tunnel.SessionID, *state.AgentSession) bool,
 	stream grpc.ServerStreamingServer[rpc.AgentInfoSnapshot],
 ) error {
@@ -1029,7 +1069,11 @@ func (s *service) watchAgents(
 		for _, agentSessionID := range agentSessionIDs {
 			ag, ok := snapshot.Load(agentSessionID)
 			if ok && !m.IsInactive(types.UID(ag.PodUid)) {
-				agents = append(agents, agentInfoForWatch(ag.AgentInfo, compact))
+				projected, err := agentInfoForClientWatch(ag.AgentInfo, compact, legacy, forkFields)
+				if err != nil {
+					return err
+				}
+				agents = append(agents, projected)
 			}
 		}
 		if firstSnap {
@@ -1065,6 +1109,8 @@ func (s *service) WatchAgentsDelta(session *rpc.SessionInfo, stream grpc.ServerS
 	}
 	ns := clientInfo.Namespace
 	compact := clientInfo.SupportsCompactAgentInfo
+	legacy := legacyForkClient(clientInfo.ClientInfo)
+	forkFields := agentconfig.UsesForkAgentFields(clientInfo.Version)
 	deltaCh := s.state.WatchAgents(ctx, func(_ tunnel.SessionID, a *state.AgentSession) bool { return a.Namespace == ns })
 	sessionDone, err := s.state.SessionDone(managerutil.GetSessionID(ctx))
 	if err != nil {
@@ -1081,7 +1127,11 @@ func (s *service) WatchAgentsDelta(session *rpc.SessionInfo, stream grpc.ServerS
 			if rl := len(delta.Upserts); rl > 0 {
 				aid.Upserts = make(map[string]*rpc.AgentInfo, rl)
 				for k, v := range delta.Upserts {
-					aid.Upserts[string(k)] = agentInfoForWatch(v.AgentInfo, compact)
+					projected, err := agentInfoForClientWatch(v.AgentInfo, compact, legacy, forkFields)
+					if err != nil {
+						return err
+					}
+					aid.Upserts[string(k)] = projected
 				}
 			}
 			if rl := len(delta.Removals); rl > 0 {
@@ -1234,12 +1284,13 @@ func (s *service) WatchIntercepts(session *rpc.SessionInfo, stream grpc.ServerSt
 	if err != nil {
 		return err
 	}
+	projection := s.interceptWatchProjection(session)
 	snapshot := cache.NewClientMap[string, *state.Intercept]()
 	return snapshot.Watch(sessionDone, deltaCh, func() error {
 		clog.Debug(ctx, "Sending update")
 		intercepts := make([]*rpc.InterceptInfo, 0, snapshot.Size())
 		snapshot.Range(func(_ string, intercept *state.Intercept) bool {
-			intercepts = append(intercepts, intercept.InterceptInfo)
+			intercepts = append(intercepts, watcherInterceptInfo(intercept.InterceptInfo, projection))
 			return true
 		})
 		sort.Slice(intercepts, func(i, j int) bool {
@@ -1261,6 +1312,7 @@ func (s *service) WatchInterceptsDelta(session *rpc.SessionInfo, stream grpc.Ser
 	if err != nil {
 		return err
 	}
+	projection := s.interceptWatchProjection(session)
 	for {
 		select {
 		case <-ctx.Done():
@@ -1272,7 +1324,7 @@ func (s *service) WatchInterceptsDelta(session *rpc.SessionInfo, stream grpc.Ser
 			if rl := len(delta.Upserts); rl > 0 {
 				iid.Upserts = make(map[string]*rpc.InterceptInfo, rl)
 				for k, v := range delta.Upserts {
-					iid.Upserts[k] = v.InterceptInfo
+					iid.Upserts[k] = watcherInterceptInfo(v.InterceptInfo, projection)
 				}
 			}
 			clog.Debugf(ctx, "Sending %d upserts and %d removals", len(iid.Upserts), len(iid.Removals))
@@ -1281,6 +1333,56 @@ func (s *service) WatchInterceptsDelta(session *rpc.SessionInfo, stream grpc.Ser
 				return err
 			}
 		}
+	}
+}
+
+type interceptWatchProjection int
+
+const (
+	clientProjection interceptWatchProjection = iota
+	agentProjection
+	forkAgentProjection
+)
+
+func (s *service) interceptWatchProjection(session *rpc.SessionInfo) interceptWatchProjection {
+	agent := s.state.GetAgent(tunnel.SessionID(session.GetSessionId()))
+	if agent == nil {
+		return clientProjection
+	}
+	if agentconfig.UsesForkAgentFields(agent.Version) || legacyForkVersion(agent.Version) {
+		return forkAgentProjection
+	}
+	return agentProjection
+}
+
+func watcherInterceptInfo(info *rpc.InterceptInfo, projection interceptWatchProjection) *rpc.InterceptInfo {
+	if projection == clientProjection {
+		return info
+	}
+	spec := info.Spec
+	if projection == forkAgentProjection && spec.GetServiceUid() != "" && !spec.SharedService {
+		// Older fork agents select by Service UID whenever one is present.
+		// Send the primary container port for a single-workload fallback.
+		spec = proto.CloneOf(spec)
+		spec.ServiceUid = ""
+		spec.ServicePortName = ""
+		spec.ServicePort = 0
+	}
+	return &rpc.InterceptInfo{
+		Spec:              spec,
+		Id:                info.Id,
+		ClientSession:     info.ClientSession,
+		Disposition:       info.Disposition,
+		Message:           info.Message,
+		PodName:           info.PodName,
+		ApiPort:           info.ApiPort,
+		PodIp:             info.PodIp,
+		SftpPort:          info.SftpPort,
+		FtpPort:           info.FtpPort,
+		ClientMountPoint:  info.ClientMountPoint,
+		MechanismArgsDesc: info.MechanismArgsDesc,
+		ModifiedAt:        info.ModifiedAt,
+		ServiceWorkloads:  info.ServiceWorkloads,
 	}
 }
 
@@ -1406,8 +1508,12 @@ func (s *service) EnsureAgent(ctx context.Context, request *rpc.EnsureAgentReque
 		return nil, errors.Errorf(codes.Internal, "failed to ensure agent for workload %s: no agents became active", request.Name)
 	}
 	rpcAs := make([]*rpc.AgentInfo, len(as))
+	forkFields := agentconfig.UsesForkAgentFields(client.Version)
 	for i, a := range as {
-		rpcAs[i] = a.AgentInfo
+		rpcAs[i], err = agentconfig.AgentInfoForPeer(a.AgentInfo, forkFields)
+		if err != nil {
+			return nil, err
+		}
 	}
 	lastActivity := time.Now()
 	if client.Mark(lastActivity) {
@@ -2369,7 +2475,10 @@ func (s *service) updateTrafficManagerConfigMap(ctx context.Context) error {
 
 func (s *service) ensureClientSession(ctx context.Context, sessionInfo *rpc.SessionInfo) (context.Context, *state.ClientSession, error) {
 	ctx = managerutil.WithSessionInfo(ctx, sessionInfo)
-	sessionID := tunnel.SessionID(sessionInfo.SessionId)
+	sessionID := tunnel.SessionID(sessionInfo.GetSessionId())
+	if sessionID == "" {
+		return ctx, nil, errors.Errorf(codes.InvalidArgument, "a session id is required")
+	}
 	session := s.state.GetClient(sessionID)
 	if session == nil {
 		return ctx, nil, errors.Errorf(codes.NotFound, "Client session %q not found", sessionID)

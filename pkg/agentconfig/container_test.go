@@ -1,7 +1,10 @@
 package agentconfig
 
 import (
+	"context"
+	"reflect"
 	"testing"
+	"time"
 
 	core "k8s.io/api/core/v1"
 )
@@ -126,6 +129,82 @@ func TestAgentSecurityContextIgnoresOwnContainersOnReinjection(t *testing.T) {
 	}
 	if sc.RunAsGroup == nil || *sc.RunAsGroup != DefaultAgentGID {
 		t.Fatalf("RunAsGroup = %v, want %d", sc.RunAsGroup, DefaultAgentGID)
+	}
+}
+
+func TestAgentContainerPreStopDrain(t *testing.T) {
+	tests := []struct {
+		name        string
+		timeout     time.Duration
+		gracePeriod *int64
+		want        string
+	}{
+		{
+			name:    "disabled",
+			timeout: 0,
+		},
+		{
+			name:    "negative timeout",
+			timeout: -time.Second,
+		},
+		{
+			name:    "default grace period",
+			timeout: 2 * time.Minute,
+			want:    "25s",
+		},
+		{
+			name:        "configured timeout fits grace period",
+			timeout:     2 * time.Minute,
+			gracePeriod: new(int64(1890)),
+			want:        "2m0s",
+		},
+		{
+			name:        "configured grace period caps timeout",
+			timeout:     2 * time.Minute,
+			gracePeriod: new(int64(60)),
+			want:        "55s",
+		},
+		{
+			name:        "five second grace period disables hook",
+			timeout:     time.Minute,
+			gracePeriod: new(int64(5)),
+		},
+		{
+			name:        "short grace period disables hook",
+			timeout:     time.Minute,
+			gracePeriod: new(int64(3)),
+		},
+		{
+			name:        "zero grace period disables hook",
+			timeout:     time.Minute,
+			gracePeriod: new(int64(0)),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := scBuilder(nil, nil, nil)
+			builder.PreStopDrainTimeout = tt.timeout
+			builder.Pod.Spec.TerminationGracePeriodSeconds = tt.gracePeriod
+
+			container, _, err := builder.AgentContainer(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.want == "" {
+				if container.Lifecycle != nil {
+					t.Fatalf("unexpected lifecycle: %#v", container.Lifecycle)
+				}
+				return
+			}
+			if container.Lifecycle == nil || container.Lifecycle.PreStop == nil || container.Lifecycle.PreStop.Exec == nil {
+				t.Fatal("missing preStop exec handler")
+			}
+			want := []string{"/usr/local/bin/traffic", "agent-drain", tt.want}
+			if got := container.Lifecycle.PreStop.Exec.Command; !reflect.DeepEqual(got, want) {
+				t.Fatalf("preStop command = %q, want %q", got, want)
+			}
+		})
 	}
 }
 

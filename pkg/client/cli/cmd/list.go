@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/telepresence/rpc/v2/connector"
@@ -14,6 +15,7 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/ann"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/connect"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/daemon"
+	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/env"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/intercept"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/output"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/progress"
@@ -33,6 +35,7 @@ type listCommand struct {
 	inclusions [4]bool
 	onlyAgents bool
 	debug      bool
+	showEnv    bool
 	namespace  string
 	watch      bool
 }
@@ -51,6 +54,7 @@ func list() *cobra.Command {
 		ValidArgsFunction: cobra.NoFileCompletions,
 	}
 	flags := cmd.Flags()
+	env.AddShowFlag(flags, &s.showEnv)
 	flags.BoolVarP(&s.inclusions[includeIntercepts], "intercepts", "i", false, "intercepts")
 	flags.BoolVarP(&s.inclusions[includeIngests], "ingests", "g", false, "ingests")
 	flags.BoolVarP(&s.inclusions[includeReplacements], "replacements", "r", false, "replacements")
@@ -206,7 +210,7 @@ func (s *listCommand) printList(ctx context.Context, workloads []*connector.Work
 	}
 
 	if formattedOut {
-		output.Object(ctx, workloads, false)
+		output.Object(ctx, workloadPresentation(workloads, s.showEnv), false)
 	} else {
 		includeNs := false
 		ns := s.namespace
@@ -245,4 +249,29 @@ func (s *listCommand) printList(ctx context.Context, workloads []*connector.Work
 			ioutil.Printf(stdout, "%-*s %-*s: %s\n", typeLen, strings.ToLower(t), nameLen, n, state(workload))
 		}
 	}
+}
+
+func workloadPresentation(workloads []*connector.WorkloadInfo, showEnv bool) []*connector.WorkloadInfo {
+	if workloads == nil {
+		return nil
+	}
+	result := make([]*connector.WorkloadInfo, len(workloads))
+	for i, workload := range workloads {
+		if workload == nil {
+			continue
+		}
+		view := proto.Clone(workload).(*connector.WorkloadInfo)
+		for _, intercept := range view.InterceptInfo {
+			if intercept != nil {
+				intercept.Environment = env.Presentation(intercept.Environment, showEnv)
+			}
+		}
+		for _, ingest := range view.IngestInfo {
+			if ingest != nil {
+				ingest.Environment = env.Presentation(ingest.Environment, showEnv)
+			}
+		}
+		result[i] = view
+	}
+	return result
 }

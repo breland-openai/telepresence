@@ -39,7 +39,7 @@ func (c *containerState) newPortHandler(ctx context.Context, pp types.PortAndPro
 	if d := c.DialerFactory(); d != nil {
 		opts = append(opts, forwarder.WithDialer(d))
 	}
-	if pp.Proto == types.ProtoTCP && c.container.Replace == agentconfig.ReplacePolicyIntercept {
+	if c.container.Replace == agentconfig.ReplacePolicyIntercept {
 		// The agent's own pass-through dial to the real app -- made here,
 		// once, when no intercept is active -- must land somewhere the
 		// nftables pod-IP redirect gate doesn't reach; see the doc comment on
@@ -49,7 +49,10 @@ func (c *containerState) newPortHandler(ctx context.Context, pp types.PortAndPro
 		cfg := c.AgentConfig()
 		nftRedirects := c.DialerFactory() != nil || cfg.NftRedirectsActive()
 		defaultTarget := cfg.PassThroughTarget(c.AppPodIP(), ic.ContainerPort, pp.Proto, nftRedirects)
-		return fwd.NewTCPInterceptor(ctx, pp, tunnel.AgentToClient, c.TLSManager(), defaultTarget, opts...)
+		if pp.Proto == types.ProtoTCP {
+			return fwd.NewTCPInterceptor(ctx, pp, tunnel.AgentToClient, c.TLSManager(), defaultTarget, opts...)
+		}
+		return fwd.NewInterceptor(ctx, pp, tunnel.AgentToClient, defaultTarget, opts...)
 	}
 	// The agent will intercept all traffic intended for this container.
 	return fwd.NewInterceptor(ctx, pp, tunnel.AgentToClient, netip.AddrPort{}, opts...)

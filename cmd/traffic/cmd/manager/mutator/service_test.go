@@ -7,13 +7,127 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/test/bufconn"
 	admission "k8s.io/api/admission/v1"
 
 	"github.com/telepresenceio/telepresence/v2/pkg/errcat"
 )
+
+func TestWebhookShutdownBeforeReady(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		listener := bufconn.Listen(1024)
+		done := make(chan error, 1)
+		go func() {
+			done <- serveWebhook(ctx, &http.Server{}, listener, func() {
+				t.Error("watchers started after cancellation")
+			})
+		}()
+		synctest.Wait()
+		cancel()
+		require.NoError(t, <-done)
+		_, err := listener.DialContext(t.Context())
+		require.Error(t, err)
+	})
+}
+
+func TestWebhookReturnsServeError(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		beforeReady bool
+	}{
+		{"before readiness", true},
+		{"after readiness", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+				defer cancel()
+				listener := bufconn.Listen(1024)
+				if tc.beforeReady {
+					require.NoError(t, listener.Close())
+				}
+				started := false
+				err := serveWebhook(ctx, &http.Server{}, listener, func() {
+					started = true
+					_ = listener.Close()
+				})
+				_, listenErr := listener.Accept()
+				require.Error(t, listenErr)
+				require.ErrorIs(t, err, listenErr)
+				require.NoError(t, ctx.Err())
+				require.Equal(t, !tc.beforeReady, started)
+			})
+		})
+	}
+}
+
+func TestWebhookShutdownAfterReady(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		wantErr error
+	}{
+		{"request finishes", nil},
+		{"drain deadline", context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				type contextKey struct{}
+				ctx, cancel := context.WithCancel(context.WithValue(t.Context(), contextKey{}, "manager"))
+				defer cancel()
+				handling := make(chan struct{})
+				handled := make(chan struct{})
+				finish := make(chan struct{})
+				server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, "manager", r.Context().Value(contextKey{}))
+					close(handling)
+					defer close(handled)
+					select {
+					case <-finish:
+						w.WriteHeader(http.StatusNoContent)
+					case <-r.Context().Done():
+					}
+				})}
+				listener := bufconn.Listen(1024)
+				ready := make(chan struct{})
+				done := make(chan error, 1)
+				go func() {
+					done <- serveWebhook(ctx, server, listener, func() { close(ready) })
+				}()
+				<-ready
+				conn, err := listener.DialContext(ctx)
+				require.NoError(t, err)
+				defer conn.Close()
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				require.NoError(t, req.Write(conn))
+				<-handling
+
+				cancel()
+				synctest.Wait()
+				_, err = listener.DialContext(t.Context())
+				require.Error(t, err, "the listener must be closed while the request drains")
+				select {
+				case <-handled:
+					t.Fatal("request context canceled before the drain deadline")
+				case err := <-done:
+					t.Fatalf("returned with an active request: %v", err)
+				default:
+				}
+				if tc.wantErr == nil {
+					close(finish)
+				}
+				require.ErrorIs(t, <-done, tc.wantErr)
+				<-handled
+			})
+		})
+	}
+}
 
 type contextRecordingInjector struct {
 	uninstallContext context.Context

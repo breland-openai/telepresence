@@ -276,6 +276,12 @@ func NewSession(
 		clog.Errorf(config, "Unable to connect to session: %s", err)
 		return nil, nil, err
 	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			tmgr.Close()
+		}
+	}()
 	if tmgr.compareFinalizedManagerVersion(2, 21, 0) < 0 {
 		return nil, nil,
 			fmt.Errorf("traffic manager version %s is too old. Minimum supported version is 2.21.0, please upgrade", tmgr.ManagerVersion())
@@ -308,10 +314,9 @@ func NewSession(
 
 	// The root daemon establishes its own manager connection, so give that phase
 	// a fresh timeout instead of reusing the budget spent by the user daemon.
-	rootCtx, rootCancel := tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
+	rootCtx, rootCancel := tmgr.rootDaemonConnectTimeout(ctx, oi)
 	defer rootCancel()
 	if err = tmgr.connectRootDaemon(rootCtx, oi, wg, cr.IsPodDaemon); err != nil {
-		_ = tmgr.managerConnection().Close()
 		return nil, nil, err
 	}
 
@@ -320,7 +325,11 @@ func NewSession(
 
 	tmgr.AddNamespaceEventHandler(tmgr.updateDaemonNamespaces)
 	ci, err := tmgr.status(rootCtx, true)
-	return tmgr, ci, err
+	if err != nil {
+		return nil, nil, err
+	}
+	handedOff = true
+	return tmgr, ci, nil
 }
 
 func (s *session) GetService() userd.Service {
@@ -338,7 +347,9 @@ func (s *session) Run() {
 	started := time.Now()
 	g := log.NewGroup(s)
 	defer func() {
-		_ = s.WithRootClient(context.WithoutCancel(s), func(ctx context.Context, rd rootdRpc.DaemonClient) error {
+		rootCtx, cancel := context.WithTimeout(context.WithoutCancel(s), 3*time.Second)
+		defer cancel()
+		_ = s.WithRootClient(rootCtx, func(ctx context.Context, rd rootdRpc.DaemonClient) error {
 			_, _ = rd.Disconnect(ctx, &empty.Empty{})
 			return nil
 		})
@@ -355,6 +366,19 @@ func (s *session) Run() {
 		clog.Infof(s, "session context ended after %s: context=%v cause=%v", elapsed, s.Err(), context.Cause(s))
 	default:
 		clog.Infof(s, "session services stopped cleanly after %s", elapsed)
+	}
+}
+
+func (s *session) Close() {
+	rootCtx, cancel := context.WithTimeout(context.WithoutCancel(s), 3*time.Second)
+	defer cancel()
+	_ = s.WithRootClient(rootCtx, func(ctx context.Context, rd rootdRpc.DaemonClient) error {
+		_, err := rd.Disconnect(ctx, &empty.Empty{})
+		return err
+	})
+	s.closeRootDaemon()
+	if conn := s.managerConnection(); conn != nil {
+		_ = conn.Close()
 	}
 }
 
@@ -432,6 +456,12 @@ func connectMgr(
 	if err != nil {
 		return nil, err
 	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			_ = conn.Close()
+		}
+	}()
 	if sdc := cfg.Grpc().SimulateDisconnect; sdc > 0 {
 		time.AfterFunc(sdc, func() {
 			clog.Info(cluster, "Simulated disconnect from manager")
@@ -514,6 +544,7 @@ func connectMgr(
 		podRelay:           newPodRelay(),
 	}
 	sess.Context = withSession(sess.Context, sess)
+	handedOff = true
 	return sess, nil
 }
 
@@ -1197,9 +1228,7 @@ func (s *session) CheckStatus(cr *rpc.ConnectRequest) error {
 		// connect that doesn't define a kubeconfig at all.
 		config = s.Kubeconfig
 	}
-	if len(cr.MappedNamespaces) == 1 && cr.MappedNamespaces[0] == "all" {
-		cr.MappedNamespaces = nil
-	}
+	cr.MappedNamespaces, _ = normalizeMappedNamespaces(cr.MappedNamespaces)
 	// If namespaces are specified in the request, then we must ensure that they are the same as the current ones
 	// because the request takes precedence over namespaces configured in the client configuration or by the traffic-manager.
 	if len(cr.MappedNamespaces) == 0 || slices.Equal(cr.MappedNamespaces, s.MappedNamespaces) {
@@ -1331,15 +1360,15 @@ func (s *session) updateClientConfig(ctx context.Context, namespaces []string) {
 // needed. Querying the API here would run on every status request, and with an external
 // manager address the API server may not be reachable at all, in which case each call
 // blocks until the connect timeout.
-func (s *session) managerInstallID() string {
-	if id := s.sessionInfo.GetManagerInstallId(); id != "" {
+func (s *session) managerInstallID(ctx context.Context) string {
+	if id := s.SessionInfo().GetManagerInstallId(); id != "" {
 		return id
 	}
 	if client.GetConfig(s).Cluster().UsesExternalManager() {
 		return k8sapi.ZeroNamespaceID
 	}
 	// Managers that don't report the install ID.
-	return s.GetManagerInstallId()
+	return s.GetManagerInstallId(k8sapi.WithK8sInterface(ctx, k8sapi.GetK8sInterface(s)))
 }
 
 func (s *session) status(ctx context.Context, initial bool) (*rpc.ConnectInfo, error) {
@@ -1349,7 +1378,7 @@ func (s *session) status(ctx context.Context, initial bool) (*rpc.ConnectInfo, e
 		Initial:          initial,
 		ClusterContext:   cfg.KubeContext,
 		ClusterServer:    cfg.Server,
-		ManagerInstallId: s.managerInstallID(),
+		ManagerInstallId: s.managerInstallID(ctx),
 		SessionInfo:      s.SessionInfo(),
 		ConnectionName:   s.daemonID.Name,
 		KubeFlags:        s.OriginalFlagMap,
@@ -1368,7 +1397,7 @@ func (s *session) status(ctx context.Context, initial bool) (*rpc.ConnectInfo, e
 		ret.MappedNamespaces = s.GetCurrentNamespaces(true)
 	}
 	err := s.WithRootClient(ctx, func(ctx context.Context, rd rootdRpc.DaemonClient) (err error) {
-		ret.DaemonStatus, err = rd.Status(s, &empty.Empty{})
+		ret.DaemonStatus, err = rd.Status(ctx, &empty.Empty{})
 		return err
 	})
 	if err != nil {
@@ -1405,6 +1434,47 @@ func (s *session) getNetworkInfo(cr *rpc.ConnectRequest) *rootdRpc.NetworkConfig
 	}
 }
 
+type proxyViaStartupTimeoutError struct {
+	managerConnect, agentArrival, totalAgentArrival time.Duration
+	workloadCount                                   int
+}
+
+func (e proxyViaStartupTimeoutError) Error() string {
+	return fmt.Sprintf(
+		"proxy-via startup exceeded trafficManagerConnect (%s) plus intercept (%s) for agent arrival in %d distinct workload(s) (%s total agent allowance)",
+		e.managerConnect, e.agentArrival, e.workloadCount, e.totalAgentArrival,
+	)
+}
+
+func (s *session) rootDaemonConnectTimeout(ctx context.Context, nc *rootdRpc.NetworkConfig) (context.Context, context.CancelFunc) {
+	tos := client.GetConfig(s).Timeouts()
+	workloads := make(map[string]struct{})
+	for _, via := range nc.GetSubnetViaWorkloads() {
+		if name := via.GetWorkload(); name != "" && name != "local" {
+			workloads[name] = struct{}{}
+		}
+	}
+	if count := len(workloads); count > 0 {
+		// The root requests agent injection serially for distinct named workloads.
+		managerConnect := tos.Get(client.TimeoutTrafficManagerConnect)
+		agentArrival := tos.Get(client.TimeoutIntercept)
+		deadline := time.Now().Add(managerConnect)
+		agentStart := deadline
+		for range count {
+			deadline = deadline.Add(agentArrival)
+		}
+		return context.WithDeadlineCause(ctx, deadline, proxyViaStartupTimeoutError{managerConnect, agentArrival, deadline.Sub(agentStart), count})
+	}
+	return tos.TimeoutContext(ctx, client.TimeoutTrafficManagerConnect)
+}
+
+func rootDaemonConnectError(ctx context.Context, err error) error {
+	if cause, ok := context.Cause(ctx).(proxyViaStartupTimeoutError); ok {
+		return fmt.Errorf("%w (%s)", err, cause)
+	}
+	return err
+}
+
 func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.NetworkConfig, wg *sync.WaitGroup, isPodDaemon bool) (err error) {
 	// establish a connection to the root daemon gRPC grpcService
 	clog.Info(s, "Connecting to root daemon...")
@@ -1437,20 +1507,21 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 		}()
 
 		g := log.NewGroup(rootSession)
-		if err = rootSession.Start(g, svc.TeleroutePort()); err != nil {
-			return err
+		defer func() {
+			// Register after Start has added workers, including on failed startup.
+			if wg != nil {
+				wg.Go(func() {
+					err := g.Wait()
+					if err != nil && !errors.Is(err, context.Canceled) {
+						clog.Errorf(s, "root session exited with error: %v", err)
+					}
+				})
+			}
+		}()
+		if err = rootSession.StartWithContext(timeoutCtx, g, svc.TeleroutePort()); err != nil {
+			return rootDaemonConnectError(timeoutCtx, err)
 		}
 		rd = rootSession
-
-		// Give in-proc root session services a chance to clean up.
-		if wg != nil {
-			wg.Go(func() {
-				err := g.Wait()
-				if err != nil && !errors.Is(err, context.Canceled) {
-					clog.Errorf(s, "root session exited with error: %v", err)
-				}
-			})
-		}
 	} else {
 		dialRootDaemon := s.dialRootDaemon
 		if dialRootDaemon == nil {
@@ -1471,7 +1542,7 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 			var rootStatus *rootdRpc.DaemonStatus
 			rootStatus, err = rd.Connect(timeoutCtx, nc)
 			if err != nil {
-				return fmt.Errorf("failed to connect to root daemon: %w", err)
+				return fmt.Errorf("failed to connect to root daemon: %w", rootDaemonConnectError(timeoutCtx, err))
 			}
 			oc := rootStatus.OutboundConfig
 			if oc == nil || oc.Session == nil {
@@ -1488,7 +1559,7 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 				// ...or not, since we've already done it.
 				return errors.New("unable to reconnect to root daemon")
 			}
-			if _, err = rd.Disconnect(s, &empty.Empty{}); err != nil {
+			if _, err = rd.Disconnect(timeoutCtx, &empty.Empty{}); err != nil {
 				return fmt.Errorf("failed to disconnect from the root daemon: %w", err)
 			}
 		}
@@ -1500,7 +1571,7 @@ func (s *session) connectRootDaemon(timeoutCtx context.Context, nc *rootdRpc.Net
 		if se, ok := status.FromError(err); ok {
 			err = se.Err()
 		}
-		return fmt.Errorf("failed to connect to root daemon: %v", err)
+		return fmt.Errorf("failed to connect to root daemon: %w", rootDaemonConnectError(timeoutCtx, err))
 	}
 	generation := s.setRootDaemon(rd, conn, nc, isPodDaemon)
 	if !svc.RootSessionInProcess() {
@@ -1607,7 +1678,7 @@ func (s *session) reconnectRootDaemon(failedGeneration uint64, cause error) {
 			return
 		}
 
-		timeoutCtx, cancel := client.GetConfig(s).Timeouts().TimeoutContext(s, client.TimeoutTrafficManagerConnect)
+		timeoutCtx, cancel := s.rootDaemonConnectTimeout(s, nc)
 		err := s.connectRootDaemon(timeoutCtx, nc, nil, isPodDaemon)
 		cancel()
 		if err == nil {
