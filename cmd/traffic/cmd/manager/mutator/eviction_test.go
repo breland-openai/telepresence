@@ -1076,7 +1076,7 @@ func TestDeleteMapsAndRolloutNamespaceWaitsForAllEvictions(t *testing.T) {
 			require.NoError(t, replicaSetStore.Add(object.DeepCopy()))
 		}
 	}
-	evictMap, err := podList(ctx, namespace)
+	evictMap, err := podList(ctx, namespace, podIsPendingOrRunning)
 	require.NoError(t, err)
 	require.Len(t, evictMap, 1)
 

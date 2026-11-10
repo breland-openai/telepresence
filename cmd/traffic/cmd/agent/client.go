@@ -47,17 +47,14 @@ func (is interceptsStringer) String() string {
 
 var NewExtendedManagerClient func(conn *grpc.ClientConn, ossManager rpc.ManagerClient) rpc.ManagerClient //nolint:gochecknoglobals // extension point
 
-// managerHandshakeTimeout bounds the initial unary RPCs made before the agent
-// can enter its reconnecting watch loops. Without a timeout, a manager that
-// accepts the transport but stops servicing unary RPCs can leave the agent
-// stuck forever before /tmp/agent/ready is created.
-var managerHandshakeTimeout = 10 * time.Second //nolint:gochecknoglobals // overridden by tests
-
 var managerHeartbeatInterval = time.Minute //nolint:gochecknoglobals // overridden by tests
 
 const (
-	agentSessionIDPrefix         = "agent:"
-	initialInterceptSyncTimeout  = 30 * time.Second
+	agentSessionIDPrefix        = "agent:"
+	initialInterceptSyncTimeout = 30 * time.Second
+	managerVersionRPCTimeout    = 10 * time.Second
+	// Registration may authenticate and reconcile agent state.
+	managerRegistrationTimeout   = 30 * time.Second
 	managerSessionRPCTimeout     = 10 * time.Second
 	managerHeartbeatFailureLimit = 3
 )
@@ -217,7 +214,7 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 		manager = NewExtendedManagerClient(conn, manager)
 	}
 
-	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, managerHandshakeTimeout)
+	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, managerVersionRPCTimeout)
 	ver, err := manager.Version(handshakeCtx, &empty.Empty{})
 	handshakeCancel()
 	if err != nil {
@@ -231,7 +228,7 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 		return fmt.Errorf("failed to parse manager version %q: %s", verStr, err)
 	}
 
-	handshakeCtx, handshakeCancel = context.WithTimeout(ctx, managerHandshakeTimeout)
+	handshakeCtx, handshakeCancel = context.WithTimeout(ctx, managerRegistrationTimeout)
 	session, err := manager.ArriveAsAgent(handshakeCtx, info)
 	handshakeCancel()
 	if err != nil {
@@ -241,15 +238,13 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 
 	state.SetManager(session, manager, mgrVer)
 
-	// Best-effort and non-blocking: a manager without QUIC enabled, or one that's
-	// briefly unreachable for this one RPC, must never delay or fail the rest of
-	// this session. Bounded independently of ctx's lifetime so a slow manager can't
-	// wedge this goroutine past the session's own teardown.
-	go func() {
-		fetchCtx, fetchCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer fetchCancel()
-		state.RefreshQuicAgentListener(processCtx, fetchCtx)
-	}()
+	// Best-effort and non-blocking: fetch the certificate at session start and after
+	// every ReconnectAgent, retrying each fetch until it succeeds or this manager
+	// session ends. Each attempt is bounded, and the retries cannot delay or fail the
+	// rest of the session.
+	refreshQuicCert := make(chan struct{}, 1)
+	refreshQuicCert <- struct{}{}
+	go quicAgentCertRefresher(processCtx, ctx, state, refreshQuicCert, 10*time.Second, time.Second)
 
 	// Create the /tmp/agent directory if it doesn't exist
 	// We use this to place a file which conveys 'readiness'
@@ -307,7 +302,12 @@ func TalkToManager(ctx context.Context, address string, info *rpc.AgentInfo, sta
 	})
 	snapshots := make(chan interceptSnapshot, 1)
 	wg.Go("interceptWatch", func(ctx context.Context) error {
-		return interceptWatchLoop(ctx, manager, session, info, snapshots, retryInterval, readiness)
+		return interceptWatchLoop(ctx, manager, session, info, snapshots, retryInterval, readiness, func() {
+			select {
+			case refreshQuicCert <- struct{}{}:
+			default:
+			}
+		})
 	})
 	wg.Go("handleIntercept", func(ctx context.Context) error {
 		err := handleInterceptLoop(ctx, manager, session, snapshots, state, readiness)
@@ -362,6 +362,7 @@ func interceptWatchLoop(
 	snapshots chan interceptSnapshot,
 	retryInterval time.Duration,
 	readiness *interceptReadiness,
+	onReconnect func(),
 ) error {
 	// Call WatchIntercepts and publish the snapshots on the channel
 	snapMap := make(map[string]*rpc.InterceptInfo)
@@ -370,12 +371,15 @@ func interceptWatchLoop(
 			return err
 		}
 		clear(snapMap)
-		repairCtx, cancel := context.WithTimeout(ctx, managerSessionRPCTimeout)
+		repairCtx, cancel := context.WithTimeout(ctx, managerRegistrationTimeout)
 		defer cancel()
 		_, err := manager.ReconnectAgent(repairCtx, &rpc.ReconnectAgentRequest{
 			Session: session,
 			Agent:   info,
 		})
+		if err == nil {
+			onReconnect()
+		}
 		return err
 	}
 	err := watcher.WatchWithRetry(ctx, "WatchInterceptsDelta", retryInterval,

@@ -4,12 +4,33 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func TestTalkToManagerLoopWaitsAfterSlowFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		const retryInterval = time.Second
+		var failedAt, retriedAt time.Time
+		talkToManagerLoop(ctx, retryInterval, func(context.Context) error {
+			if failedAt.IsZero() {
+				time.Sleep(2 * retryInterval)
+				failedAt = time.Now()
+				return status.Error(codes.DeadlineExceeded, "registration timed out")
+			}
+			retriedAt = time.Now()
+			cancel()
+			return nil
+		})
+		require.Equal(t, retryInterval, retriedAt.Sub(failedAt))
+	})
+}
 
 func TestTalkToManagerLoopRetriesInactivePod(t *testing.T) {
 	for _, tc := range []struct {

@@ -33,6 +33,7 @@ import (
 )
 
 type Map interface {
+	VerifiedPods(k8sapi.Workload, string) map[types.UID]string
 	Get(string, string) *agentconfig.Sidecar
 	GetOrGenerate(context.Context, k8sapi.Workload) (*agentconfig.Sidecar, error)
 	Store(*agentconfig.Sidecar)
@@ -164,7 +165,12 @@ func (c *configWatcher) RegenerateAgentMaps(ctx context.Context, agentImage stri
 
 func (c *configWatcher) regenerateAgentConfigs(ctx context.Context, ns string, gc *agentmap.GeneratorConfig) error {
 	clog.Debugf(ctx, "regenerate agent maps %s", whereWeWatch(ns))
-	evictMap, err := podList(ctx, ns)
+	// Only configuration-bearing pods contribute to regeneration. Resolving
+	// unrelated owners first can block restoration on an irrelevant lookup.
+	evictMap, err := podList(ctx, ns, func(pod *core.Pod) bool {
+		_, annotated := pod.Annotations[annotation.Config]
+		return annotated && podIsPendingOrRunning(pod)
+	})
 	if err != nil {
 		return err
 	}
@@ -179,11 +185,7 @@ func (c *configWatcher) regenerateAgentConfigs(ctx context.Context, ns string, g
 		wls := make(map[WorkloadKey]*agentconfig.Sidecar, len(wp.pods))
 		podsOfInterest := make([]*core.Pod, 0, len(wp.pods))
 		for _, pod := range wp.pods {
-			cfgJSON, ok := pod.Annotations[annotation.Config]
-			if !ok {
-				continue
-			}
-			sc, err := agentconfig.UnmarshalJSON(cfgJSON)
+			sc, err := agentconfig.UnmarshalJSON(pod.Annotations[annotation.Config])
 			if err != nil {
 				clog.Errorf(ctx, "unable to unmarshal agent config from annotation in pod %s.%s: %v", pod.Name, pod.Namespace, err)
 				continue
@@ -248,6 +250,7 @@ const (
 )
 
 type informersWithCancel struct {
+	inventory *podInventory
 	cancel    context.CancelFunc
 	informers [watcherMax]cache.SharedIndexInformer
 	eventRegs [watcherMax]cache.ResourceEventHandlerRegistration
@@ -320,6 +323,11 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 		}
 	}()
 
+	kf := informer.GetK8sFactory(ctx, ns)
+	var inventory *podInventory
+	if env := managerutil.GetEnv(ctx); env.CachedPodChecks {
+		inventory = observeInventory(kf, k8sapi.GetK8sInterface(ctx), ns, env.EnabledWorkloadKinds)
+	}
 	ifns := [watcherMax]cache.SharedIndexInformer{}
 	ifns[serviceWatcher] = c.startServices(ctx, ns)
 	for _, wlKind := range managerutil.GetEnv(ctx).EnabledWorkloadKinds {
@@ -336,7 +344,6 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 	}
 	ifns[podWatcher] = c.startPods(ctx, ns)
 	c.startIngresses(ctx, ns)
-	kf := informer.GetK8sFactory(ctx, ns)
 	kf.Start(ctx.Done())
 	kf.WaitForCacheSync(ctx.Done())
 	if ifns[rolloutWatcher] != nil {
@@ -347,6 +354,7 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 
 	return &informersWithCancel{
 		cancel:    cancel,
+		inventory: inventory,
 		informers: ifns,
 	}, nil
 }

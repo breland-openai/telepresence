@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v4"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -421,8 +422,7 @@ func discoverServiceWorkloads(ctx context.Context, spec *rpc.InterceptSpec) ([]k
 	return sortedServiceWorkloads(workloads), true, nil
 }
 
-// serviceWorkloads keeps the explicitly requested workload when informer
-// state is unavailable, preserving single-workload interception.
+// serviceWorkloads includes the requested workload in the verified Service selection.
 func serviceWorkloads(ctx context.Context, spec *rpc.InterceptSpec, primary k8sapi.Workload) ([]k8sapi.Workload, error) {
 	workloads := map[string]k8sapi.Workload{
 		participantKey(primary.GetNamespace(), string(primary.GetKind()), primary.GetName()): primary,
@@ -432,7 +432,7 @@ func serviceWorkloads(ctx context.Context, spec *rpc.InterceptSpec, primary k8sa
 		return nil, err
 	}
 	if !known {
-		return sortedServiceWorkloads(workloads), nil
+		return nil, status.Errorf(codes.Unavailable, "participant discovery for Service %q is unavailable", spec.ServiceName)
 	}
 	for _, workload := range discovered {
 		addServiceWorkload(workloads, workload)
@@ -516,11 +516,31 @@ func serviceWorkloadInfos(workloads []k8sapi.Workload) []*rpc.InterceptWorkload 
 }
 
 func fallbackToSingleWorkload(ctx context.Context, spec *rpc.InterceptSpec, reason string) {
+	if ctx.Err() != nil {
+		return
+	}
 	clog.Warnf(ctx, "Shared-Service expansion for %q is unavailable: %s; using only requested workload %q",
 		spec.ServiceName, reason, spec.Agent)
 	spec.ServiceUid = ""
 	spec.ServicePortName = ""
 	spec.ServicePort = 0
+}
+
+func serviceVerificationFailure(err error, target any) error {
+	code := status.Code(err)
+	switch {
+	case errors.Is(err, context.Canceled) || code == codes.Canceled:
+		code = codes.Canceled
+	case errors.Is(err, context.DeadlineExceeded) || k8sErrors.IsTimeout(err) || k8sErrors.IsServerTimeout(err) || code == codes.DeadlineExceeded:
+		code = codes.DeadlineExceeded
+	case k8sErrors.IsTooManyRequests(err) || code == codes.ResourceExhausted:
+		code = codes.ResourceExhausted
+	case code == codes.Unavailable || !k8sErrors.IsNotFound(err) && transientSidecarLookup(err):
+		code = codes.Unavailable
+	default:
+		return nil
+	}
+	return status.Errorf(code, "verifying shared-Service coverage for %s: %v", target, err)
 }
 
 func (s *State) ensureServiceWorkloads(
@@ -531,22 +551,25 @@ func (s *State) ensureServiceWorkloads(
 	primaryAgents []*AgentSession,
 	rp agentconfig.ReplacePolicy,
 	client *ClientSession,
-) []*rpc.InterceptWorkload {
+) ([]*rpc.InterceptWorkload, error) {
 	if !serviceScopedIntercept(spec) {
-		return nil
+		return nil, nil
 	}
 	if spec.Replace || spec.Mechanism != "http" {
 		fallbackToSingleWorkload(ctx, spec, "shared interception requires the http mechanism without --replace")
-		return nil
+		return nil, nil
 	}
 
 	workloads, err := serviceWorkloads(ctx, spec, primary)
 	if err != nil {
+		if failure := serviceVerificationFailure(err, spec.ServiceName); failure != nil {
+			return nil, failure
+		}
 		fallbackToSingleWorkload(ctx, spec, err.Error())
-		return nil
+		return nil, nil
 	}
 	if len(workloads) <= 1 {
-		return serviceWorkloadInfos(workloads)
+		return serviceWorkloadInfos(workloads), nil
 	}
 
 	configWorkloads := make(map[string]k8sapi.Workload, len(workloads))
@@ -555,9 +578,12 @@ func (s *State) ensureServiceWorkloads(
 			continue
 		}
 		if err = s.checkServiceWorkloadConflicts(ctx, spec, workload, client); err != nil {
+			if failure := serviceVerificationFailure(err, workload); failure != nil {
+				return nil, failure
+			}
 			fallbackToSingleWorkload(ctx, spec,
 				fmt.Sprintf("workload %s conflicts with an existing intercept: %v", workload, err))
-			return nil
+			return nil, nil
 		}
 		configWorkloads[participantKey(workload.GetNamespace(), string(workload.GetKind()), workload.GetName())] = workload
 	}
@@ -577,15 +603,18 @@ func (s *State) ensureServiceWorkloads(
 				config, agents, err = s.ensureAgent(ctx, configWorkload, s.isExtended(spec), false, spec, rp)
 			}
 			if err != nil {
+				if failure := serviceVerificationFailure(err, workload); failure != nil {
+					return nil, failure
+				}
 				fallbackToSingleWorkload(ctx, spec,
 					fmt.Sprintf("unable to ensure agent for workload %s: %v", workload, err))
-				return nil
+				return nil, nil
 			}
 		}
 		if !sidecarClaimsService(config, spec) {
 			fallbackToSingleWorkload(ctx, spec,
 				fmt.Sprintf("agent config for workload %s does not claim the selected Service target", workload))
-			return nil
+			return nil, nil
 		}
 		currentAgents := s.LoadMatchingAgents(func(_ tunnel.SessionID, agent *AgentSession) bool {
 			return agent.Namespace == workload.GetNamespace() &&
@@ -612,10 +641,10 @@ func (s *State) ensureServiceWorkloads(
 		if !allClaim {
 			fallbackToSingleWorkload(ctx, spec,
 				fmt.Sprintf("not every agent for workload %s advertises the selected Service target", workload))
-			return nil
+			return nil, nil
 		}
 	}
-	return serviceWorkloadInfos(workloads)
+	return serviceWorkloadInfos(workloads), nil
 }
 
 func prepareAllContainerPorts(cn *agentconfig.Container, pi *rpc.PreparedIntercept) {
@@ -952,10 +981,13 @@ func (s *State) AddIntercept(ctx context.Context, cir *rpc.CreateInterceptReques
 		if err != nil {
 			return nil, nil, err
 		}
-		serviceWorkloads = s.ensureServiceWorkloads(ctx, spec, wl, primaryConfig, primaryAgents, rp, client)
+		serviceWorkloads, err = s.ensureServiceWorkloads(ctx, spec, wl, primaryConfig, primaryAgents, rp, client)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
-	is, err := s.addIntercept(interceptID, cir, serviceWorkloads)
+	is, err := s.addIntercept(ctx, interceptID, cir, serviceWorkloads)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -971,7 +1003,8 @@ func (s *State) AddIntercept(ctx context.Context, cir *rpc.CreateInterceptReques
 		pmCir.InterceptSpec = pmSpec
 
 		pmInterceptID := fmt.Sprintf("%s:%s", sessionID, pmSpec.Name)
-		_, err = s.addIntercept(pmInterceptID, pmCir, nil)
+		// Publication of the parent commits the request and its pod ports.
+		_, err = s.addIntercept(context.WithoutCancel(ctx), pmInterceptID, pmCir, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1054,7 +1087,7 @@ func childInterceptSpecs(spec *rpc.InterceptSpec) ([]*rpc.InterceptSpec, error) 
 	return specs, nil
 }
 
-func (s *State) addIntercept(id string, cir *rpc.CreateInterceptRequest, serviceWorkloads []*rpc.InterceptWorkload) (*Intercept, error) {
+func (s *State) addIntercept(ctx context.Context, id string, cir *rpc.CreateInterceptRequest, serviceWorkloads []*rpc.InterceptWorkload) (*Intercept, error) {
 	is := s.NewInterceptInfo(id, cir)
 	is.ServiceWorkloads = serviceWorkloads
 	s.initializeParticipants(is)
@@ -1071,11 +1104,20 @@ func (s *State) addIntercept(id string, cir *rpc.CreateInterceptRequest, service
 		}
 	}
 
-	if existingValue, hasConflict := s.intercepts.LoadOrStore(id, is); hasConflict {
-		if existingValue.Disposition != rpc.InterceptDispositionType_REMOVED {
-			return nil, grpcErrors.Errorf(codes.AlreadyExists, "Intercept named %q already exists", is.Spec.Name)
+	var createErr error
+	s.intercepts.Compute(id, func(existing *Intercept, loaded bool) (*Intercept, xsync.ComputeOp) {
+		if err := ctx.Err(); err != nil {
+			createErr = status.FromContextError(err).Err()
+			return existing, xsync.CancelOp
 		}
-		s.intercepts.Store(id, is)
+		if loaded && existing.Disposition != rpc.InterceptDispositionType_REMOVED {
+			createErr = grpcErrors.Errorf(codes.AlreadyExists, "Intercept named %q already exists", is.Spec.Name)
+			return existing, xsync.CancelOp
+		}
+		return is, xsync.UpdateOp
+	})
+	if createErr != nil {
+		return nil, createErr
 	}
 	return is, nil
 }
@@ -1229,6 +1271,13 @@ func (s *State) ensureAgent(parentCtx context.Context, wl k8sapi.Workload, exten
 
 	ctx, cancel := context.WithTimeout(parentCtx, managerutil.GetEnv(parentCtx).AgentArrivalTimeout)
 	defer cancel()
+
+	if managerutil.GetEnv(ctx).CachedPodChecks {
+		if sc, encoded, as := s.cachedSidecarAgents(ctx, wl, spec, extended, rp); len(as) > 0 {
+			cfgJSON, waitOutcome = encoded, sidecarAgentWaitSucceeded
+			return sc, as, nil
+		}
+	}
 
 	failedCreateCh, err := eventwatch.WatchWarnings(ctx, k8sapi.GetK8sInterface(ctx), wl.GetNamespace(), wl.GetName())
 	if err != nil {
@@ -1459,12 +1508,7 @@ func (s *State) getOrCreateAgentConfig(
 		}
 
 		if spec != nil {
-			var cn *agentconfig.Container
-			if spec.NoDefaultPort {
-				cn, err = icept.FindContainer(sc, spec)
-			} else {
-				cn, _, err = icept.FindIntercept(sc, spec)
-			}
+			cn, err := interceptConfigContainer(sc, spec)
 			if err != nil {
 				return nil, err
 			}
@@ -1472,6 +1516,14 @@ func (s *State) getOrCreateAgentConfig(
 		}
 		return sc, nil
 	})
+}
+
+func interceptConfigContainer(sc *agentconfig.Sidecar, spec *rpc.InterceptSpec) (*agentconfig.Container, error) {
+	if spec.NoDefaultPort {
+		return icept.FindContainer(sc, spec)
+	}
+	cn, _, err := icept.FindIntercept(sc, spec)
+	return cn, err
 }
 
 func checkInterceptAnnotations(ctx context.Context, wl k8sapi.Workload) (bool, error) {
@@ -1632,8 +1684,11 @@ func (s *State) waitForAgentsMatching(
 			return nil, errcat.User.New(terminalEventMessage(ctx, fe, podNamespace, failedContainerRx, nodeAgent))
 		case delta, ok := <-deltaCh:
 			if !ok {
-				// The request has been canceled.
-				return nil, status.Error(codes.Canceled, fmt.Sprintf("channel closed while waiting for agent %s.%s to arrive", name, namespace))
+				if ctx.Err() != nil {
+					deltaCh = nil
+					continue
+				}
+				return nil, status.Errorf(codes.Canceled, "channel closed while waiting for agent %s.%s to arrive", name, namespace)
 			}
 			if sidecar != nil {
 				if err := sidecar.apply(ctx, mm, arrived, delta); err != nil {
@@ -1684,7 +1739,7 @@ func (s *State) waitForAgentsMatching(
 							"See https://telepresence.io/docs/troubleshooting#eks-calico-and-traffic-agent-injection-timeouts")
 				}
 			}
-			return maps.Values(arrived), errcat.User.New(bf.String())
+			return maps.Values(arrived), errcat.User.Errorf(ctx.Err(), "%s", bf.String())
 		}
 		if len(arrived) >= expected {
 			return maps.Values(arrived), nil

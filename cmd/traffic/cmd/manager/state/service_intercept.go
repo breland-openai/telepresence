@@ -425,6 +425,9 @@ func (s *State) reconcileServiceParticipantsWithSelection(
 		return intercept
 	}
 	return s.UpdateIntercept(interceptID, func(intercept *Intercept) {
+		if !serviceScopedIntercept(intercept.Spec) {
+			return
+		}
 		added := false
 		published := intercept.publishedServiceParticipant()
 		publishedKey := ""
@@ -434,6 +437,9 @@ func (s *State) reconcileServiceParticipantsWithSelection(
 		if allowAdds && selectionKnown {
 			for key, participant := range selected {
 				if _, ok := intercept.participants[key]; !ok {
+					if intercept.participants == nil {
+						intercept.participants = make(map[string]*interceptParticipant, len(selected))
+					}
 					intercept.participants[key] = participant
 					added = true
 				}

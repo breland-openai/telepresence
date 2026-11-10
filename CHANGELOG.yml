@@ -27,6 +27,38 @@ items:
   - version: 2.32.0
     date: (TBD)
     notes:
+      - type: feature
+        title: Verify healthy sidecars using watched pod and controller data
+        body: >-
+          An experimental traffic-manager setting, <code>CACHED_POD_CHECKS</code>,
+          lets healthy sidecar intercepts reuse synchronized informer data. It
+          defaults to false. Incomplete inventory or stale watch progress uses
+          live Kubernetes checks.
+        docs: reference/cluster-config
+      - type: bugfix
+        title: Preserve shared Service scope on temporary verification failures
+        body: >-
+          Intercept creation now returns an error when throttling or a timeout
+          prevents verification of a shared Service. The manager checks for
+          cancellation before publishing a route. A retry verifies the current
+          participants of the requested Service.
+      - type: bugfix
+        title: Wait for physical pod replacement during agent cleanup
+        body: >-
+          Pod eviction keeps the informer entry until Kubernetes reports its
+          removal. Agent cleanup verifies that an accepted eviction has recovered
+          before finishing.
+      - type: bugfix
+        title: Limit internal traffic-manager authentication load
+        body: >-
+          The traffic-manager now limits internal TokenReview requests and
+          rate-limits warnings for invalid tokens and admission rejections.
+          Short bursts can wait up to one second for a credential check
+          to start. An admitted check keeps its place through an audience
+          fallback.
+          Authentication metrics distinguish the internal and external
+          listeners, and permissive mode treats admission limits as
+          authentication being unavailable.
       - type: bugfix
         title: Reject intercepts without a reverse connection to the traffic-agent
         body: >-
@@ -257,6 +289,27 @@ items:
           new revision for each sibling approval. Traffic-agents keep intercept
           watch updates flowing during reviews and attempt to reconnect unready
           sessions after repeated manager heartbeat failures.
+      - type: bugfix
+        title: Reduce traffic-agent registration retry pressure
+        body: >-
+          Traffic-agents allow more time for registration and session restoration
+          when a traffic-manager is slow to respond. Failed connections wait
+          before retrying, reducing repeated work during recovery.
+      - type: bugfix
+        title: Resume service intercepts after workloads are selected again
+        body: >-
+          The traffic-manager no longer panics when a Service selects workloads
+          after temporarily selecting none. Reselected workloads must approve
+          before the intercept becomes active.
+      - type: bugfix
+        title: Recover file sharing and QUIC after a traffic-manager restart
+        body: >-
+          When a traffic-agent reconnects to a restarted traffic-manager, it
+          refreshes its verification key and retries transient failures so file
+          sharing works again without replacing the agent pod. The client also
+          refreshes its QUIC credentials on reconnect, so it can use QUIC again
+          instead of staying on the port-forward fallback.
+        docs: reference/authentication
   - version: 2.31.2
     date: 2026-08-02
     notes:

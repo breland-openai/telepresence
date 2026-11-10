@@ -75,7 +75,9 @@ func (*sessionRecoveryState) AgentConfig() *agentconfig.Sidecar {
 
 func (*sessionRecoveryState) SetManager(*rpc.SessionInfo, rpc.ManagerClient, semver.Version) {}
 
-func (*sessionRecoveryState) RefreshQuicAgentListener(context.Context, context.Context) {}
+func (*sessionRecoveryState) RefreshQuicAgentListener(context.Context, context.Context) error {
+	return nil
+}
 
 func (s *sessionRecoveryState) HandleIntercepts(ctx context.Context, intercepts []*rpc.InterceptInfo) []*rpc.ReviewInterceptRequest {
 	return s.handle(ctx, intercepts)

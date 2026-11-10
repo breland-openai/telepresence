@@ -80,7 +80,7 @@ func (c *configWatcher) evictAllPodsWithAgentConfigAndWait(ctx context.Context, 
 	failedWorkloads := make(map[WorkloadKey]struct{})
 	var errs error
 	for {
-		evictMap, err := podList(ctx, namespace)
+		evictMap, err := podList(ctx, namespace, podIsPendingOrRunning)
 		if err != nil {
 			return errors.Join(errs, err)
 		}
@@ -91,6 +91,7 @@ func (c *configWatcher) evictAllPodsWithAgentConfigAndWait(ctx context.Context, 
 				continue
 			}
 			pods := podsWithAgentConfigMismatch(ctx, wp.pods, "")
+			pods = slices.DeleteFunc(pods, func(p *core.Pod) bool { return c.isEvicted(p.UID) })
 			if len(pods) == 0 {
 				continue
 			}
@@ -106,7 +107,7 @@ func (c *configWatcher) evictAllPodsWithAgentConfigAndWait(ctx context.Context, 
 			if timeout := managerutil.GetEnv(ctx).AgentArrivalTimeout; timeout > 0 {
 				recoveryCtx, cancel = context.WithTimeout(ctx, timeout)
 			}
-			err = waitForWorkloadRecovery(recoveryCtx, wp.wl)
+			err = c.waitForEvictionRecovery(recoveryCtx, wp.wl)
 			cancel()
 			if err != nil {
 				errs = errors.Join(errs, err)
@@ -514,6 +515,25 @@ func waitForReplicaCount(ctx context.Context, wl k8sapi.Workload, count int) err
 	}
 }
 
+func (c *configWatcher) waitForEvictionRecovery(ctx context.Context, wl k8sapi.Workload) error {
+	for {
+		if err := waitForWorkloadRecovery(ctx, wl); err != nil {
+			return err
+		}
+		if err := c.evictPods(ctx, wl, nil); err != nil {
+			return err
+		}
+		if !c.workloadEvictionPending(evictionKey(wl)) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(evictionPendingDelay):
+		}
+	}
+}
+
 func waitForWorkloadRecovery(ctx context.Context, wl k8sapi.Workload) error {
 	for {
 		refreshed, err := refreshWorkload(ctx, wl)
@@ -572,12 +592,6 @@ func evictPod(ctx context.Context, pod *core.Pod) (bool, error) {
 		},
 	})
 	if err == nil || k8sErrors.IsNotFound(err) {
-		store := informer.GetK8sFactory(ctx, pod.Namespace).Core().V1().Pods().Informer().GetStore()
-		if cached, exists, getErr := store.Get(pod); getErr == nil && exists {
-			if cachedPod, ok := cached.(*core.Pod); ok && cachedPod.UID == pod.UID {
-				_ = store.Delete(cachedPod)
-			}
-		}
 		clog.Debugf(ctx, "Pod %s was evicted or already replaced", pod.Name)
 		return err == nil, nil
 	}
@@ -616,7 +630,7 @@ func getPodLister(ctx context.Context, namespace string) (lister podLister) {
 	return lister
 }
 
-func podList(ctx context.Context, namespace string) (wlPodMap, error) {
+func podList(ctx context.Context, namespace string, include func(*core.Pod) bool) (wlPodMap, error) {
 	lister := getPodLister(ctx, namespace)
 	pods, err := lister.List(labels.Everything())
 	if err != nil {
@@ -625,7 +639,7 @@ func podList(ctx context.Context, namespace string) (wlPodMap, error) {
 	enabledWorkloads := managerutil.GetEnv(ctx).EnabledWorkloadKinds
 	podMap := make(wlPodMap)
 	for _, pod := range pods {
-		if !podIsPendingOrRunning(pod) {
+		if !include(pod) {
 			continue
 		}
 		wl, err := podOwnerWorkload(ctx, pod, enabledWorkloads)
