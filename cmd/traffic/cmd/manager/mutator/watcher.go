@@ -165,7 +165,12 @@ func (c *configWatcher) RegenerateAgentMaps(ctx context.Context, agentImage stri
 
 func (c *configWatcher) regenerateAgentConfigs(ctx context.Context, ns string, gc *agentmap.GeneratorConfig) error {
 	clog.Debugf(ctx, "regenerate agent maps %s", whereWeWatch(ns))
-	evictMap, err := podList(ctx, ns)
+	// Only configuration-bearing pods contribute to regeneration. Resolving
+	// unrelated owners first can block restoration on an irrelevant lookup.
+	evictMap, err := podList(ctx, ns, func(pod *core.Pod) bool {
+		_, annotated := pod.Annotations[annotation.Config]
+		return annotated && podIsPendingOrRunning(pod)
+	})
 	if err != nil {
 		return err
 	}
@@ -180,11 +185,7 @@ func (c *configWatcher) regenerateAgentConfigs(ctx context.Context, ns string, g
 		wls := make(map[WorkloadKey]*agentconfig.Sidecar, len(wp.pods))
 		podsOfInterest := make([]*core.Pod, 0, len(wp.pods))
 		for _, pod := range wp.pods {
-			cfgJSON, ok := pod.Annotations[annotation.Config]
-			if !ok {
-				continue
-			}
-			sc, err := agentconfig.UnmarshalJSON(cfgJSON)
+			sc, err := agentconfig.UnmarshalJSON(pod.Annotations[annotation.Config])
 			if err != nil {
 				clog.Errorf(ctx, "unable to unmarshal agent config from annotation in pod %s.%s: %v", pod.Name, pod.Namespace, err)
 				continue

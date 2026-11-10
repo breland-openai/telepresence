@@ -80,7 +80,7 @@ func (c *configWatcher) evictAllPodsWithAgentConfigAndWait(ctx context.Context, 
 	failedWorkloads := make(map[WorkloadKey]struct{})
 	var errs error
 	for {
-		evictMap, err := podList(ctx, namespace)
+		evictMap, err := podList(ctx, namespace, podIsPendingOrRunning)
 		if err != nil {
 			return errors.Join(errs, err)
 		}
@@ -630,7 +630,7 @@ func getPodLister(ctx context.Context, namespace string) (lister podLister) {
 	return lister
 }
 
-func podList(ctx context.Context, namespace string) (wlPodMap, error) {
+func podList(ctx context.Context, namespace string, include func(*core.Pod) bool) (wlPodMap, error) {
 	lister := getPodLister(ctx, namespace)
 	pods, err := lister.List(labels.Everything())
 	if err != nil {
@@ -639,7 +639,7 @@ func podList(ctx context.Context, namespace string) (wlPodMap, error) {
 	enabledWorkloads := managerutil.GetEnv(ctx).EnabledWorkloadKinds
 	podMap := make(wlPodMap)
 	for _, pod := range pods {
-		if !podIsPendingOrRunning(pod) {
+		if !include(pod) {
 			continue
 		}
 		wl, err := podOwnerWorkload(ctx, pod, enabledWorkloads)
