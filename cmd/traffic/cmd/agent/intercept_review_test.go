@@ -74,7 +74,7 @@ func testInterceptReviewWatch(t *testing.T, mode string) {
 	snapshots := make(chan interceptSnapshot, 1)
 	done := make(chan error, 2)
 	go func() {
-		done <- interceptWatchLoop(ctx, mgr, session, &rpc.AgentInfo{}, snapshots, time.Second, readiness)
+		done <- interceptWatchLoop(ctx, mgr, session, &rpc.AgentInfo{}, snapshots, time.Second, readiness, func() {})
 	}()
 	go func() { done <- handleInterceptLoop(ctx, mgr, session, snapshots, state, readiness) }()
 	defer func() {
