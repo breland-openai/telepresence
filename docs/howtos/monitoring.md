@@ -57,15 +57,6 @@ To enable Prometheus metrics for your traffic manager, follow these steps:
    | `telepresence_auth_invalid_tokens`       | Counter  | Bearer tokens the API server rejected.                                         | `listener`                               |
    | `telepresence_auth_api_failures`         | Counter  | `TokenReview` calls that failed for infrastructure reasons.                    | `listener`                               |
 
-   A shared Service can contribute one verification decision for each participating workload.
-   A `hit` reuses verified pod identities and a connected sidecar. A `fallback` enters live
-   reconciliation with cached checks enabled, and `disabled` enters it with cached checks
-   disabled. Live reconciliation can still fail. Dry runs and manually configured agents
-   that bypass this verification do not contribute to the counter.
-
-   Before the metrics server starts, the manager logs the start and elapsed time of
-   traffic-agent informer setup and initial agent configuration regeneration at info level.
-
 4. **Enable Scraping for Traffic Manager Metrics**
    To ensure that these metrics are collected regularly by your Prometheus server and to maintain a historical record, it's essential to enable scraping. If you're using the default Prometheus configuration, you can achieve this by specifying specific pod annotations as follows:
 
@@ -80,12 +71,22 @@ To enable Prometheus metrics for your traffic manager, follow these steps:
 
    These annotations instruct Prometheus to scrape metrics from the Traffic Manager pod, allowing you to track consumption metrics and other important data over time.
 
+## Sidecar Pod Checks
+
+A shared Service can contribute one verification decision for each participating workload.
+A `hit` reuses verified pod identities and a connected sidecar. A `fallback` enters live
+reconciliation with cached checks enabled, and `disabled` enters it with cached checks
+disabled. Live reconciliation can still fail. Dry runs and manually configured agents
+that bypass this verification do not contribute to the counter.
+
+Before the metrics server starts, the manager logs the start and elapsed time of
+traffic-agent informer setup and initial agent configuration regeneration at info level.
+
 ## External Endpoint Authentication Metrics
 
 The `telepresence_auth_*` counters carry a `listener` label distinguishing
-the `external` control endpoint from the `internal` in-cluster one; today
-only the external listener is instrumented, and its series exist only when
-the traffic-manager publishes an
+the `external` control endpoint from the `internal` in-cluster one.
+The external series exists when the traffic-manager publishes an
 [external control endpoint](../reference/external-endpoint.md). That
 listener authenticates callers the Kubernetes API server has not vetted:
 anyone with network access to it can submit a bearer token, and each
