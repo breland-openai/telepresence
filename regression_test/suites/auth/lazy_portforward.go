@@ -92,36 +92,8 @@ func deleteAppAttachRole(t *testing.T, ctx context.Context, r *rt.Runtime, name,
 	}
 }
 
-// portForwardRefusalLogged reports whether the root daemon's log recorded a
-// pods/portforward refusal for a pod in ns: daemon.log, or any
-// daemon-*.log this run rotated. The needle matches the "<pod>.<ns>
-// refused" part of the message, so the pod's generated name doesn't matter.
-func portForwardRefusalLogged(t *testing.T, r *rt.Runtime, ns string) bool {
-	t.Helper()
-	needle := fmt.Sprintf(".%s refused (pods/portforward)", ns)
-	paths, err := filepath.Glob(filepath.Join(r.LogDir(), "daemon*.log"))
-	if err != nil {
-		t.Fatalf("globbing daemon logs: %v", err)
-	}
-	for _, p := range paths {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		if strings.Contains(string(data), needle) {
-			return true
-		}
-	}
-	return false
-}
-
-// AttachWithoutPortForward proves the fail-fast path
-// (pkg/client/agentpf/clients.go's WaitForIP, pkg/client/userd/trafficmgr/
-// podaccess.go's ensureAccess): an identity that can connect and attach
-// (connections/attachments.telepresence.io) but holds no pods/portforward
-// in the target namespace, and has no QUIC tunnel available either, fails
-// its intercept quickly with a clear error instead of hanging, and the
-// refusal is logged once for the refused pod.
+// AttachWithoutPortForward covers an identity with a policy grant to attach but
+// no usable channel for intercepted traffic.
 type AttachWithoutPortForward struct {
 	rt.Suite
 }
@@ -130,12 +102,7 @@ func init() {
 	rt.Register(&AttachWithoutPortForward{}, rt.InArea("auth"), rt.NeedsManager(authGrantSpec("telepresence")))
 }
 
-// Test_InterceptWithoutPodsPortForward creates an identity that can connect
-// and attach but has no pods/portforward in the app namespace, connects as
-// that identity, and asserts that an intercept attempt fails quickly with
-// an error naming both the missing pods/portforward grant and the QUIC
-// tunnel, and that the root daemon logged the pod as refused for direct
-// agent access.
+// Test_InterceptWithoutPodsPortForward rejects the attachment before injecting an agent.
 func (s *AttachWithoutPortForward) Test_InterceptWithoutPodsPortForward() {
 	t := s.T()
 	ctx := s.Ctx()
@@ -162,6 +129,15 @@ func (s *AttachWithoutPortForward) Test_InterceptWithoutPodsPortForward() {
 	interceptOpts := append(rt.ToLocal(ls, "http")(), cli.MountFalse()()...)
 	iArgs := append([]string{"intercept", wl.Name, "--namespace", ns}, interceptOpts...)
 
+	podUIDs := func() string {
+		out, err := r.Kubectl(ctx, ns, "get", "pods", "-l", "app="+wl.Name,
+			"-o", `jsonpath={range .items[*]}{.metadata.uid}{" "}{.spec.containers[*].name}{"\n"}{end}`)
+		s.Require().NoError(err)
+		result := strings.TrimSpace(out)
+		s.Require().NotEmpty(result, "expected a live workload pod")
+		return result
+	}
+	before := podUIDs()
 	start := time.Now()
 	_, stderr, err := r.CLI().Run(ctx, iArgs...)
 	elapsed := time.Since(start)
@@ -171,8 +147,6 @@ func (s *AttachWithoutPortForward) Test_InterceptWithoutPodsPortForward() {
 	s.Contains(stderr, "QUIC tunnel")
 	s.Less(elapsed, interceptFailTimeout, "intercept should fail quickly instead of waiting out a timeout")
 
-	s.Eventually(func() bool {
-		return portForwardRefusalLogged(t, r, ns)
-	}, 30*time.Second, 500*time.Millisecond,
-		"expected the root daemon log to record the pods/portforward refusal for namespace %s", ns)
+	s.Contains(stderr, "No intercept was created")
+	s.Equal(before, podUIDs(), "a rejected attachment must preserve the workload's running pods")
 }

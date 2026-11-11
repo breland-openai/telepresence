@@ -14,13 +14,15 @@ import (
 // root_daemon object this area asserts on: the fields
 // pkg/client/cli/cmd/status.go's RootDaemonStatus promotes from its embedded
 // *client.RoutingSnake (subnets, never_proxy_subnets) plus its named DNS
-// field (dns.include_suffixes). regression_test/framework/cli.Status only
+// fields (dns.include_suffixes and dns.preserve_local_cluster_dns_names).
+// regression_test/framework/cli.Status only
 // mirrors the top-level running/version fields, not these, so this area
 // keeps its own narrower mirror instead of widening the shared one.
 type daemonStatus struct {
 	RootDaemon struct {
 		DNS struct {
-			IncludeSuffixes []string `json:"include_suffixes"`
+			IncludeSuffixes              []string `json:"include_suffixes"`
+			PreserveLocalClusterDNSNames []string `json:"preserve_local_cluster_dns_names"`
 		} `json:"dns"`
 		Subnets           []string `json:"subnets"`
 		AlsoProxy         []string `json:"also_proxy_subnets"`

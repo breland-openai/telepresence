@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -77,6 +78,10 @@ type State struct {
 	// need to exceed the context of a request into the state object, e.g. session contexts.
 	backgroundCtx context.Context
 
+	// Registration and removal must finish reconciling intercepts before the
+	// same pod UID can establish another session.
+	agentSessionMu sync.Mutex
+
 	allClientSessionsFinalizer allClientSessionsFinalizer
 	allInterceptsFinalizer     allInterceptsFinalizer
 	participantAuthorizer      participantAuthorizer
@@ -88,6 +93,8 @@ type State struct {
 	llSubs                     *loglevelSubscribers
 	workloadWatchers           *xsync.Map[string, Watcher] // workload watchers, created on demand and keyed by namespace
 	serviceInterceptWatchers   *xsync.Map[string, struct{}]
+	sidecarAgentWaits          sync.Map
+	sidecarPodChecks           struct{ hit, fallback, disabled atomic.Uint64 }
 
 	// nodeAgentPodWatchers tracks the running per-workload node-agent pod-set
 	// watchers (nodeAgentPodWatchLoop), one per name+namespace with at least
@@ -249,15 +256,15 @@ func (s *State) pruneSessions(ctx context.Context) {
 		}
 		return true
 	})
-	var sids []tunnel.SessionID
-	s.agents.Range(func(s tunnel.SessionID, c *AgentSession) bool {
+	var agents []*AgentSession
+	s.agents.Range(func(_ tunnel.SessionID, c *AgentSession) bool {
 		if !slices.Contains(nss, c.Namespace) {
-			sids = append(sids, s)
+			agents = append(agents, c)
 		}
 		return true
 	})
-	for _, sid := range sids {
-		s.removeAgentSession(sid)
+	for _, agent := range agents {
+		s.RemoveAgentSession(agent)
 	}
 }
 
@@ -337,18 +344,44 @@ func (s *State) checkAgentsForIntercept(intercept *Intercept) (errCode rpc.Inter
 func (s *State) RemoveSession(ctx context.Context, id tunnel.SessionID) {
 	if cs, ok := s.clients.LoadAndDelete(id); ok {
 		s.removeClientSession(cs)
-	} else {
-		s.removeAgentSession(id)
+	} else if agent, ok := s.agents.Load(id); ok {
+		s.RemoveAgentSession(agent)
 	}
 }
 
-// removeAgentSession removes an AgentSession from the set of present session IDs.
-func (s *State) removeAgentSession(id tunnel.SessionID) {
-	if as, loaded := s.agents.LoadAndDelete(id); loaded {
-		clog.Debugf(s.backgroundCtx, "AgentSession %s removed. Explicit removal", id)
-		mutator.GetMap(s.backgroundCtx).Inactivate(types.UID(as.PodUid))
-		s.consolidateAgentSessionIntercepts(as)
+// RemoveAgentSession removes only the given session, preserving a replacement
+// that has already registered with the same pod UID.
+func (s *State) RemoveAgentSession(agent *AgentSession) {
+	s.agentSessionMu.Lock()
+	defer s.agentSessionMu.Unlock()
+
+	if current, ok := s.agents.Load(agent.sessionID()); ok && current == agent {
+		s.removeAgentSessionLocked(agent, true)
 	}
+}
+
+func (s *State) expireAgentSession(agent *AgentSession, moment time.Time) {
+	s.agentSessionMu.Lock()
+	defer s.agentSessionMu.Unlock()
+
+	if current, ok := s.agents.Load(agent.sessionID()); ok && current == agent && agent.lastMarked().Before(moment) {
+		s.removeAgentSessionLocked(agent, false)
+	}
+}
+
+func (s *State) removeAgentSessionLocked(agent *AgentSession, inactivate bool) {
+	agent.reviewMu.Lock()
+	id := agent.sessionID()
+	s.agents.Delete(id)
+	if inactivate {
+		clog.Debugf(s.backgroundCtx, "AgentSession %s removed. Explicit removal", id)
+		mutator.GetMap(s.backgroundCtx).Inactivate(types.UID(agent.PodUid))
+	} else {
+		clog.Infof(s.backgroundCtx, "AgentSession %s expired; last heartbeat %s", id, agent.lastMarked())
+	}
+	agent.cancel()
+	agent.reviewMu.Unlock()
+	s.consolidateAgentSessionIntercepts(agent)
 }
 
 // removeClientSession removes an AgentSession from the set of present session IDs.
@@ -622,10 +655,9 @@ func (s *State) expireSessions(clientMoment, agentMoment time.Time) {
 		}
 		return true
 	})
-	s.agents.Range(func(id tunnel.SessionID, agent *AgentSession) bool {
-		moment := agentMoment
-		if agent.lastMarked().Before(moment) {
-			s.removeAgentSession(id)
+	s.agents.Range(func(_ tunnel.SessionID, agent *AgentSession) bool {
+		if agent.lastMarked().Before(agentMoment) {
+			s.expireAgentSession(agent, agentMoment)
 		}
 		return true
 	})
@@ -655,12 +687,26 @@ func (s *State) AddClient(client *rpc.ClientInfo, principal *auth.Principal, now
 	return sessionID
 }
 
-func (s *State) RestoreClient(sessionID tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) {
-	s.addClient(sessionID, client, principal, now)
+// RestoreClient returns the session and whether another request already restored it.
+func (s *State) RestoreClient(sessionID tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) (*ClientSession, bool) {
+	return s.clients.LoadOrCompute(sessionID, func() (*ClientSession, bool) {
+		cs := newClientSessionState(s.backgroundCtx, sessionID, client, now)
+		if principal != nil {
+			cs.SetPrincipal(principal)
+		}
+		return cs, false
+	})
 }
 
 func (s *State) RestoreAgents(agents []*rpc.AgentInfo, now time.Time) {
+	s.agentSessionMu.Lock()
+	defer s.agentSessionMu.Unlock()
+
+	m := mutator.GetMap(s.backgroundCtx)
 	for _, newAgent := range agents {
+		if m.IsInactive(types.UID(newAgent.PodUid)) {
+			continue
+		}
 		id := tunnel.SessionID(AgentSessionIDPrefix + newAgent.PodUid)
 		s.agents.LoadOrCompute(id, func() *AgentSession {
 			return newAgentSessionState(s.backgroundCtx, id, newAgent, now)
@@ -685,15 +731,13 @@ func (s *State) RestoreIntercepts(ctx context.Context, intercepts []*rpc.Interce
 		is, _ := s.intercepts.LoadOrCompute(intercept.Id, func() *Intercept {
 			is := &Intercept{InterceptInfo: intercept}
 			s.initializeParticipants(is)
-			wl, err := agentmap.GetWorkload(ctx, spec.Agent, spec.Namespace, k8sapi.Kind(spec.WorkloadKind))
-			if err == nil {
-				is.addFinalizer(func(ctx context.Context, interceptInfo *rpc.InterceptInfo) error {
-					return s.restoreAppContainer(ctx, interceptInfo, wl)
-				})
-			}
 			if spec.NodeAgent {
 				is.addFinalizer(s.nodeAgentReapFinalizer())
 				nodeAgentWatches[nodeAgentWatchKey{name: spec.Agent, namespace: spec.Namespace}] = struct{}{}
+			} else if wl, err := agentmap.GetWorkload(ctx, spec.Agent, spec.Namespace, k8sapi.Kind(spec.WorkloadKind)); err == nil {
+				is.addFinalizer(func(ctx context.Context, interceptInfo *rpc.InterceptInfo) error {
+					return s.restoreAppContainer(ctx, interceptInfo, wl)
+				})
 			}
 			if serviceScopedIntercept(spec) {
 				serviceInterceptWatches[intercept.Id] = struct{}{}
@@ -741,13 +785,9 @@ func (s *State) restoreChildIntercepts(parent *Intercept, now time.Time) {
 }
 
 // addClient is like AddClient but takes a sessionID, for testing purposes.
-func (s *State) addClient(id tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) {
-	cs := newClientSessionState(s.backgroundCtx, id, client, now)
-	if principal != nil {
-		cs.SetPrincipal(principal)
-	}
-	if oldClient, hasConflict := s.clients.LoadOrStore(id, cs); hasConflict {
-		panic(fmt.Errorf("duplicate id %q, existing %+v, new %+v", id, oldClient, client))
+func (s *State) addClient(sessionID tunnel.SessionID, client *rpc.ClientInfo, principal *auth.Principal, now time.Time) {
+	if old, loaded := s.RestoreClient(sessionID, client, principal, now); loaded {
+		panic(fmt.Errorf("duplicate id %q, existing %+v, new %+v", sessionID, old, client))
 	}
 }
 
@@ -779,6 +819,23 @@ func ClientOwnershipError(ctx context.Context, sessionID tunnel.SessionID, clien
 
 func (s *State) EachClient(f func(tunnel.SessionID, *ClientSession) bool) {
 	s.clients.Range(f)
+}
+
+// RegisterSidecarPodCheckMetrics exposes one decision per workload entering sidecar
+// verification. Keep the counters on State so early requests and concurrent scrapes
+// see the same totals regardless of when the metrics server starts.
+func (s *State) RegisterSidecarPodCheckMetrics(reg prometheus.Registerer) {
+	for path, count := range map[string]*atomic.Uint64{
+		"hit":      &s.sidecarPodChecks.hit,
+		"fallback": &s.sidecarPodChecks.fallback,
+		"disabled": &s.sidecarPodChecks.disabled,
+	} {
+		reg.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name:        "telepresence_sidecar_pod_checks_total",
+			Help:        "Workload sidecar verification decisions by cache path.",
+			ConstLabels: prometheus.Labels{"path": path},
+		}, func() float64 { return float64(count.Load()) }))
+	}
 }
 
 func (s *State) CountAgents() int {
@@ -835,13 +892,16 @@ func (s *State) IsInterceptedBy(agent *AgentSession, client tunnel.SessionID) (f
 // Sessions: Agents ////////////////////////////////////////////////////////////////////////////////
 
 func (s *State) AddAgent(ctx context.Context, agent *rpc.AgentInfo, principal *auth.Principal, now time.Time) (tunnel.SessionID, error) {
-	if mutator.GetMap(ctx).IsInactive(types.UID(agent.PodUid)) {
-		return "", status.Error(codes.Aborted, "inactivated pod")
-	}
 	return s.RestoreAgent(ctx, tunnel.SessionID(AgentSessionIDPrefix+agent.PodUid), agent, principal, now)
 }
 
 func (s *State) RestoreAgent(ctx context.Context, id tunnel.SessionID, agent *rpc.AgentInfo, principal *auth.Principal, now time.Time) (tunnel.SessionID, error) {
+	s.agentSessionMu.Lock()
+	defer s.agentSessionMu.Unlock()
+
+	if mutator.GetMap(s.backgroundCtx).IsInactive(types.UID(agent.PodUid)) {
+		return "", status.Error(codes.Aborted, "inactivated pod")
+	}
 	as := newAgentSessionState(s.backgroundCtx, id, agent, now)
 	if principal != nil {
 		as.SetPrincipal(principal)
@@ -1006,6 +1066,14 @@ func (s *State) UpdateIntercept(interceptID string, apply func(*Intercept)) *Int
 // they become active; workload-scoped intercepts retain the historical
 // first-review-wins behavior.
 func (s *State) ApplyAgentReview(ctx context.Context, interceptID string, agent *AgentSession, review *rpc.ReviewInterceptRequest) *Intercept {
+	agent.reviewMu.RLock()
+	defer agent.reviewMu.RUnlock()
+	select {
+	case <-agent.done():
+		intercept, _ := s.intercepts.Load(interceptID)
+		return intercept
+	default:
+	}
 	return s.UpdateIntercept(interceptID, func(intercept *Intercept) {
 		if !AgentMatchesInterceptInfo(agent.AgentInfo, intercept) {
 			return
@@ -1015,17 +1083,18 @@ func (s *State) ApplyAgentReview(ctx context.Context, interceptID string, agent 
 			return
 		}
 
-		// Agents race to review an intercept, so only reviews for waiting
-		// intercepts can change its state.
+		if serviceScopedIntercept(intercept.Spec) {
+			// Participant reconciliation reopens an unavailable Service once every workload is eligible.
+			if intercept.Disposition != rpc.InterceptDispositionType_WAITING {
+				return
+			}
+			intercept.applyServiceReview(agent.AgentInfo, review)
+			return
+		}
 		if intercept.Disposition != rpc.InterceptDispositionType_NO_AGENT &&
 			intercept.Disposition != rpc.InterceptDispositionType_WAITING {
 			return
 		}
-		if serviceScopedIntercept(intercept.Spec) {
-			intercept.applyServiceReview(agent.AgentInfo, review)
-			return
-		}
-
 		applyReview(intercept, review)
 		intercept.PodName = agent.PodName
 	})

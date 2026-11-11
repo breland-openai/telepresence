@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -17,14 +20,133 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	connectorRpc "github.com/telepresenceio/telepresence/rpc/v2/connector"
 	rootdRpc "github.com/telepresenceio/telepresence/rpc/v2/daemon"
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
+	cliDaemon "github.com/telepresenceio/telepresence/v2/pkg/client/cli/daemon"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/remotefs"
+	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
 )
+
+func TestSessionStatusUsesManagerInstallIDWithoutKubernetes(t *testing.T) {
+	server := &rootDaemonReconnectTestServer{}
+	conn, cleanup, err := dialTestRootDaemon(server)
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	s := rootStatusTestSession(t.Context(), conn, "manager-namespace-id")
+	info, err := s.Status(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "manager-namespace-id", info.ManagerInstallId)
+}
+
+func TestSessionStatusForwardsCallerDeadlineToRootDaemon(t *testing.T) {
+	server := &rootDaemonStalledStatusTestServer{started: make(chan struct{}), canceled: make(chan struct{})}
+	conn, cleanup, err := dialTestRootDaemon(server)
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	s := rootStatusTestSession(t.Context(), conn, "manager-namespace-id")
+	requestCtx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, callErr := s.Status(requestCtx)
+		result <- callErr
+	}()
+	select {
+	case <-server.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("root daemon status was not called")
+	}
+	select {
+	case err = <-result:
+		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	case <-time.After(2 * time.Second):
+		t.Fatal("root daemon status did not respect the request deadline")
+	}
+	select {
+	case <-server.canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("root daemon status handler did not observe request cancellation")
+	}
+	require.NoError(t, s.Err())
+}
+
+func TestSessionStatusFallbackKubernetesHonorsCallerCancellation(t *testing.T) {
+	started := make(chan string, 1)
+	canceled := make(chan struct{})
+	api := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		started <- r.Method + " " + r.URL.Path
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	t.Cleanup(api.Close)
+	ki, err := kubernetes.NewForConfig(&rest.Config{Host: api.URL})
+	require.NoError(t, err)
+	conn, cleanup, err := dialTestRootDaemon(&rootDaemonReconnectTestServer{})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	s := rootStatusTestSession(k8sapi.WithK8sInterface(t.Context(), ki), conn, "")
+	requestCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, callErr := s.Status(requestCtx)
+		result <- callErr
+	}()
+	select {
+	case request := <-started:
+		require.Equal(t, "GET /api/v1/namespaces/ambassador", request)
+	case err = <-result:
+		t.Fatalf("status returned before requesting its manager namespace ID: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the older session did not request its manager namespace ID")
+	}
+	cancel()
+	select {
+	case err = <-result:
+		require.Equal(t, codes.Canceled, status.Code(err))
+	case <-time.After(2 * time.Second):
+		t.Fatal("the namespace lookup did not respect request cancellation")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Kubernetes handler did not observe request cancellation")
+	}
+	require.NoError(t, s.Err())
+}
+
+func rootStatusTestSession(ctx context.Context, conn *grpc.ClientConn, managerInstallID string) *session {
+	cfg := client.GetDefaultConfig()
+	cfg.Cluster().DefaultManagerNamespace = "ambassador"
+	ctx = client.WithConfig(ctx, cfg)
+	return &session{
+		Cluster: &k8s.Cluster{Kubeconfig: &k8s.Kubeconfig{
+			Context: ctx, Namespace: "default", KubeContext: "test", Server: "https://cluster.example",
+		}},
+		daemonID:       cliDaemon.NewIdentifier("test", "test", "default", false),
+		sessionInfo:    &manager.SessionInfo{SessionId: "test-session", ManagerInstallId: managerInstallID},
+		rootDaemon:     rootdRpc.NewDaemonClient(conn),
+		currentIngests: xsync.NewMap[ingestKey, *ingest](),
+	}
+}
+
+type rootDaemonStalledStatusTestServer struct {
+	rootdRpc.UnimplementedDaemonServer
+	started, canceled chan struct{}
+}
+
+func (s *rootDaemonStalledStatusTestServer) Status(ctx context.Context, _ *emptypb.Empty) (*rootdRpc.DaemonStatus, error) {
+	close(s.started)
+	<-ctx.Done()
+	close(s.canceled)
+	return nil, ctx.Err()
+}
 
 func TestRootDaemonActivityWatcherReconnectsRootDaemon(t *testing.T) {
 	const sessionID = "test-session"
@@ -88,24 +210,22 @@ func TestRootDaemonActivityWatcherReconnectsRootDaemon(t *testing.T) {
 
 	require.NoError(t, s.connectRootDaemon(ctx, nc, nil, false))
 	require.Eventually(t, func() bool {
-		return second.connectCount.Load() == 1
-	}, time.Second, 10*time.Millisecond)
+		var name string
+		err := s.WithRootClient(ctx, func(ctx context.Context, rd rootdRpc.DaemonClient) error {
+			st, err := rd.Status(ctx, &emptypb.Empty{})
+			name = st.GetOutboundConfig().GetManagerNamespace()
+			return err
+		})
+		return err == nil && name == "second"
+	}, 5*time.Second, 10*time.Millisecond)
 
 	require.Equal(t, int32(2), dialCount.Load())
 	require.Equal(t, int32(1), first.connectCount.Load())
 	require.Equal(t, int32(1), second.connectCount.Load())
-
-	err := s.WithRootClient(ctx, func(ctx context.Context, rd rootdRpc.DaemonClient) error {
-		st, err := rd.Status(ctx, &emptypb.Empty{})
-		require.NoError(t, err)
-		require.Equal(t, "second", st.GetOutboundConfig().GetManagerNamespace())
-		return nil
-	})
-	require.NoError(t, err)
 }
 
 func TestReconnectRootDaemonStopsWhenRootDaemonIsGone(t *testing.T) {
-	quit, dialCount := startFailingRootDaemonReconnect(t, false)
+	quit, dialCount := startFailingRootDaemonReconnect(t, t.Context(), func(context.Context) bool { return false })
 	select {
 	case <-quit:
 	case <-time.After(2 * time.Second):
@@ -115,7 +235,7 @@ func TestReconnectRootDaemonStopsWhenRootDaemonIsGone(t *testing.T) {
 }
 
 func TestReconnectRootDaemonKeepsRetryingWhileRootDaemonIsRunning(t *testing.T) {
-	quit, dialCount := startFailingRootDaemonReconnect(t, true)
+	quit, dialCount := startFailingRootDaemonReconnect(t, t.Context(), func(context.Context) bool { return true })
 	select {
 	case <-quit:
 		t.Fatal("the user daemon quit while the root daemon was running")
@@ -124,13 +244,34 @@ func TestReconnectRootDaemonKeepsRetryingWhileRootDaemonIsRunning(t *testing.T) 
 	require.Greater(t, dialCount.Load(), int32(2))
 }
 
+func TestCanceledReconnectPreservesUserDaemon(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	checked := make(chan struct{})
+	quit, _ := startFailingRootDaemonReconnect(t, ctx, func(context.Context) bool {
+		cancel()
+		close(checked)
+		return false
+	})
+	select {
+	case <-checked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("root daemon liveness was never checked")
+	}
+	select {
+	case <-quit:
+		t.Fatal("canceling the session stopped the user daemon")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 // startFailingRootDaemonReconnect connects a session to a root daemon whose activity
 // watcher fails at once, and fails every later dial. The returned channel closes when
 // the session asks the user daemon to quit.
-func startFailingRootDaemonReconnect(t *testing.T, running bool) (<-chan struct{}, *atomic.Int32) {
+func startFailingRootDaemonReconnect(t *testing.T, parent context.Context, running func(context.Context) bool) (<-chan struct{}, *atomic.Int32) {
 	const sessionID = "test-session"
 
-	ctx, cancel := context.WithCancel(client.WithConfig(context.Background(), client.GetDefaultConfig()))
+	ctx, cancel := context.WithCancel(client.WithConfig(parent, client.GetDefaultConfig()))
 	t.Cleanup(cancel)
 
 	first := &rootDaemonReconnectTestServer{
@@ -164,7 +305,7 @@ func startFailingRootDaemonReconnect(t *testing.T, running bool) (<-chan struct{
 		service:           quitTestService{quitter: quitter},
 		sessionInfo:       &manager.SessionInfo{SessionId: sessionID},
 		dialRootDaemon:    dialRootDaemon,
-		rootDaemonRunning: func(context.Context) bool { return running },
+		rootDaemonRunning: running,
 	}
 	nc := &rootdRpc.NetworkConfig{
 		Namespace: "default",

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -13,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	authnv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -102,6 +104,110 @@ func TestAuthenticate_AudienceFallback(t *testing.T) {
 	p, err = a.Authenticate(context.Background(), "user-token")
 	require.NoError(t, err)
 	assert.Equal(t, "some-user", p.Username)
+}
+
+func TestAuthenticateManagerKubernetesSeparatesOrdinaryCredentialCache(t *testing.T) {
+	for _, observerFirst := range []bool{false, true} {
+		name := "ordinary first"
+		if observerFirst {
+			name = "observer first"
+		}
+		t.Run(name, func(t *testing.T) {
+			ci := fake.NewClientset()
+			var managerReviews, apiReviews int
+			k8sapi.InstallFakeTokenReviews(ci, func(token string, audiences []string) *authnv1.TokenReviewStatus {
+				if len(audiences) == 1 && audiences[0] == agentconfig.ManagerTokenAudience {
+					managerReviews++
+				} else {
+					apiReviews++
+					require.Equal(t, []string{"https://kubernetes.example"}, audiences)
+					if token == "api-only" {
+						s := authenticatedStatus("system:serviceaccount:routing:observer", "observer-uid")
+						s.Audiences = audiences
+						return s
+					}
+				}
+				return &authnv1.TokenReviewStatus{Authenticated: false}
+			})
+			a := auth.NewAuthenticator(ci)
+			ctx := authenticator.WithAudiences(context.Background(), authenticator.Audiences{"https://kubernetes.example"})
+			ordinary := func() {
+				p, err := a.Authenticate(ctx, "api-only")
+				require.NoError(t, err)
+				require.Equal(t, "observer-uid", p.UID)
+			}
+			observer := func() {
+				p, err := a.AuthenticateManagerKubernetes(ctx, "api-only")
+				require.ErrorIs(t, err, auth.ErrInvalidToken)
+				require.Nil(t, p)
+			}
+			if observerFirst {
+				observer()
+				ordinary()
+			} else {
+				ordinary()
+				observer()
+			}
+			for range 3 {
+				ordinary()
+				observer()
+			}
+			require.Equal(t, 2, managerReviews, "each independent cache performs its first Kubernetes review once")
+			require.Equal(t, 1, apiReviews, "only the ordinary credential path may use the API audience")
+		})
+	}
+}
+
+func TestAuthenticateManagerKubernetesRequiresKubernetesAndCachesManagerReview(t *testing.T) {
+	ci := fake.NewClientset()
+	var reviews []string
+	k8sapi.InstallFakeTokenReviews(ci, func(token string, audiences []string) *authnv1.TokenReviewStatus {
+		reviews = append(reviews, token)
+		require.Equal(t, []string{agentconfig.ManagerTokenAudience}, audiences)
+		if token == "manager-only" {
+			s := authenticatedStatus("system:serviceaccount:routing:observer", "observer-uid")
+			s.Audiences = audiences
+			return s
+		}
+		return &authnv1.TokenReviewStatus{Authenticated: false}
+	})
+	minted := auth.NewMintedTokens()
+	minted.InvalidateAll(1)
+	certToken, _, err := minted.Mint(&auth.Principal{Username: "x509-user", UID: "cert-uid"}, "certificate-fingerprint", time.Now().Add(time.Hour), 1)
+	require.NoError(t, err)
+	a := auth.NewAuthenticator(ci, auth.WithMintedTokens(minted))
+	for range 3 {
+		p, authenticateErr := a.Authenticate(context.Background(), certToken)
+		require.NoError(t, authenticateErr)
+		require.Equal(t, "cert-uid", p.UID)
+		p, authenticateErr = a.AuthenticateManagerKubernetes(context.Background(), certToken)
+		require.ErrorIs(t, authenticateErr, auth.ErrInvalidToken)
+		require.Nil(t, p)
+		p, authenticateErr = a.AuthenticateManagerKubernetes(context.Background(), "manager-only")
+		require.NoError(t, authenticateErr)
+		require.Equal(t, "observer-uid", p.UID)
+	}
+	require.Equal(t, []string{certToken, "manager-only"}, reviews)
+}
+
+func TestAuthenticateManagerKubernetesInfrastructureErrorCannotFallback(t *testing.T) {
+	ci := fake.NewClientset()
+	failure := errors.New("Kubernetes manager-audience review unavailable")
+	var reviews int
+	ci.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		reviews++
+		review := action.(k8stesting.CreateAction).GetObject().(*authnv1.TokenReview)
+		require.Equal(t, []string{agentconfig.ManagerTokenAudience}, review.Spec.Audiences)
+		return true, nil, failure
+	})
+	a := auth.NewAuthenticator(ci)
+	for range 2 {
+		p, err := a.AuthenticateManagerKubernetes(context.Background(), "outage")
+		require.ErrorIs(t, err, failure)
+		require.NotErrorIs(t, err, auth.ErrInvalidToken)
+		require.Nil(t, p)
+	}
+	require.Equal(t, 1, reviews)
 }
 
 func TestAuthenticate_InvalidToken(t *testing.T) {

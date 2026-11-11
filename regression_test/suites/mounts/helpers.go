@@ -2,7 +2,7 @@ package mounts
 
 import (
 	"path/filepath"
-	"strings"
+	"slices"
 	"time"
 
 	"github.com/telepresenceio/telepresence/v2/regression_test/framework/rt"
@@ -33,15 +33,8 @@ const tokenRelPath = "var/run/secrets/kubernetes.io/serviceaccount/token"
 // The workloads package exports no equivalent constant (API gap).
 const configVolumeK8sName = "rtest-config"
 
-// envInterceptMounts is the attach environment key naming the colon-joined
-// list of remote mount paths the agent actually mounts (cmd/traffic/cmd/
-// agent/agent.go's buildEnv; pkg/agentconfig/sidecar.go's
-// EnvInterceptMounts). A path with mount policy MountPolicyIgnore is
-// dropped from this list before it ever reaches the client.
-const envInterceptMounts = "TELEPRESENCE_MOUNTS"
-
 // configFilePath is the local path the mounted ConfigMap file appears at
-// under root (rt.MountRoot's TELEPRESENCE_ROOT).
+// under rt.MountRoot's local mount directory.
 func configFilePath(root string) string {
 	return filepath.Join(root, workloads.ConfigVolumeMountPath, workloads.ConfigVolumeFileName)
 }
@@ -65,17 +58,21 @@ func isNonEmpty(b []byte) bool {
 	return len(b) > 0
 }
 
-// mountedPaths splits a's TELEPRESENCE_MOUNTS entry into its colon-separated
-// remote paths, or nil if the attach carries no such entry.
+// mountedPaths returns remote mounts, excluding local and ignored policies.
 func mountedPaths(a *rt.Attach) []string {
-	if a.Intercept == nil {
+	m := a.Mount()
+	if m == nil {
 		return nil
 	}
-	v := a.Intercept.Environment[envInterceptMounts]
-	if v == "" {
-		return nil
+	var paths []string
+	for path, policy := range m.Mounts {
+		switch policy {
+		case "Remote", "RemoteReadOnly":
+			paths = append(paths, path)
+		}
 	}
-	return strings.Split(v, ":")
+	slices.Sort(paths)
+	return paths
 }
 
 // containsPath reports whether paths contains path exactly.

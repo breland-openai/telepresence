@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -16,10 +17,12 @@ import (
 
 	"github.com/blang/semver/v4"
 	"github.com/cenkalti/backoff/v4"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"k8s.io/client-go/kubernetes"
 
@@ -43,6 +46,11 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/proc"
 	"github.com/telepresenceio/telepresence/v2/pkg/types"
 )
+
+type LocalClientRedirect struct {
+	Remote    types.AddrPortProto
+	LocalPort uint16
+}
 
 //nolint:gochecknoglobals // extension point
 var QuitDaemonFuncs = []func(context.Context){
@@ -226,6 +234,7 @@ func EnsureSession(ctx context.Context, useLine string, required bool) (context.
 			return ctx, err
 		}
 	}
+
 	return daemon.WithSession(ctx, s), nil
 }
 
@@ -275,6 +284,75 @@ func ResolveRemoteReroute(ctx context.Context, ds *daemon.Session, pm string) (e
 		SrcPort:     uint32(newPort.Port),
 	})
 	return tpGrpc.FromGRPC(err)
+}
+
+func ResolveLocalClientRedirect(ctx context.Context, ds *daemon.Session, pm string) (err error) {
+	ix := strings.LastIndexByte(pm, ':')
+	if ix < 3 {
+		return fmt.Errorf("invalid local client redirect %s", pm)
+	}
+	localPort, err := types.ParsePortAndProto(pm[ix+1:])
+	if err != nil {
+		return fmt.Errorf("invalid local client redirect %s: local port %w", pm, err)
+	}
+	hostPort, err := resolveHostPort(ctx, ds, localPort.Proto, pm[:ix])
+	if err != nil {
+		return err
+	}
+	hpb, err := hostPort.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	_, err = ds.AddLocalClientRedirect(ctx, &daemonRpc.ReroutePortRequest{
+		DstHostPort: hpb,
+		SrcPort:     uint32(localPort.Port),
+	})
+	return tpGrpc.FromGRPC(err)
+}
+
+func RemoveLocalClientRedirect(ctx context.Context, ds *daemon.Session, hp string) (err error) {
+	proto := types.ProtoTCP
+	if ix := strings.LastIndexByte(hp, types.ProtoSeparator); ix > 0 {
+		proto, err = types.ParseProto(hp[ix+1:])
+		if err != nil {
+			return fmt.Errorf("invalid local client redirect %s: protocol %w", hp, err)
+		}
+		hp = hp[:ix]
+	}
+	hostPort, err := resolveHostPort(ctx, ds, proto, hp)
+	if err != nil {
+		return err
+	}
+	hpb, err := hostPort.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	_, err = ds.RemoveLocalClientRedirect(ctx, &daemonRpc.ReroutePortRequest{
+		DstHostPort: hpb,
+	})
+	return tpGrpc.FromGRPC(err)
+}
+
+func ListLocalClientRedirects(ctx context.Context, ds *daemon.Session) ([]LocalClientRedirect, error) {
+	rsp, err := ds.ListLocalClientRedirects(ctx, &emptypb.Empty{})
+	if err != nil {
+		return nil, tpGrpc.FromGRPC(err)
+	}
+	redirects := make([]LocalClientRedirect, 0, len(rsp.Redirects))
+	for _, redirect := range rsp.Redirects {
+		var remote types.AddrPortProto
+		if err := remote.UnmarshalBinary(redirect.DstHostPort); err != nil {
+			return nil, err
+		}
+		if redirect.LocalPort > math.MaxUint16 {
+			return nil, fmt.Errorf("invalid local client redirect local port %d", redirect.LocalPort)
+		}
+		redirects = append(redirects, LocalClientRedirect{
+			Remote:    remote,
+			LocalPort: uint16(redirect.LocalPort),
+		})
+	}
+	return redirects, nil
 }
 
 func resolveHostPort(ctx context.Context, ds *daemon.Session, proto types.Proto, hostPortStr string) (hostPort types.AddrPortProto, err error) {
@@ -450,29 +528,27 @@ func launchHostDaemon(ctx context.Context, daemonID *daemon.Identifier, connecto
 	}
 	info := &daemon.Info{
 		DaemonPort:   fp[0].Port(),
+		HostID:       uuid.NewString(),
 		Name:         daemonID.Name,
 		KubeContext:  daemonID.KubeContext,
 		Namespace:    daemonID.Namespace,
 		ExposedPorts: cr.ExposedPorts,
 		Hostname:     cr.Hostname,
 	}
-	args = append(args, "--address", fmt.Sprintf("127.0.0.1:%d", info.DaemonPort))
+	args = append(args, "--address", fmt.Sprintf("127.0.0.1:%d", info.DaemonPort), "--host-id", info.HostID)
 	fn := daemonID.InfoFileName()
 	il := daemon.NewUserInfoLoader(ctx)
 	err = il.SaveInfo(info, fn)
 	if err != nil {
 		return ctx, errcat.NoDaemonLogs.New(err)
 	}
-
-	defer func() {
-		if err != nil {
-			file := daemonID.InfoFileName()
-			clog.Debugf(ctx, "Deleting daemon info %s due to launch error: %v", file, err)
-			_ = il.DeleteInfo(file)
-		}
-	}()
+	host, err := daemon.ReadHostInfo(ctx)
+	if err != nil {
+		return ctx, errcat.NoDaemonLogs.New(err)
+	}
 
 	if err = proc.StartInBackground(false, args...); err != nil {
+		_ = host.Delete(ctx)
 		return ctx, errcat.NoDaemonLogs.Errorf(err, "failed to launch the connector service")
 	}
 	conn, err := il.DialDaemon(ctx, true)
@@ -484,6 +560,7 @@ func launchHostDaemon(ctx context.Context, daemonID *daemon.Identifier, connecto
 
 func findOrLaunchConnectorDaemon(ctx context.Context, daemonID *daemon.Identifier, connectorDaemon string, required bool) (context.Context, bool, error) {
 	cr := daemon.MustGetRequest(ctx)
+	baseCtx := ctx
 
 	// Try dialing the host daemon using the well-known socket.
 	ctx, err := DiscoverDaemon(ctx, cr.Use, daemonID)
@@ -493,10 +570,43 @@ func findOrLaunchConnectorDaemon(ctx context.Context, daemonID *daemon.Identifie
 			cr.Docker = true
 		}
 		if ud.Containerized() == cr.Docker {
+			if required && !ud.Containerized() {
+				if !cr.Implicit && cr.Use == nil {
+					_ = ud.Close()
+					var missing bool
+					ctx, missing, err = hostConnectorOrMissing(baseCtx, daemonID, cr)
+					if missing && err == nil {
+						return findOrLaunchConnectorDaemon(baseCtx, daemonID, connectorDaemon, required)
+					}
+					return ctx, false, err
+				}
+				ctx, err = withHostOwnership(ctx, daemonID.Name, cr.Use == nil)
+				if err != nil {
+					_ = ud.Close()
+				}
+				return ctx, false, err
+			}
 			return ctx, false, nil
 		}
 		// A daemon running on the host does not fulfill a request for a containerized daemon. They can
 		// coexist though.
+		err = os.ErrNotExist
+	}
+	if cr.Use != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if !required {
+				return ctx, false, daemon.ErrNoUserDaemon
+			}
+			return ctx, false, errcat.User.Newf("unable to find a daemon matching --use %q", cr.Use.String())
+		}
+		return ctx, false, errcat.NoDaemonLogs.New(err)
+	}
+	if required && !cr.Docker && (errors.Is(err, os.ErrNotExist) || errors.Is(err, daemon.ErrNoUserDaemon)) {
+		var missing bool
+		ctx, missing, err = hostConnectorOrMissing(ctx, daemonID, cr)
+		if !missing || err != nil {
+			return ctx, false, err
+		}
 		err = os.ErrNotExist
 	}
 	if !errors.Is(err, os.ErrNotExist) {
@@ -524,6 +634,9 @@ func findOrLaunchConnectorDaemon(ctx context.Context, daemonID *daemon.Identifie
 		ctx, err = launchDockerDaemon(ctx, daemonID, cr)
 	} else {
 		ctx, err = launchHostDaemon(ctx, daemonID, connectorDaemon, cr)
+		if err == nil {
+			ctx, err = withHostOwnership(ctx, daemonID.Name, true)
+		}
 	}
 	return ctx, err == nil, err
 }
@@ -618,7 +731,7 @@ func connectSession(ctx context.Context, useLine string, request *daemon.Request
 	userD := daemon.MustGetUserClient(ctx)
 	var ci *connector.ConnectInfo
 	defer func() {
-		if ci != nil {
+		if err == nil && ci.GetSessionInfo() != nil && ci.GetManagerVersion() != nil && ci.GetConnectionName() != "" {
 			request.KubeFlags = ci.KubeFlags
 			request.ManagerNamespace = ci.ManagerNamespace
 			request.Name = ci.ConnectionName
@@ -635,6 +748,9 @@ func connectSession(ctx context.Context, useLine string, request *daemon.Request
 		// implicit calls use the current Status instead of passing flags and mapped namespaces.
 		ci, err = userD.Status(ctx, &emptypb.Empty{})
 		if err == nil && ci.ManagerVersion == nil {
+			if !userD.Containerized() && (ci.GetSessionInfo() != nil || ci.GetDaemonStatus() == nil || ci.GetDaemonStatus().GetOutboundConfig() != nil) {
+				return nil, errcat.User.New("the shared root has an active or unconfirmed connection; its daemon was preserved")
+			}
 			// If the manager version is nil, the user daemon is not connected. This is the same
 			// as it being unavailable when the request is implicit.
 			err = status.Errorf(codes.Unavailable, "user daemon is not connected")
@@ -663,13 +779,16 @@ func connectSession(ctx context.Context, useLine string, request *daemon.Request
 				"connect to namespace %q. The implicit connect behavior is deprecated and will be removed in a future release.",
 			useLine, daemonID.Namespace)
 	}
-	if ci, err = userD.Connect(ctx, request.ConnectRequest); err != nil {
-		if !userD.Containerized() {
-			file := userD.DaemonID().InfoFileName()
-			clog.Debugf(ctx, "Deleting daemon info %s due to connect error: %v", file, err)
-			_ = daemon.NewUserInfoLoader(ctx).DeleteInfo(file)
-		}
+	connectRequest := request.ConnectRequest
+	if !userD.Containerized() && request.Use != nil {
+		connectRequest = proto.Clone(connectRequest).(*connector.ConnectRequest)
+		connectRequest.Name = userD.DaemonID().Name
+	}
+	if ci, err = userD.Connect(ctx, connectRequest); err != nil {
 		return nil, tpGrpc.FromGRPC(err)
+	}
+	if err = commitHostOwnership(ctx, ci); err != nil {
+		return nil, err
 	}
 	return connectResult(ctx, ci, true), nil
 }

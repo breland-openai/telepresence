@@ -13,7 +13,8 @@ Parse, resolve and render compose file in canonical format
 
 ### Flags:
 ```
-  -h, --help   help for config
+  -h, --help       help for config
+      --show-env   Include remote environment values in output. WARNING: may expose sensitive values
 ```
 
 ### Compose flags:

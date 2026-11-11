@@ -1,12 +1,14 @@
 package auth
 
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Metrics groups the counters published for the external listener's
-// authentication path. TokenReview is the expensive, API-server-bound step,
+// Metrics groups the counters published for a listener's authentication path.
+// TokenReview is the expensive, API-server-bound step,
 // so the counters separate what avoided it (CacheHits) from what triggered it
 // (FirstReviews, FallbackReviews) and from the admission controls that reject
 // a call before either happens (RateLimited).
@@ -19,11 +21,12 @@ type Metrics struct {
 	// FallbackReviews counts the deliberate no-audience TokenReview retry,
 	// which serves tokens minted for the API server only.
 	FallbackReviews prometheus.Counter
-	// RateLimited counts calls rejected by the external listener's admission
+	// RateLimited counts calls rejected by the listener's admission
 	// controls (concurrency cap, QPS/burst limiter, or oversized metadata)
 	// before either TokenReview could run.
 	RateLimited prometheus.Counter
-	// InvalidTokens counts bearer tokens the API server rejected outright.
+	// InvalidTokens counts authentication attempts rejected as invalid, including
+	// decisions served from the token-review cache.
 	InvalidTokens prometheus.Counter
 	// APIFailures counts TokenReview calls that failed for infrastructure
 	// reasons rather than rejecting the token.
@@ -45,7 +48,7 @@ var authMetricVecs = struct { //nolint:gochecknoglobals // prometheus vectors re
 	firstReviews:    authMetricVec("telepresence_auth_first_reviews", "Manager-audience TokenReview calls made"),
 	fallbackReviews: authMetricVec("telepresence_auth_fallback_reviews", "No-audience fallback TokenReview calls made"),
 	rateLimited:     authMetricVec("telepresence_auth_rate_limited", "TokenReview attempts rejected by review admission"),
-	invalidTokens:   authMetricVec("telepresence_auth_invalid_tokens", "Bearer tokens the API server rejected"),
+	invalidTokens:   authMetricVec("telepresence_auth_invalid_tokens", "Authentication attempts rejected as invalid, including cached decisions"),
 	apiFailures:     authMetricVec("telepresence_auth_api_failures", "TokenReview calls that failed for infrastructure reasons"),
 }
 
@@ -79,4 +82,34 @@ func unregisteredMetrics() *Metrics {
 		InvalidTokens:   c(),
 		APIFailures:     c(),
 	}
+}
+
+type tokenReviewMetrics struct {
+	requests *prometheus.CounterVec
+	duration *prometheus.HistogramVec
+}
+
+func newTokenReviewMetrics() *tokenReviewMetrics {
+	labels := []string{"audience", "outcome"}
+	return &tokenReviewMetrics{
+		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "telepresence_token_review_requests_total",
+			Help: "Kubernetes TokenReview API requests, excluding cached authentication results.",
+		}, labels),
+		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "telepresence_token_review_duration_seconds",
+			Help:    "Kubernetes TokenReview API request duration, including client-side rate-limit waits.",
+			Buckets: []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+		}, labels),
+	}
+}
+
+func (m *tokenReviewMetrics) observe(audience, outcome string, duration time.Duration) {
+	m.requests.WithLabelValues(audience, outcome).Inc()
+	m.duration.WithLabelValues(audience, outcome).Observe(duration.Seconds())
+}
+
+// RegisterMetrics registers this authenticator's TokenReview collectors with r.
+func (a *Authenticator) RegisterMetrics(r prometheus.Registerer) {
+	r.MustRegister(a.reviewMetrics.requests, a.reviewMetrics.duration)
 }

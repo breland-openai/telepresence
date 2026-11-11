@@ -94,13 +94,13 @@ func (s *Container) Test_ContainerTargetsNamedContainer() {
 	wl := s.Workload(containerWorkload("container-target"))
 	ls := s.LocalEcho()
 
-	a := conn.Intercept(t, wl, rt.ToLocal(ls, "http"), cli.MountFalse(), cli.Container("secondary"))
+	a := conn.Intercept(t, wl, rt.ToLocal(ls, "http"), cli.MountFalse(), cli.Container("secondary"), cli.ShowEnv())
 	rt.RoutedToLocal(t, wl.ServiceURL(), ls)
 	s.Require().NotNil(a.Intercept, "intercept response should include InterceptInfo")
 	s.Equal("secondary", a.Intercept.Environment["TP_TEST_TAG"])
 	a.Detach(t)
 
-	a = conn.Intercept(t, wl, rt.ToLocal(ls, "http"), cli.MountFalse())
+	a = conn.Intercept(t, wl, rt.ToLocal(ls, "http"), cli.MountFalse(), cli.ShowEnv())
 	rt.RoutedToLocal(t, wl.ServiceURL(), ls)
 	s.Require().NotNil(a.Intercept, "intercept response should include InterceptInfo")
 	s.Equal("primary", a.Intercept.Environment["TP_TEST_TAG"])
@@ -127,7 +127,7 @@ func (s *Container) Test_ContainerReplace() {
 
 	// The secondary's port is service-less and unnamed, so it is targeted
 	// by number.
-	a := conn.Replace(t, wl, rt.ToLocal(ls, strconv.Itoa(secondaryContainerPort)), cli.MountFalse(), cli.Container("secondary"))
+	a := conn.Replace(t, wl, rt.ToLocal(ls, strconv.Itoa(secondaryContainerPort)), cli.MountFalse(), cli.Container("secondary"), cli.ShowEnv())
 	waitRollout(&s.Suite, wl)
 	s.Require().NotNil(a.Replace, "replace response should include InterceptInfo")
 	s.Equal("secondary", a.Replace.Environment["TP_TEST_TAG"])
@@ -146,7 +146,7 @@ func (s *Container) Test_ContainerReplace() {
 	waitRollout(&s.Suite, wl)
 	assertPodContainers(&s.Suite, wl, true, true)
 
-	a = conn.Intercept(t, wl, rt.ToLocal(ls, "http"), cli.MountFalse())
+	a = conn.Intercept(t, wl, rt.ToLocal(ls, "http"), cli.MountFalse(), cli.ShowEnv())
 	rt.RoutedToLocal(t, wl.ServiceURL(), ls)
 	s.Require().NotNil(a.Intercept, "intercept response should include InterceptInfo")
 	s.Equal("primary", a.Intercept.Environment["TP_TEST_TAG"])

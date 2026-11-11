@@ -109,7 +109,7 @@ func (s *NodeAgentModes) Test_Ingest() {
 	}()
 
 	s.Require().NotNil(a.Ingest, "ingest response should include IngestInfo")
-	s.Equal(wl.Name, a.Ingest.Environment["TELEPRESENCE_CONTAINER"])
+	s.Equal(wl.Name, a.Ingest.Container)
 	waitJobCount(&s.Suite, ctx, wl, 1)
 	s.False(hasAgentContainer(ctx, s.R(), wl.Namespace, wl.Name),
 		"a node-agent ingest must not inject a traffic-agent sidecar")

@@ -73,7 +73,8 @@ func (f *udp) ServeTo(ctx context.Context, initCh chan<- netip.AddrPort, fw func
 			// The address to listen to is likely to change the first time around, because it may
 			// be ":0", so let's ensure that the same address is used next time
 			la := pc.LocalAddr().(*net.UDPAddr)
-			atomic.StoreInt32(&f.listenPort, int32(la.Port))
+			lp = uint16(la.Port)
+			atomic.StoreInt32(&f.listenPort, int32(lp))
 			clog.Infof(ctx, "Forwarding udp from %s", la)
 			if initCh != nil {
 				initCh <- la.AddrPort()

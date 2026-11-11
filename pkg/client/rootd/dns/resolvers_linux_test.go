@@ -27,7 +27,7 @@ Link 4 (eth1): [2001:db8::1]:53
 	}, got)
 }
 
-func TestLinkDomainsIncludesNamespaceQualifiedServiceRoutes(t *testing.T) {
+func TestLinkDomainsIncludesNamespaceQualifiedServiceAndPodRoutes(t *testing.T) {
 	paths := linkDomains(
 		[]string{"tel2-search"},
 		map[string]struct{}{"app": {}, "other": {}, "svc": {}},
@@ -39,10 +39,21 @@ func TestLinkDomainsIncludesNamespaceQualifiedServiceRoutes(t *testing.T) {
 		"tel2-search",
 		"~app",
 		"~app.svc.cluster.local",
+		"~app.pod.cluster.local",
 		"~other",
 		"~other.svc.cluster.local",
+		"~other.pod.cluster.local",
 		"~svc",
 		"~internal.",
 		"~cluster.local.",
 	}, paths)
+}
+
+func TestLinkDomainsUsesReportedKubernetesDomain(t *testing.T) {
+	paths := linkDomains(nil, map[string]struct{}{"app": {}, "svc": {}}, nil, "example.test.")
+	require.Contains(t, paths, "~app.svc.example.test")
+	require.Contains(t, paths, "~app.pod.example.test")
+	require.NotContains(t, paths, "~svc.svc.example.test")
+	require.NotContains(t, paths, "~svc.pod.example.test")
+	require.NotContains(t, paths, "~app.pod.cluster.local")
 }

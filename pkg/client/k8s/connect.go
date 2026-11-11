@@ -26,7 +26,6 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/client/portforward"
 	"github.com/telepresenceio/telepresence/v2/pkg/errcat"
 	grpcClient "github.com/telepresenceio/telepresence/v2/pkg/grpc/client"
-	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
 )
 
 const (
@@ -197,7 +196,7 @@ func knownNameExhaustedError(podName string) error {
 // canPortForwardKnownName uses a SelfSubjectAccessReview, which every
 // authenticated identity may make regardless of its other RBAC grants.
 func (kc *Cluster) canPortForwardKnownName(namespace string) (bool, error) {
-	return k8sapi.CanI(kc, portForwardAttributes(namespace, trafficManagerPodName))
+	return CanPortForward(kc, namespace, trafficManagerPodName)
 }
 
 // knownNameForbiddenError is the connect refusal for an identity that holds

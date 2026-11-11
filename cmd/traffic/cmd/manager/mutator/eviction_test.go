@@ -16,11 +16,14 @@ import (
 	core "k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	metaapi "k8s.io/apimachinery/pkg/api/meta"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/kubernetes/scheme"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
@@ -50,7 +53,7 @@ func newEvictionFixture(t *testing.T, ctx context.Context, kinds k8sapi.Kinds, o
 	ctx = managerutil.WithEnv(ctx, &managerutil.Env{EnabledWorkloadKinds: kinds})
 	f := &evictionFixture{t: t, ctx: ctx, client: client, cw: NewWatcher().(*configWatcher)}
 	for _, obj := range objects {
-		f.addToStore(obj)
+		require.NoError(t, f.store(obj).Add(obj.DeepCopyObject()))
 	}
 	return f
 }
@@ -98,14 +101,22 @@ func (f *evictionFixture) store(obj runtime.Object) cache.Store {
 }
 
 func (f *evictionFixture) addToStore(obj runtime.Object) {
+	require.NoError(f.t, f.client.Tracker().Add(obj.DeepCopyObject()))
 	require.NoError(f.t, f.store(obj).Add(obj.DeepCopyObject()))
 }
 
 func (f *evictionFixture) updateStore(obj runtime.Object) {
+	resource, _ := metaapi.UnsafeGuessKindToResource(kubeGVK(f.t, obj))
+	require.NoError(f.t, f.client.Tracker().Update(resource, obj.DeepCopyObject(), obj.(meta.Object).GetNamespace()))
 	require.NoError(f.t, f.store(obj).Update(obj.DeepCopyObject()))
 }
 
 func (f *evictionFixture) removeFromStore(obj runtime.Object) {
+	resource, _ := metaapi.UnsafeGuessKindToResource(kubeGVK(f.t, obj))
+	m := obj.(meta.Object)
+	if err := f.client.Tracker().Delete(resource, m.GetNamespace(), m.GetName()); !k8sErrors.IsNotFound(err) {
+		require.NoError(f.t, err)
+	}
 	require.NoError(f.t, f.store(obj).Delete(obj))
 }
 
@@ -120,7 +131,7 @@ func (f *evictionFixture) gets(resource string) int {
 // stableDeployment is a Deployment whose controller has nothing left to do.
 func stableDeployment(ns, name string, replicas int32, maxUnavailable *intstr.IntOrString) *apps.Deployment {
 	d := &apps.Deployment{
-		ObjectMeta: meta.ObjectMeta{Name: name, Namespace: ns, Generation: 3},
+		ObjectMeta: meta.ObjectMeta{Name: name, Namespace: ns, UID: types.UID(name), Generation: 3},
 		Spec: apps.DeploymentSpec{
 			Replicas: &replicas,
 			Selector: &meta.LabelSelector{MatchLabels: map[string]string{"app": name}},
@@ -150,7 +161,7 @@ func stableDeployment(ns, name string, replicas int32, maxUnavailable *intstr.In
 
 func stableReplicaSet(ns, name string, replicas int32) *apps.ReplicaSet {
 	return &apps.ReplicaSet{
-		ObjectMeta: meta.ObjectMeta{Name: name, Namespace: ns, Generation: 1},
+		ObjectMeta: meta.ObjectMeta{Name: name, Namespace: ns, UID: types.UID(name), Generation: 1},
 		Spec: apps.ReplicaSetSpec{
 			Replicas: &replicas,
 			Selector: &meta.LabelSelector{MatchLabels: map[string]string{"app": name}},
@@ -169,9 +180,10 @@ func stableReplicaSet(ns, name string, replicas int32) *apps.ReplicaSet {
 func agentPod(ns, name, workload string, kind k8sapi.Kind, cfgJSON string, ready bool) *core.Pod {
 	pod := &core.Pod{
 		ObjectMeta: meta.ObjectMeta{
-			Name:      name,
-			Namespace: ns,
-			UID:       types.UID(name),
+			Name:            name,
+			Namespace:       ns,
+			UID:             types.UID(name),
+			OwnerReferences: []meta.OwnerReference{*meta.NewControllerRef(&meta.ObjectMeta{Name: workload, UID: types.UID(workload)}, apps.SchemeGroupVersion.WithKind(string(kind)))},
 			Labels: map[string]string{
 				"app":                         workload,
 				agentconfig.WorkloadNameLabel: workload,
@@ -663,7 +675,7 @@ func TestTeardownEvictsEveryPodWithoutWaiting(t *testing.T) {
 	require.NoError(t, f.cw.EvictAllPodsWithAgentConfig(f.ctx, ns))
 	assert.Less(t, time.Since(start), time.Second, "teardown must not wait for replacements")
 	assert.Equal(t, int32(9), f.evictions.Load())
-	assert.Zero(t, f.gets("replicasets"), "workloads are read from the cache")
+	assert.Equal(t, 3, f.gets("replicasets"), "teardown verifies the native identity of each workload")
 	assert.Nil(t, f.cw.Get("echo-one", ns), "the namespace's agent configs are dropped")
 }
 
@@ -699,4 +711,11 @@ func TestEvictionStateIsReclaimed(t *testing.T) {
 	cw.deleteEvictionState(workloadKeyOf(wl))
 	assert.Zero(t, cw.evictionStates.Size())
 	assert.Zero(t, cw.pendingRequests.Load())
+}
+
+func kubeGVK(t *testing.T, obj runtime.Object) schema.GroupVersionKind {
+	t.Helper()
+	kinds, _, err := scheme.Scheme.ObjectKinds(obj)
+	require.NoError(t, err)
+	return kinds[0]
 }

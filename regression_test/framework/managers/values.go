@@ -184,10 +184,11 @@ type ClientRouting struct {
 	AutoResolveConflicts *bool `json:"autoResolveConflicts,omitempty"`
 }
 
-// ClientDNS is the chart's client.dns.* shape, restricted to the key wave 3
+// ClientDNS is the chart's client.dns.* shape, restricted to the keys wave 3
 // suites configure.
 type ClientDNS struct {
-	IncludeSuffixes []string `json:"includeSuffixes,omitempty"`
+	IncludeSuffixes              []string `json:"includeSuffixes,omitempty"`
+	PreserveLocalClusterDNSNames []string `json:"preserveLocalClusterDNSNames,omitempty"`
 }
 
 // QuicTunnel is the chart's quicTunnel.* shape, restricted to the keys the
@@ -547,6 +548,9 @@ func mergeClient(base, over Client) Client {
 	}
 	if over.DNS.IncludeSuffixes != nil {
 		base.DNS.IncludeSuffixes = over.DNS.IncludeSuffixes
+	}
+	if over.DNS.PreserveLocalClusterDNSNames != nil {
+		base.DNS.PreserveLocalClusterDNSNames = over.DNS.PreserveLocalClusterDNSNames
 	}
 	return base
 }

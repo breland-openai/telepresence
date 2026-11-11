@@ -2,6 +2,7 @@ package rootd
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/blang/semver/v4"
@@ -15,6 +16,8 @@ import (
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
+	"github.com/telepresenceio/telepresence/v2/pkg/grpc/server"
+	"github.com/telepresenceio/telepresence/v2/pkg/log"
 	"github.com/telepresenceio/telepresence/v2/pkg/types"
 )
 
@@ -30,6 +33,11 @@ func versionInfo(ctx context.Context) *common.VersionInfo {
 	vi := client.VersionInfo(ctx)
 	vi.Name += " (embedded root daemon)"
 	return vi
+}
+
+// StartWithContext bounds startup without tying the running root session to the caller.
+func (rd *InProcSession) StartWithContext(ctx context.Context, g log.Group, teleroutePort uint16) error {
+	return rd.start(server.NewCombinedContext(rd, ctx), g, teleroutePort)
 }
 
 func (rd *InProcSession) Version(ctx context.Context, _ *empty.Empty, _ ...grpc.CallOption) (*common.VersionInfo, error) {
@@ -93,6 +101,9 @@ func (rd *InProcSession) TranslateEnvIPs(_ context.Context, in *rpc.Environment,
 
 func (rd *InProcSession) WaitForNetwork(ctx context.Context, _ *empty.Empty, _ ...grpc.CallOption) (*empty.Empty, error) {
 	if err, ok := <-rd.networkReady(ctx); ok {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return &empty.Empty{}, status.FromContextError(err).Err()
+		}
 		return &empty.Empty{}, status.Error(codes.Unavailable, err.Error())
 	}
 	return &empty.Empty{}, nil
@@ -109,6 +120,28 @@ func (rd *InProcSession) RerouteRemotePort(_ context.Context, request *rpc.Rerou
 	}
 	rd.rerouteRemotePort(ap, uint16(request.SrcPort))
 	return &empty.Empty{}, nil
+}
+
+func (rd *InProcSession) AddLocalClientRedirect(_ context.Context, request *rpc.ReroutePortRequest, _ ...grpc.CallOption) (*empty.Empty, error) {
+	var ap types.AddrPortProto
+	if err := ap.UnmarshalBinary(request.DstHostPort); err != nil {
+		return nil, err
+	}
+	rd.addLocalClientRedirect(ap, uint16(request.SrcPort))
+	return &empty.Empty{}, nil
+}
+
+func (rd *InProcSession) RemoveLocalClientRedirect(_ context.Context, request *rpc.ReroutePortRequest, _ ...grpc.CallOption) (*empty.Empty, error) {
+	var ap types.AddrPortProto
+	if err := ap.UnmarshalBinary(request.DstHostPort); err != nil {
+		return nil, err
+	}
+	rd.removeLocalClientRedirect(ap)
+	return &empty.Empty{}, nil
+}
+
+func (rd *InProcSession) ListLocalClientRedirects(context.Context, *empty.Empty, ...grpc.CallOption) (*rpc.LocalClientRedirects, error) {
+	return &rpc.LocalClientRedirects{Redirects: rd.listLocalClientRedirects()}, nil
 }
 
 func (rd *InProcSession) WaitForAgentIP(ctx context.Context, request *rpc.WaitForAgentIPRequest, _ ...grpc.CallOption) (*rpc.WaitForAgentIPResponse, error) {

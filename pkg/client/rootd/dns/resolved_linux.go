@@ -117,19 +117,19 @@ func (s *Server) updateLinkDomains(c context.Context, dev vif.Device) error {
 }
 
 func linkDomains(search []string, routes map[string]struct{}, includeSuffixes []string, clusterDomain string) []string {
-	paths := make([]string, 0, len(search)+len(routes)*2+len(includeSuffixes)+1)
+	paths := make([]string, 0, len(search)+len(routes)*3+len(includeSuffixes)+1)
 
 	// Namespaces are copied verbatim. Entries that aren't prefixed with "~" are considered search path entries.
 	paths = append(paths, search...)
-	serviceClusterDomain := strings.TrimSuffix(clusterDomain, ".")
+	kubernetesDomain := strings.TrimSuffix(clusterDomain, ".")
 	for ns := range routes {
 		paths = append(paths, "~"+ns)
-		if ns != "svc" && serviceClusterDomain != "" {
-			// DHCP can advertise a route-only svc.<cluster-domain> on the VM's
-			// primary link. Namespace-qualified service routes are more specific,
-			// so systemd-resolved sends Kubernetes service lookups through the
-			// Telepresence link instead of a different cluster's DNS server.
-			paths = append(paths, "~"+ns+".svc."+serviceClusterDomain)
+		if ns != "svc" && kubernetesDomain != "" {
+			// DHCP can advertise the Kubernetes domain or its service domain on
+			// the primary link. Namespace-qualified service and pod routes are
+			// more specific, so systemd-resolved sends both kinds of lookups
+			// through Telepresence and preserves virtual pod addresses.
+			paths = append(paths, "~"+ns+".svc."+kubernetesDomain, "~"+ns+".pod."+kubernetesDomain)
 		}
 	}
 

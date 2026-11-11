@@ -58,6 +58,13 @@ func InitCommand(cmd *cobra.Command) (err error) {
 			flags.DeprecationIfChanged(cmd, global.FlagDocker, "use telepresence connect to initiate the connection")
 			flags.DeprecationIfChanged(cmd, global.FlagContext, "use telepresence connect to initiate the connection")
 		}
+		if cr := daemon.MustGetRequest(ctx); v == ann.Required && !cr.Docker {
+			unlock, lockErr := daemon.LockHost(ctx)
+			if lockErr != nil {
+				return errcat.NoDaemonLogs.Errorf(lockErr, "unable to reserve the host daemon")
+			}
+			defer unlock()
+		}
 		ctx, err = EnsureUserDaemon(ctx, v == ann.Required)
 		if err != nil {
 			if v == ann.Optional && (errors.Is(err, daemon.ErrNoUserDaemon) || errcat.GetCategory(err) == errcat.Config) {

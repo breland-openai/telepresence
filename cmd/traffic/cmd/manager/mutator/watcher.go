@@ -43,6 +43,7 @@ type Map interface {
 	EvictPodsWithAgentConfigMismatch(ctx context.Context, wl k8sapi.Workload, sc *agentconfig.Sidecar) error
 	EvictAllPodsWithAgentConfig(ctx context.Context, namespace string) error
 
+	VerifiedPods(k8sapi.Workload, string) map[types.UID]string
 	RegenerateAgentMaps(ctx context.Context, s string) error
 
 	Delete(name, namespace string)
@@ -51,26 +52,31 @@ type Map interface {
 }
 
 type configWatcher struct {
-	cancel          context.CancelFunc
-	agentConfigs    *xsync.Map[string, *xsync.Map[string, *agentconfig.Sidecar]]
-	informers       *xsync.Map[string, *informersWithCancel]
-	inactivePods    *xsync.Map[types.UID, inactivation]
-	evictionStates  *xsync.Map[WorkloadKey, *workloadEvictionState]
-	evictionQueue   evictionQueue
-	pendingRequests atomic.Int32
-	deferralNotice  time.Duration
-	deferralCeiling time.Duration
-	budgetGrace     time.Duration
-	startedAt       time.Time
-	configured      atomic.Bool
-	running         atomic.Bool
+	cancel            context.CancelFunc
+	agentConfigs      *xsync.Map[string, *xsync.Map[string, *agentconfig.Sidecar]]
+	informers         *xsync.Map[string, *informersWithCancel]
+	inactivePods      *xsync.Map[types.UID, inactivation]
+	evictionStates    *xsync.Map[WorkloadKey, *workloadEvictionState]
+	evictionQueueDone chan struct{}
+	evictionQueue     evictionQueue
+	pendingRequests   atomic.Int32
+	deferralNotice    time.Duration
+	deferralCeiling   time.Duration
+	budgetGrace       time.Duration
+	startedAt         time.Time
+	configured        atomic.Bool
+	running           atomic.Bool
 }
 
 // workloadEvictionState serializes the eviction passes for one workload and carries what they must
 // remember between passes.
 type workloadEvictionState struct {
 	sync.Mutex
-	requested bool
+	requested    bool
+	uid          types.UID
+	accepted     *evictionBatch
+	tracksConfig bool
+	denied       error // retried only after a relevant event or a new request
 	// wanted is the agent config the pods must carry; nil means no agent.
 	wanted *agentconfig.Sidecar
 	// rolloutGeneration is the workload's generation when a pass restarted it through its controller.
@@ -133,6 +139,8 @@ func (c *configWatcher) SetConfigured() {
 // RegenerateAgentMaps regenerates all agent configurations and requests the replacement of every pod
 // whose agent config annotation differs from the generated one.
 func (c *configWatcher) RegenerateAgentMaps(ctx context.Context, agentImage string) error {
+	started := time.Now()
+	clog.Info(ctx, "Regenerating traffic-agent configurations")
 	gc, err := managerutil.GetEnv(ctx).GeneratorConfig(agentImage)
 	if err != nil {
 		return err
@@ -143,12 +151,16 @@ func (c *configWatcher) RegenerateAgentMaps(ctx context.Context, agentImage stri
 			return err
 		}
 	}
+	clog.Infof(ctx, "Traffic-agent configuration regeneration finished in %s", time.Since(started))
 	return nil
 }
 
 func (c *configWatcher) regenerateAgentConfigs(ctx context.Context, ns string, gc *agentmap.GeneratorConfig) error {
 	clog.Debugf(ctx, "regenerate agent maps %s", whereWeWatch(ns))
-	evictMap, err := podList(ctx, ns)
+	evictMap, err := podList(ctx, ns, func(pod *core.Pod) bool {
+		_, annotated := pod.Annotations[annotation.Config]
+		return annotated && podIsPendingOrRunning(pod)
+	})
 	if err != nil {
 		return err
 	}
@@ -170,6 +182,7 @@ func (c *configWatcher) regenerateAgentConfigs(ctx context.Context, ns string, g
 				continue
 			}
 			if !configured {
+				gc.SetPodCreationFields(sc)
 				c.Store(sc)
 			}
 			break
@@ -211,6 +224,7 @@ const (
 )
 
 type informersWithCancel struct {
+	inventory *podInventory
 	cancel    context.CancelFunc
 	informers [watcherMax]cache.SharedIndexInformer
 	eventRegs [watcherMax]cache.ResourceEventHandlerRegistration
@@ -237,6 +251,10 @@ func (c *configWatcher) Delete(name, namespace string) {
 }
 
 func (c *configWatcher) deleteNamespaceAgentConfigs(namespace string) {
+	if namespace == "" {
+		c.agentConfigs.Clear()
+		return
+	}
 	c.agentConfigs.Delete(namespace)
 }
 
@@ -288,6 +306,11 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 		}
 	}()
 
+	kf := informer.GetK8sFactory(ctx, ns)
+	var inventory *podInventory
+	if env := managerutil.GetEnv(ctx); env.CachedPodChecks {
+		inventory = observeInventory(kf, k8sapi.GetK8sInterface(ctx), ns, env.EnabledWorkloadKinds)
+	}
 	ifns := [watcherMax]cache.SharedIndexInformer{}
 	ifns[serviceWatcher] = c.startServices(ctx, ns)
 	for _, wlKind := range managerutil.GetEnv(ctx).EnabledWorkloadKinds {
@@ -304,7 +327,6 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 	}
 	ifns[podWatcher] = c.startPods(ctx, ns)
 	c.startIngresses(ctx, ns)
-	kf := informer.GetK8sFactory(ctx, ns)
 	kf.Start(ctx.Done())
 	kf.WaitForCacheSync(ctx.Done())
 	if ifns[rolloutWatcher] != nil {
@@ -314,6 +336,7 @@ func (c *configWatcher) startInformers(ctx context.Context, ns string) (iwc *inf
 	}
 
 	return &informersWithCancel{
+		inventory: inventory,
 		cancel:    cancel,
 		informers: ifns,
 	}, nil
@@ -333,7 +356,7 @@ func (c *configWatcher) startWatchers(ctx context.Context, iwc *informersWithCan
 			}
 		}
 	}
-	iwc.eventRegs[podWatcher], err = c.watchPods(ctx, ifns[podWatcher])
+	iwc.eventRegs[podWatcher], err = c.watchPods(ifns[podWatcher])
 	return err
 }
 
@@ -564,7 +587,7 @@ func (c *configWatcher) deleteMapsAndRolloutNS(ctx context.Context, ns string, i
 		}
 	}
 
-	if err := c.EvictAllPodsWithAgentConfig(ctx, ns); err != nil {
+	if err := c.removeAgentsAndWait(ctx, ns); err != nil {
 		clog.Errorf(ctx, "unable to delete agents in namespace %s: %v", ns, err)
 	}
 }

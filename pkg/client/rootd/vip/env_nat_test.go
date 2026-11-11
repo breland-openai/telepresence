@@ -1,10 +1,16 @@
 package vip
 
 import (
+	"context"
+	"log/slog"
 	"maps"
 	"net/netip"
+	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/telepresenceio/clog"
 	"github.com/telepresenceio/clog/testutil"
 )
 
@@ -141,4 +147,20 @@ func Test_translateEnvironmentIPs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEnvironmentTranslationLogsExcludeValues(t *testing.T) {
+	var logs strings.Builder
+	ctx := clog.WithLogger(context.Background(), slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	provider := &localIPProviderTest{
+		cidrs:  []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")},
+		mapped: map[netip.Addr]netip.Addr{netip.MustParseAddr("192.0.2.1"): netip.MustParseAddr("198.51.100.1")},
+	}
+	values := map[string]string{"ORDINARY": "https://sentinel-user:sentinel-password@192.0.2.1/path"}
+	TranslateEnvironmentIPs(ctx, values, provider)
+	require.Equal(t, "https://sentinel-user:sentinel-password@198.51.100.1/path", values["ORDINARY"])
+	require.Contains(t, logs.String(), "ORDINARY")
+	require.NotContains(t, logs.String(), "sentinel")
+	require.NotContains(t, logs.String(), "192.0.2.1")
+	require.NotContains(t, logs.String(), "198.51.100.1")
 }

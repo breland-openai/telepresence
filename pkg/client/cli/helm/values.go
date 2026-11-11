@@ -77,6 +77,7 @@ type Agent struct {
 	LogLevel                 *string                   `json:"logLevel,omitzero"`
 	MaxIdleTime              *string                   `json:"maxIdleTime,omitzero"`
 	MountPolicies            map[string]string         `json:"mountPolicies,omitzero"`
+	PreStopDrainTimeout      *string                   `json:"preStopDrainTimeout,omitzero"`
 	Port                     *int32                    `json:"port,omitzero"`
 	Resources                core.ResourceRequirements `json:"resources,omitzero"`
 	SecurityContext          core.SecurityContext      `json:"securityContext,omitzero"`
@@ -198,19 +199,21 @@ type ClientCluster struct {
 
 // ClientDNS configures the client-side DNS resolver.
 type ClientDNS struct {
-	Error            *string             `json:"error,omitzero"`
-	LocalIP          *string             `json:"localIP,omitzero"`      // deprecated, use localAddresses
-	RemoteIP         *string             `json:"remoteIP,omitzero"`     // deprecated, use vifAddress
-	LocalAddress     *string             `json:"localAddress,omitzero"` // deprecated, use localAddresses
-	LocalAddresses   []string            `json:"localAddresses,omitzero"`
-	VIFAddress       *string             `json:"vifAddress,omitzero"`
-	IncludeSuffixes  []string            `json:"includeSuffixes,omitzero"`
-	ExcludeSuffixes  []string            `json:"excludeSuffixes,omitzero"`
-	Excludes         []string            `json:"excludes,omitzero"`
-	Mappings         []*ClientDNSMapping `json:"mappings,omitzero"`
-	LookupTimeout    *string             `json:"lookupTimeout,omitzero"`
-	RecursionCheck   *bool               `json:"recursionCheck,omitzero"`
-	UseComplexLookup *bool               `json:"useComplexLookup,omitzero"`
+	Error                        *string             `json:"error,omitzero"`
+	LocalIP                      *string             `json:"localIP,omitzero"`      // deprecated, use localAddresses
+	RemoteIP                     *string             `json:"remoteIP,omitzero"`     // deprecated, use vifAddress
+	LocalAddress                 *string             `json:"localAddress,omitzero"` // deprecated, use localAddresses
+	LocalAddresses               []string            `json:"localAddresses,omitzero"`
+	VIFAddress                   *string             `json:"vifAddress,omitzero"`
+	IncludeSuffixes              []string            `json:"includeSuffixes,omitzero"`
+	ExcludeSuffixes              []string            `json:"excludeSuffixes,omitzero"`
+	Excludes                     []string            `json:"excludes,omitzero"`
+	Mappings                     []*ClientDNSMapping `json:"mappings,omitzero"`
+	LookupTimeout                *string             `json:"lookupTimeout,omitzero"`
+	RecursionCheck               *bool               `json:"recursionCheck,omitzero"`
+	PreserveLocalClusterDNS      *bool               `json:"preserveLocalClusterDNS,omitzero"`
+	PreserveLocalClusterDNSNames []string            `json:"preserveLocalClusterDNSNames,omitzero"`
+	UseComplexLookup             *bool               `json:"useComplexLookup,omitzero"`
 }
 
 // ClientDNSMapping resolves Name to AliasFor instead of looking it up.

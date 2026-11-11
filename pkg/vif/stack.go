@@ -254,7 +254,15 @@ func dispatchToStream(ctx context.Context, id tunnel.ConnID, conn net.Conn, stre
 		clog.Errorf(ctx, "forward %s: %v", id, err)
 		return false
 	}
-	ep := tunnel.NewConnEndpoint(stream, conn, cancel, nil, nil)
+	ep := newConnEndpoint(ctx, stream, conn, cancel)
 	ep.Start(ctx)
 	return true
+}
+
+func newConnEndpoint(ctx context.Context, stream tunnel.Stream, conn net.Conn, cancel context.CancelFunc) tunnel.Endpoint {
+	if stream.Tag() == tunnel.DnsToTun {
+		ttl := tunnel.DNSConnTTL(client.GetConfig(ctx).DNS().LookupTimeout)
+		return tunnel.NewConnEndpointTTL(stream, conn, cancel, ttl, nil, nil)
+	}
+	return tunnel.NewConnEndpoint(stream, conn, cancel, nil, nil)
 }

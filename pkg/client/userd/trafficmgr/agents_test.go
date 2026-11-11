@@ -9,10 +9,7 @@ import (
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 )
 
-// TestDecideIngestPod exercises the pure pod-matching decision behind
-// handleAgentPodSnapshot's ingest walk: workload+namespace matching (not
-// workload-only, the pre-existing cross-namespace hijack bug this rework
-// fixes) and replacement detection by pod name.
+// TestDecideIngestPod covers workload and namespace matching with name-only pod identities.
 func TestDecideIngestPod(t *testing.T) {
 	key := ingestKey{workload: "echo", namespace: "default", container: "cn"}
 
@@ -21,7 +18,7 @@ func TestDecideIngestPod(t *testing.T) {
 			{workload: "other", namespace: "default", podName: "other-1"},
 			{workload: "echo", namespace: "other-ns", podName: "echo-1"},
 		}
-		decision, matching := decideIngestPod(pods, key, "echo-1")
+		decision, matching := decideIngestPod(pods, key, ingestPodIdentity{name: "echo-1"})
 		assert.Equal(t, ingestPodNoMatch, decision)
 		assert.Nil(t, matching)
 	})
@@ -31,7 +28,7 @@ func TestDecideIngestPod(t *testing.T) {
 			{workload: "echo", namespace: "default", podName: "echo-1"},
 			{workload: "echo", namespace: "default", podName: "echo-2"},
 		}
-		decision, matching := decideIngestPod(pods, key, "echo-1")
+		decision, matching := decideIngestPod(pods, key, ingestPodIdentity{name: "echo-1"})
 		assert.Equal(t, ingestPodKeepAlive, decision)
 		assert.Len(t, matching, 2)
 	})
@@ -40,20 +37,17 @@ func TestDecideIngestPod(t *testing.T) {
 		pods := []agentPod{
 			{workload: "echo", namespace: "default", podName: "echo-2"},
 		}
-		decision, matching := decideIngestPod(pods, key, "echo-1")
+		decision, matching := decideIngestPod(pods, key, ingestPodIdentity{name: "echo-1"})
 		assert.Equal(t, ingestPodReplaced, decision)
 		require.Len(t, matching, 1)
 		assert.Equal(t, "echo-2", matching[0].podName)
 	})
 
 	t.Run("same workload name in a different namespace does not match", func(t *testing.T) {
-		// This is the namespace-blind matching bug the rework fixes: a
-		// same-named workload in another namespace must not be treated as a
-		// match for this ingest's key.
 		pods := []agentPod{
 			{workload: "echo", namespace: "other-ns", podName: "echo-1"},
 		}
-		decision, matching := decideIngestPod(pods, key, "echo-1")
+		decision, matching := decideIngestPod(pods, key, ingestPodIdentity{name: "echo-1"})
 		assert.Equal(t, ingestPodNoMatch, decision)
 		assert.Nil(t, matching)
 	})

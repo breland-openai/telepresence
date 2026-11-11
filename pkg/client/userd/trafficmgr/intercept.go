@@ -2,6 +2,7 @@ package trafficmgr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/docker"
+	"github.com/telepresenceio/telepresence/v2/pkg/client/k8s"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/remotefs"
 	"github.com/telepresenceio/telepresence/v2/pkg/client/userd"
 	"github.com/telepresenceio/telepresence/v2/pkg/errcat"
@@ -564,6 +566,58 @@ func requireQuicTunnelAvailable(ctx context.Context, mc quicTunnelEndpointGetter
 	return nil
 }
 
+// An intercept needs the root daemon's reverse-dial watcher for the target agents.
+func (s *session) requireInterceptAgentWatch(ctx context.Context, kind string, spec *manager.InterceptSpec) error {
+	namespace := spec.Namespace
+	attachment := kind
+	if kind == "replace" {
+		attachment = "replacement"
+	}
+	if !slices.Contains(s.agentPodWatchNamespaces(), namespace) {
+		return errcat.User.Newf("%s cannot receive traffic from namespace %q: this session does not watch its traffic-agents. "+
+			"Reconnect with --mapped-namespaces including %q. No %s was created.", kind, namespace, namespace, attachment)
+	}
+	if namespace != s.Namespace && s.compareFinalizedManagerVersion(2, 28, 0) < 0 {
+		return errcat.User.Newf(
+			"%s cannot receive traffic from namespace %q: traffic-manager version %s only watches traffic-agents "+
+				"in the connected namespace %q. Reconnect with --namespace %q, or upgrade the traffic-manager to "+
+				"version 2.28 or newer. No %s was created.",
+			kind, namespace, s.ManagerVersion(), s.Namespace, namespace, attachment)
+	}
+	if client.GetConfig(s).Cluster().UsesExternalManager() {
+		return nil
+	}
+	// A namespace can be watched even if only specific agent pods can be dialed.
+	// Check the target when creating an attachment, never when starting a watch.
+	allowed, checkErr := k8s.CanPortForward(ctx, namespace, "")
+	if allowed {
+		return nil
+	}
+	for _, pod := range s.getCurrentAgentPods() {
+		if pod.namespace != namespace || pod.workload != spec.Agent || pod.podName == "" {
+			continue
+		}
+		ok, err := k8s.CanPortForward(ctx, namespace, pod.podName)
+		if ok {
+			return nil
+		}
+		checkErr = errors.Join(checkErr, err)
+	}
+	endpoint, err := s.ManagerClient().GetQuicTunnelEndpoint(ctx, s.SessionInfo())
+	if err == nil && endpoint.GetEnabled() {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if checkErr != nil {
+		return fmt.Errorf("checking port-forward access in namespace %q: %w", namespace, checkErr)
+	}
+	return errcat.User.Newf("%s cannot receive traffic from namespace %q. Check WebSocket (get) or SPDY (create) access to pods/portforward "+
+		"for the target agent, e.g. `kubectl auth can-i create pods/portforward --namespace %s`, or enable the manager's QUIC tunnel. No %s was created.",
+		kind, namespace, namespace, attachment)
+}
+
 func (s *session) CanIntercept(ctx context.Context, ir *rpc.CreateInterceptRequest) (userd.InterceptInfo, error) {
 	spec := ir.Spec
 	kind := "intercept"
@@ -586,6 +640,12 @@ func (s *session) CanIntercept(ctx context.Context, ir *rpc.CreateInterceptReque
 		)
 	} else {
 		spec.Namespace = ns
+	}
+	if spec.Wiretap {
+		kind = "wiretap"
+	}
+	if err := s.requireInterceptAgentWatch(ctx, kind, spec); err != nil {
+		return nil, err
 	}
 
 	if er := s.ensureNoInterceptConflict(ir); er != nil {
@@ -868,15 +928,27 @@ func (s *session) RemoveIntercept(name string) error {
 }
 
 func (s *session) removeIntercept(ic *intercept) error {
+	return s.removeInterceptWithContext(s.Context, ic)
+}
+
+func (s *session) removeInterceptWithContext(c context.Context, ic *intercept) error {
 	name := ic.Spec.Name
-	s.stopHandler(name, ic.handlerContainer, ic.pid)
+	s.stopHandlerWithContext(c, name, ic.handlerContainer, ic.pid)
 
 	// Unmount filesystems before telling the manager to remove the intercept
 	ic.cancel()
-	ic.wg.Wait()
-	removeOwnedMountPoint(s, &ic.ownsMountPoint, ic.ClientMountPoint)
+	unmounted := make(chan struct{})
+	go func() {
+		ic.wg.Wait()
+		removeOwnedMountPoint(s, &ic.ownsMountPoint, ic.ClientMountPoint)
+		close(unmounted)
+	}()
+	select {
+	case <-c.Done():
+		return c.Err()
+	case <-unmounted:
+	}
 
-	c := s.Context
 	clog.Debugf(c, "telling manager to remove intercept %s", name)
 	tos := client.GetConfig(c).Timeouts()
 	cc, cancel := tos.TimeoutContext(c, client.TimeoutTrafficManagerAPI)
@@ -898,11 +970,14 @@ func (s *session) removeIntercept(ic *intercept) error {
 }
 
 func (s *session) stopHandler(name, handlerContainer string, pid int) {
+	s.stopHandlerWithContext(s.Context, name, handlerContainer, pid)
+}
+
+func (s *session) stopHandlerWithContext(c context.Context, name, handlerContainer string, pid int) {
 	// No use trying to kill processes when using a container-based daemon, unless
 	// that daemon runs as a normal user daemon with a separate root daemon.
 	// Some users run a standard telepresence client together with ingests/intercepts
 	// in one single container.
-	c := s.Context
 	if !(proc.RunningInContainer() && s.GetService().RootSessionInProcess()) {
 		if handlerContainer != "" {
 			if err := docker.StopContainer(c, handlerContainer); err != nil {
@@ -1057,21 +1132,28 @@ func (s *session) InterceptsForWorkload(workloadName, namespace string) []*manag
 }
 
 // ClearIngestsAndIntercepts removes all intercepts.
-func (s *session) ClearIngestsAndIntercepts() error {
+func (s *session) ClearIngestsAndIntercepts(ctx context.Context) error {
 	for _, ic := range s.getCurrentIntercepts() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		clog.Debugf(s, "Clearing intercept %s", ic.Spec.Name)
-		err := s.removeIntercept(ic)
+		err := s.removeInterceptWithContext(ctx, ic)
 		if err != nil && status.Code(err) != codes.NotFound {
 			return err
 		}
 	}
+	var err error
 	s.currentIngests.Range(func(key ingestKey, ig *ingest) bool {
+		if err = ctx.Err(); err != nil {
+			return false
+		}
 		clog.Debugf(s, "Clearing ingest %s", key)
-		s.stopHandler(key.workload+"/"+key.container, ig.handlerContainer, ig.pid)
+		s.stopHandlerWithContext(ctx, key.workload+"/"+key.container, ig.handlerContainer, ig.pid)
 		s.removeIngestMount(ig)
 		return true
 	})
-	return nil
+	return err
 }
 
 // reconcileAPIServers start/stop API servers as needed based on the TELEPRESENCE_API_PORT environment variable
@@ -1087,7 +1169,7 @@ func (s *session) reconcileAPIServers() {
 			if err == nil {
 				return int(port)
 			}
-			clog.Errorf(s, "unable to parse TELEPRESENCE_API_PORT(%q) to a port number in agent %s.%s: %v", ps, is.Agent, is.Namespace, err)
+			clog.Errorf(s, "unable to parse TELEPRESENCE_API_PORT to a port number in agent %s.%s", is.Agent, is.Namespace)
 		}
 		return 0
 	}

@@ -2,14 +2,19 @@ package mutator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 
 	core "k8s.io/api/core/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
@@ -48,14 +53,29 @@ func newEvictionQueue(base, maxDelay time.Duration) evictionQueue {
 // requestEviction records the agent config the pods of wl must carry and schedules a reconcile pass.
 // It also hides the agents of the pods that must be replaced.
 func (c *configWatcher) requestEviction(ctx context.Context, wl k8sapi.Workload, wanted *agentconfig.Sidecar) {
+	if wl.GetUID() == "" {
+		return
+	}
 	key := workloadKeyOf(wl)
 	clog.Debugf(ctx, "Requesting replacement of pods with agent config mismatch for %s", wl)
 	state := c.lockEvictionState(key)
+	if state.requested && state.uid != wl.GetUID() {
+		// A delayed request for an older incarnation cannot replace a current request.
+		current, err := evictionWorkload(ctx, key)
+		if err != nil || current.GetUID() != wl.GetUID() {
+			state.Unlock()
+			return
+		}
+		c.finishRequest(state)
+	}
 	if !state.requested {
 		state.requested = true
 		c.pendingRequests.Add(1)
 	}
+	state.denied = nil
+	state.uid = wl.GetUID()
 	state.wanted = wanted
+	state.tracksConfig = c.Get(key.Name, key.Namespace) != nil || wanted == nil
 	if pods, err := workloadPods(ctx, wl); err == nil {
 		c.markPendingEviction(pods, podsWithAgentConfigMismatch(ctx, pods, wanted))
 	} else {
@@ -91,6 +111,9 @@ func (c *configWatcher) finishRequest(state *workloadEvictionState) {
 		state.requested = false
 		c.pendingRequests.Add(-1)
 	}
+	state.accepted = nil
+	state.denied = nil
+	state.uid = ""
 	state.wanted = nil
 	state.rolloutGeneration = 0
 	state.failures = 0
@@ -98,12 +121,16 @@ func (c *configWatcher) finishRequest(state *workloadEvictionState) {
 }
 
 func (c *configWatcher) startEvictionWorkers(ctx context.Context) {
+	var workers sync.WaitGroup
+	c.evictionQueueDone = make(chan struct{})
 	for range evictionWorkers {
-		go c.runEvictionWorker(ctx)
+		workers.Go(func() { c.runEvictionWorker(ctx) })
 	}
 	go func() {
 		<-ctx.Done()
 		c.evictionQueue.ShutDown()
+		workers.Wait()
+		close(c.evictionQueueDone)
 	}()
 }
 
@@ -116,6 +143,9 @@ func (c *configWatcher) runEvictionWorker(ctx context.Context) {
 		}
 		pending, err := c.reconcile(ctx, key)
 		switch {
+		case permanentEvictionError(err):
+			clog.Warnf(ctx, "Agent pod eviction for %s awaits a new event: %v", key, err)
+			q.Forget(key)
 		case err != nil && ctx.Err() == nil:
 			clog.Warnf(ctx, "Agent pod eviction for %s will be retried: %v", key, err)
 			q.AddRateLimited(key)
@@ -135,10 +165,17 @@ func (c *configWatcher) reconcile(ctx context.Context, key WorkloadKey) (pending
 	if !state.requested {
 		return false, nil
 	}
+	if state.denied != nil {
+		return false, state.denied
+	}
 	pending, err = c.reconcileLocked(ctx, key, state)
 	switch {
 	case err != nil:
 		if ctx.Err() != nil {
+			return false, err
+		}
+		if permanentEvictionError(err) {
+			state.denied = err
 			return false, err
 		}
 		state.failures++
@@ -156,7 +193,7 @@ func (c *configWatcher) reconcile(ctx context.Context, key WorkloadKey) (pending
 }
 
 func (c *configWatcher) reconcileLocked(ctx context.Context, key WorkloadKey, state *workloadEvictionState) (bool, error) {
-	wl, err := evictionWorkload(ctx, key)
+	wl, err := k8sapi.GetWorkload(ctx, key.Name, key.Namespace, key.Kind)
 	if err != nil {
 		if k8sErrors.IsNotFound(err) {
 			clog.Debugf(ctx, "Agent pod eviction for %s ends because the workload is gone", key)
@@ -164,9 +201,25 @@ func (c *configWatcher) reconcileLocked(ctx context.Context, key WorkloadKey, st
 		}
 		return true, err
 	}
-	pods, err := workloadPods(ctx, wl)
+	if state.uid == "" || wl.GetUID() != state.uid {
+		return false, nil
+	}
+	if state.tracksConfig {
+		current := c.Get(key.Name, key.Namespace)
+		if state.wanted != nil && current == nil {
+			return false, nil
+		}
+		state.wanted = current
+	}
+	pods, err := liveWorkloadPods(ctx, wl)
 	if err != nil {
 		return true, err
+	}
+	if state.accepted != nil {
+		if !state.accepted.recovered(wl, pods) {
+			return true, nil
+		}
+		state.accepted = nil
 	}
 	mismatched := podsWithAgentConfigMismatch(ctx, pods, state.wanted)
 	c.markPendingEviction(pods, mismatched)
@@ -186,7 +239,11 @@ func (c *configWatcher) reconcileLocked(ctx context.Context, key WorkloadKey, st
 		state.resetDeferral()
 		return true, nil
 	}
-	evicted, refused, err := c.evictBatch(ctx, mismatched, budget)
+	accepted, refused, err := c.evictPodBatch(ctx, mismatched, budget)
+	evicted := len(accepted)
+	if evicted > 0 {
+		state.accepted = newEvictionBatch(wl, pods, accepted)
+	}
 	if err != nil {
 		return true, err
 	}
@@ -194,7 +251,7 @@ func (c *configWatcher) reconcileLocked(ctx context.Context, key WorkloadKey, st
 		state.resetDeferral()
 		clog.Debugf(ctx, "Evicted %d of %d pods with agent config mismatch for %s", evicted, len(mismatched), wl)
 	}
-	if refused == nil {
+	if refused == nil || evicted > 0 {
 		return true, nil
 	}
 	if !c.budgetRefused(ctx, state, wl, refused) {
@@ -273,55 +330,163 @@ func (c *configWatcher) deferEviction(ctx context.Context, state *workloadEvicti
 	return false
 }
 
-// watchPods wakes up the workloads with outstanding eviction requests when one of their pods changes
-// readiness, is created, or goes away.
-func (c *configWatcher) watchPods(ctx context.Context, ix cache.SharedIndexInformer) (cache.ResourceEventHandlerRegistration, error) {
+func (c *configWatcher) watchPods(ix cache.SharedIndexInformer) (cache.ResourceEventHandlerRegistration, error) {
+	if ix == nil {
+		return nil, nil
+	}
 	return ix.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) {
-			c.podChanged(ctx, obj)
-		},
-		UpdateFunc: func(oldObj, newObj any) {
-			oldPod, oldOK := oldObj.(*core.Pod)
-			newPod, newOK := newObj.(*core.Pod)
-			if oldOK && newOK &&
-				podIsReady(oldPod) == podIsReady(newPod) &&
-				oldPod.Status.Phase == newPod.Status.Phase &&
-				oldPod.DeletionTimestamp.IsZero() == newPod.DeletionTimestamp.IsZero() {
-				return
-			}
-			c.podChanged(ctx, newObj)
-		},
-		DeleteFunc: func(obj any) {
-			c.podChanged(ctx, obj)
-		},
+		AddFunc:    c.enqueueEvictionPod,
+		UpdateFunc: c.enqueueChangedEvictionPod,
+		DeleteFunc: c.enqueueEvictionPod,
 	})
 }
 
-func (c *configWatcher) podChanged(ctx context.Context, obj any) {
+func (c *configWatcher) enqueueChangedEvictionPod(oldObject, newObject any) {
+	old, oldOK := oldObject.(*core.Pod)
+	newPod, newOK := newObject.(*core.Pod)
+	if !oldOK || !newOK || old.UID != newPod.UID || old.Status.Phase != newPod.Status.Phase ||
+		old.DeletionTimestamp.IsZero() != newPod.DeletionTimestamp.IsZero() || podIsReady(old) != podIsReady(newPod) {
+		c.enqueueEvictionPod(newObject)
+	}
+}
+
+func (c *configWatcher) enqueueEvictionPod(object any) {
 	if c.pendingRequests.Load() == 0 {
 		return
 	}
-	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-		obj = tombstone.Obj
+	if tombstone, ok := object.(cache.DeletedFinalStateUnknown); ok {
+		object = tombstone.Obj
 	}
-	pod, ok := obj.(*core.Pod)
+	pod, ok := object.(*core.Pod)
 	if !ok {
 		return
 	}
-	wl, err := podOwnerWorkload(ctx, pod, managerutil.GetEnv(ctx).EnabledWorkloadKinds)
+	owner := meta.GetControllerOf(pod)
+	if owner == nil {
+		return
+	}
+	kind, valid := liveControllerKind(*owner)
+	if !valid {
+		return
+	}
+	q := c.evictionQueue
+	if q == nil {
+		return
+	}
+	keys := make(map[WorkloadKey]struct{}, 2)
+	if kind, name := pod.Labels[agentconfig.WorkloadKindLabel], pod.Labels[agentconfig.WorkloadNameLabel]; kind != "" && name != "" {
+		keys[WorkloadKey{Kind: k8sapi.Kind(kind), Name: name, Namespace: pod.Namespace}] = struct{}{}
+	}
+	switch kind {
+	case k8sapi.StatefulSetKind, k8sapi.ReplicaSetKind, k8sapi.DeploymentKind, k8sapi.RolloutKind:
+		keys[WorkloadKey{Kind: kind, Name: owner.Name, Namespace: pod.Namespace}] = struct{}{}
+	}
+	for key := range keys {
+		if request, active := c.evictionStates.Load(key); active {
+			request.Lock()
+			if request.requested && evictionPodMatchesRequest(pod, key, request.uid) {
+				request.denied = nil
+				q.Forget(key)
+				q.Add(key)
+			}
+			request.Unlock()
+		}
+	}
+}
+
+func evictionPodMatchesRequest(pod *core.Pod, key WorkloadKey, uid types.UID) bool {
+	owner := meta.GetControllerOf(pod)
+	if owner == nil || k8sapi.Kind(owner.Kind) != key.Kind {
+		return true
+	}
+	return owner.Name == key.Name && (uid == "" || owner.UID == uid)
+}
+
+// evictionBatch tracks the physical pods present when Kubernetes accepted a batch.
+type evictionBatch struct {
+	before   map[types.UID]struct{}
+	accepted map[types.UID]struct{}
+	desired  int32
+}
+
+func newEvictionBatch(wl k8sapi.Workload, pods, accepted []*core.Pod) *evictionBatch {
+	b := &evictionBatch{desired: k8sapi.DesiredReplicas(wl), before: make(map[types.UID]struct{}, len(pods)), accepted: make(map[types.UID]struct{}, len(accepted))}
+	for _, pod := range pods {
+		b.before[pod.UID] = struct{}{}
+	}
+	for _, pod := range accepted {
+		b.accepted[pod.UID] = struct{}{}
+	}
+	return b
+}
+
+func (b *evictionBatch) recovered(wl k8sapi.Workload, pods []*core.Pod) bool {
+	var ready, fresh int
+	for _, pod := range pods {
+		if _, retiring := b.accepted[pod.UID]; retiring {
+			if pod.DeletionTimestamp == nil {
+				return false
+			}
+			continue
+		}
+		if !podIsReady(pod) {
+			continue
+		}
+		ready++
+		if _, old := b.before[pod.UID]; !old {
+			fresh++
+		}
+	}
+	desired := k8sapi.DesiredReplicas(wl)
+	return ready >= int(desired) && fresh >= len(b.accepted)-int(max(0, b.desired-desired))
+}
+
+func (c *configWatcher) removeAgentsAndWait(ctx context.Context, namespace string) error {
+	c.deleteNamespaceAgentConfigs(namespace)
+	workloads, err := liveAgentPodList(ctx, namespace)
 	if err != nil {
-		return
+		return err
 	}
-	key := workloadKeyOf(wl)
-	state, ok := c.evictionStates.Load(key)
-	if !ok {
-		return
+	keys := make(map[WorkloadKey]struct{}, len(workloads))
+	for key, wp := range workloads {
+		c.requestEviction(ctx, wp.wl, nil)
+		keys[key] = struct{}{}
 	}
-	state.Lock()
-	requested := state.requested
-	state.Unlock()
-	if requested {
-		c.evictionQueue.Forget(key)
-		c.evictionQueue.Add(key)
+	c.evictionStates.Range(func(key WorkloadKey, state *workloadEvictionState) bool {
+		if namespace == "" || key.Namespace == namespace {
+			state.Lock()
+			if state.requested {
+				state.wanted = nil
+				state.tracksConfig = true
+				keys[key] = struct{}{}
+			}
+			state.Unlock()
+		}
+		return true
+	})
+	timeout := managerutil.GetEnv(ctx).AgentArrivalTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Minute
 	}
+	recoveryCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var errs error
+	for key := range keys {
+		err = c.waitForEvictionRecovery(recoveryCtx, key)
+		if err != nil {
+			errs = errors.Join(errs, fmt.Errorf("removing agents from %s: %w", key, err))
+		}
+	}
+	return errs
+}
+
+func permanentEvictionError(err error) bool {
+	return k8sErrors.IsForbidden(err) || k8sErrors.IsUnauthorized(err) || k8sErrors.IsBadRequest(err) || k8sErrors.IsInvalid(err)
+}
+
+func (c *configWatcher) waitForEvictionRecovery(ctx context.Context, key WorkloadKey) error {
+	return wait.PollUntilContextCancel(ctx, 300*time.Millisecond, true, func(ctx context.Context) (bool, error) {
+		pending, err := c.reconcile(ctx, key)
+		return !pending, err
+	})
 }

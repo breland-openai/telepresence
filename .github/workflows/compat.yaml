@@ -57,9 +57,15 @@ jobs:
           echo "TELEPRESENCE_VERSION=$v" >> "$GITHUB_ENV"
           echo "TELEPRESENCE_SEMVER=${v#v}" >> "$GITHUB_ENV"
       - name: Determine counterpart version
+        shell: bash
         run: |
-          git fetch --tags --quiet
-          c=$(git tag --sort=-v:refname | grep -E '^v2\.[0-9]+\.[0-9]+$' | head -1)
+          # The released client, chart and images come from upstream, including on forks.
+          tags=$(git ls-remote --tags --refs --sort=-v:refname https://github.com/telepresenceio/telepresence.git 'v2.*')
+          c=$(awk -F/ '$NF ~ /^v2\.[0-9]+\.[0-9]+$/ { print $NF; exit }' <<< "$tags")
+          if [[ -z "$c" ]]; then
+            echo "No stable v2 release tag found in telepresenceio/telepresence" >&2
+            exit 1
+          fi
           echo "COMPAT_VERSION=${c#v}" >> "$GITHUB_ENV"
           echo "counterpart version: $c"
       - name: Start minikube

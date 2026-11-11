@@ -41,6 +41,54 @@ and the traffic-agent have gRPC servers that the clients connect to. They are co
 
 The `trafficManager` structure of the Helm chart configures the behavior of the Telepresence traffic manager.
 
+### Experimental cached sidecar checks
+
+The traffic-manager setting `CACHED_POD_CHECKS` defaults to `false`. When
+enabled through the chart's `extraEnv`, a sidecar intercept on a stable
+Deployment, ReplicaSet, or StatefulSet can qualify an existing agent from
+the manager's informers. The check requires the expected number of physical
+pods, matching controller UIDs and agent configurations, and a connected
+sidecar session with the same pod name and UID. Deployment checks also need
+the ReplicaSet informer. An outstanding eviction or replacement requires
+live reconciliation.
+
+Each participating informer must have synchronized, received a watch bookmark
+within the last 90 seconds, and applied the latest resource version received on
+its current stream. During streaming initialization the reflector must receive
+the initial-events-end bookmark. The manager checks the stream positions
+before and after reading the stores.
+
+The 90 seconds measure time since **local receipt** of a bookmark. A newer API
+update may still be in transit, and a silently broken connection can appear
+usable until the bookmark expires. An observed disconnect, a lagging store,
+an expired bookmark, or incomplete ownership sends the request through the
+live check. Eviction and replacement readiness use live Kubernetes evidence.
+
+A cache attempt scans the namespace's pod index for each selected workload.
+A successful inventory check also scans the manager's agent sessions. With
+16 participants, a request can visit the same namespace index 16 times.
+Broad selectors, watch updates during a scan, and cold caches can increase
+both local work and the number of live checks. To compare the paths on
+equivalent workloads, keep manager and agent logging settings fixed. When
+the agent log level inherits the manager's, changing it changes the desired
+injected configuration and can cause pod replacement.
+
+### Shared Service verification failures
+
+A transient failure while verifying participants fails intercept creation and
+preserves the requested Service identity. Kubernetes throttling during these
+checks returns `ResourceExhausted`, a timeout returns `DeadlineExceeded`,
+and cancellation returns `Canceled`. The manager checks the request context
+when publishing the intercept. If cancellation has reached that point, the
+client sees no new route and later agent approvals have nothing to activate.
+An intercept already published when the caller disconnects still requires
+normal cleanup.
+
+The CLI submits one create RPC per attempt and reports a create error before
+writing its environment file. Retry the same Service after recovery. These
+publication and error-handling rules apply with either value of
+`CACHED_POD_CHECKS`.
+
 ## Agent Configuration
 
 The `agent` structure of the Helm chart configures the behavior of the Telepresence agents.
@@ -62,6 +110,22 @@ The `agent.LogLevel` controls the log level of the traffic-agent. See [Log Level
 ### Resources
 
 The `agent.resources` and `agent.initResources` will be used as the `resources` element when injecting traffic-agents and init-containers.
+
+### Shutdown drain
+
+`agent.preStopDrainTimeout` controls how long an injected traffic-agent keeps serving
+existing intercepted connections while its pod terminates. The default is `2m`; set
+it to `0s` to disable the shutdown hook.
+
+The traffic-manager and injected traffic-agent images must both support the shutdown
+hook; set this value to `0s` when using an older or custom agent image without support.
+
+The actual drain is capped at the pod's termination grace period minus five seconds.
+A pod using Kubernetes's default 30-second grace period therefore drains for at
+most 25 seconds. Workloads requiring a longer drain must configure a sufficiently
+long pod termination grace period. This setting only affects injected sidecars,
+not node agents. Every injected pod retains its resources during this drain, even
+when it has no active intercept; use `0s` to avoid that termination overhead.
 
 ## Mutating Webhook
 

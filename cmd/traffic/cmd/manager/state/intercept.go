@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v4"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -421,8 +422,7 @@ func discoverServiceWorkloads(ctx context.Context, spec *rpc.InterceptSpec) ([]k
 	return sortedServiceWorkloads(workloads), true, nil
 }
 
-// serviceWorkloads keeps the explicitly requested workload when informer
-// state is unavailable, preserving single-workload interception.
+// serviceWorkloads includes the requested workload in the verified Service selection.
 func serviceWorkloads(ctx context.Context, spec *rpc.InterceptSpec, primary k8sapi.Workload) ([]k8sapi.Workload, error) {
 	workloads := map[string]k8sapi.Workload{
 		participantKey(primary.GetNamespace(), string(primary.GetKind()), primary.GetName()): primary,
@@ -432,7 +432,7 @@ func serviceWorkloads(ctx context.Context, spec *rpc.InterceptSpec, primary k8sa
 		return nil, err
 	}
 	if !known {
-		return sortedServiceWorkloads(workloads), nil
+		return nil, status.Errorf(codes.Unavailable, "participant discovery for Service %q is unavailable", spec.ServiceName)
 	}
 	for _, workload := range discovered {
 		addServiceWorkload(workloads, workload)
@@ -445,15 +445,6 @@ func serviceWorkloads(ctx context.Context, spec *rpc.InterceptSpec, primary k8sa
 // before shared-Service expansion changes ReplacePolicyContainer to
 // ReplacePolicyIntercept and restarts pods.
 func (s *State) checkServiceWorkloadConflicts(
-	ctx context.Context,
-	spec *rpc.InterceptSpec,
-	workload k8sapi.Workload,
-	client *ClientSession,
-) error {
-	return s.checkServiceWorkloadConflictsIgnoring(ctx, spec, workload, client, "")
-}
-
-func (s *State) checkServiceWorkloadConflictsIgnoring(
 	ctx context.Context,
 	spec *rpc.InterceptSpec,
 	workload k8sapi.Workload,
@@ -520,27 +511,46 @@ func serviceWorkloadInfos(workloads []k8sapi.Workload) []*rpc.InterceptWorkload 
 	return infos
 }
 
-// secondaryExcluded returns why workload may not join a shared Service
-// intercept for client, or "" when it may.
-func (s *State) secondaryExcluded(ctx context.Context, client *ClientSession, workload k8sapi.Workload) string {
+// verifySecondaryWorkload checks authorization, injection eligibility and conflicts before publishing a participant.
+func (s *State) verifySecondaryWorkload(ctx context.Context, spec *rpc.InterceptSpec, workload k8sapi.Workload, client *ClientSession, ignoreID string) error {
 	if err := s.authorizeParticipant(ctx, client, workload); err != nil {
-		return fmt.Sprintf("workload %s is not authorized for this client: %v", workload, err)
+		return fmt.Errorf("workload %s is not authorized for this client: %w", workload, err)
 	}
 	if s.nodeAgentWanted(workload.GetName(), workload.GetNamespace()) {
-		return fmt.Sprintf("workload %s has a live node-agent intercept or ingest claim", workload)
+		return fmt.Errorf("workload %s has a live node-agent intercept or ingest claim", workload)
 	}
 	if enabled, err := checkInterceptAnnotations(ctx, workload); err != nil {
-		return fmt.Sprintf("workload %s cannot be injected: %v", workload, err)
+		return fmt.Errorf("workload %s cannot be injected: %w", workload, err)
 	} else if !enabled {
-		return fmt.Sprintf("workload %s is not interceptable", workload)
+		return fmt.Errorf("workload %s is not interceptable", workload)
 	}
-	return ""
+	if err := s.checkServiceWorkloadConflicts(ctx, spec, workload, client, ignoreID); err != nil {
+		return fmt.Errorf("workload %s conflicts with an existing intercept: %w", workload, err)
+	}
+	return nil
 }
 
 func fallbackToSingleWorkload(ctx context.Context, spec *rpc.InterceptSpec, reason string) {
 	clog.Warnf(ctx, "Shared-Service expansion for %q is unavailable: %s; using only requested workload %q",
 		spec.ServiceName, reason, spec.Agent)
 	spec.SharedService = false
+}
+
+func serviceVerificationFailure(err error, target any) error {
+	code := status.Code(err)
+	switch {
+	case errors.Is(err, context.Canceled) || code == codes.Canceled:
+		code = codes.Canceled
+	case errors.Is(err, context.DeadlineExceeded) || k8sErrors.IsTimeout(err) || k8sErrors.IsServerTimeout(err) || code == codes.DeadlineExceeded:
+		code = codes.DeadlineExceeded
+	case k8sErrors.IsTooManyRequests(err) || code == codes.ResourceExhausted:
+		code = codes.ResourceExhausted
+	case code == codes.Unavailable || !k8sErrors.IsNotFound(err) && transientSidecarLookup(err):
+		code = codes.Unavailable
+	default:
+		return nil
+	}
+	return status.Errorf(code, "verifying shared-Service coverage for %s: %v", target, err)
 }
 
 func (s *State) ensureServiceWorkloads(
@@ -551,23 +561,26 @@ func (s *State) ensureServiceWorkloads(
 	primaryAgents []*AgentSession,
 	rp agentconfig.ReplacePolicy,
 	client *ClientSession,
-) []*rpc.InterceptWorkload {
+) ([]*rpc.InterceptWorkload, error) {
 	if !namesService(spec) {
-		return nil
+		return nil, nil
 	}
 	if spec.Replace || spec.Mechanism != "http" {
 		fallbackToSingleWorkload(ctx, spec, "shared interception requires the http mechanism without --replace")
-		return nil
+		return nil, nil
 	}
-	spec.SharedService = true
 
+	spec.SharedService = true
 	workloads, err := serviceWorkloads(ctx, spec, primary)
 	if err != nil {
+		if failure := serviceVerificationFailure(err, spec.ServiceName); failure != nil {
+			return nil, failure
+		}
 		fallbackToSingleWorkload(ctx, spec, err.Error())
-		return nil
+		return nil, nil
 	}
 	if len(workloads) <= 1 {
-		return serviceWorkloadInfos(workloads)
+		return serviceWorkloadInfos(workloads), nil
 	}
 
 	configWorkloads := make(map[string]k8sapi.Workload, len(workloads))
@@ -575,14 +588,12 @@ func (s *State) ensureServiceWorkloads(
 		if workload.GetName() == primary.GetName() && workload.GetKind() == primary.GetKind() {
 			continue
 		}
-		if reason := s.secondaryExcluded(ctx, client, workload); reason != "" {
-			fallbackToSingleWorkload(ctx, spec, reason)
-			return nil
-		}
-		if err = s.checkServiceWorkloadConflicts(ctx, spec, workload, client); err != nil {
-			fallbackToSingleWorkload(ctx, spec,
-				fmt.Sprintf("workload %s conflicts with an existing intercept: %v", workload, err))
-			return nil
+		if err := s.verifySecondaryWorkload(ctx, spec, workload, client, ""); err != nil {
+			if failure := serviceVerificationFailure(err, workload); failure != nil {
+				return nil, failure
+			}
+			fallbackToSingleWorkload(ctx, spec, err.Error())
+			return nil, nil
 		}
 		configWorkloads[participantKey(workload.GetNamespace(), string(workload.GetKind()), workload.GetName())] = workload
 	}
@@ -602,15 +613,18 @@ func (s *State) ensureServiceWorkloads(
 				config, agents, err = s.ensureAgent(ctx, configWorkload, s.isExtended(spec), false, secondaryWorkloadSpec(spec), rp)
 			}
 			if err != nil {
+				if failure := serviceVerificationFailure(err, workload); failure != nil {
+					return nil, failure
+				}
 				fallbackToSingleWorkload(ctx, spec,
 					fmt.Sprintf("unable to ensure agent for workload %s: %v", workload, err))
-				return nil
+				return nil, nil
 			}
 		}
 		if !sidecarClaimsService(config, spec) {
 			fallbackToSingleWorkload(ctx, spec,
 				fmt.Sprintf("agent config for workload %s does not claim the selected Service target", workload))
-			return nil
+			return nil, nil
 		}
 		currentAgents := s.LoadMatchingAgents(func(_ tunnel.SessionID, agent *AgentSession) bool {
 			return agent.Namespace == workload.GetNamespace() &&
@@ -637,10 +651,10 @@ func (s *State) ensureServiceWorkloads(
 		if !allClaim {
 			fallbackToSingleWorkload(ctx, spec,
 				fmt.Sprintf("not every agent for workload %s advertises the selected Service target", workload))
-			return nil
+			return nil, nil
 		}
 	}
-	return serviceWorkloadInfos(workloads)
+	return serviceWorkloadInfos(workloads), nil
 }
 
 func prepareAllContainerPorts(cn *agentconfig.Container, pi *rpc.PreparedIntercept) {
@@ -979,10 +993,13 @@ func (s *State) AddIntercept(ctx context.Context, cir *rpc.CreateInterceptReques
 		if err != nil {
 			return nil, nil, err
 		}
-		serviceWorkloads = s.ensureServiceWorkloads(ctx, spec, wl, primaryConfig, primaryAgents, rp, client)
+		serviceWorkloads, err = s.ensureServiceWorkloads(ctx, spec, wl, primaryConfig, primaryAgents, rp, client)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
-	is, err := s.addIntercept(interceptID, cir, serviceWorkloads)
+	is, err := s.addIntercept(ctx, interceptID, cir, serviceWorkloads)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -998,7 +1015,8 @@ func (s *State) AddIntercept(ctx context.Context, cir *rpc.CreateInterceptReques
 		pmCir.InterceptSpec = pmSpec
 
 		pmInterceptID := fmt.Sprintf("%s:%s", sessionID, pmSpec.Name)
-		_, err = s.addIntercept(pmInterceptID, pmCir, nil)
+		// Publication of the parent commits the request and its pod ports.
+		_, err = s.addIntercept(context.WithoutCancel(ctx), pmInterceptID, pmCir, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1081,7 +1099,7 @@ func childInterceptSpecs(spec *rpc.InterceptSpec) ([]*rpc.InterceptSpec, error) 
 	return specs, nil
 }
 
-func (s *State) addIntercept(id string, cir *rpc.CreateInterceptRequest, serviceWorkloads []*rpc.InterceptWorkload) (*Intercept, error) {
+func (s *State) addIntercept(ctx context.Context, id string, cir *rpc.CreateInterceptRequest, serviceWorkloads []*rpc.InterceptWorkload) (*Intercept, error) {
 	is := s.NewInterceptInfo(id, cir)
 	is.ServiceWorkloads = serviceWorkloads
 	s.initializeParticipants(is)
@@ -1098,11 +1116,20 @@ func (s *State) addIntercept(id string, cir *rpc.CreateInterceptRequest, service
 		}
 	}
 
-	if existingValue, hasConflict := s.intercepts.LoadOrStore(id, is); hasConflict {
-		if existingValue.Disposition != rpc.InterceptDispositionType_REMOVED {
-			return nil, grpcErrors.Errorf(codes.AlreadyExists, "Intercept named %q already exists", is.Spec.Name)
+	var createErr error
+	s.intercepts.Compute(id, func(existing *Intercept, loaded bool) (*Intercept, xsync.ComputeOp) {
+		if err := ctx.Err(); err != nil {
+			createErr = status.FromContextError(err).Err()
+			return existing, xsync.CancelOp
 		}
-		s.intercepts.Store(id, is)
+		if loaded && existing.Disposition != rpc.InterceptDispositionType_REMOVED {
+			createErr = grpcErrors.Errorf(codes.AlreadyExists, "Intercept named %q already exists", is.Spec.Name)
+			return existing, xsync.CancelOp
+		}
+		return is, xsync.UpdateOp
+	})
+	if createErr != nil {
+		return nil, createErr
 	}
 	return is, nil
 }
@@ -1249,8 +1276,24 @@ func (s *State) ensureAgent(parentCtx context.Context, wl k8sapi.Workload, exten
 		return sc, nil, nil
 	}
 
+	wait := s.beginSidecarAgentWait(parentCtx, wl)
+	var cfgJSON string
+	var waitOutcome sidecarAgentWaitOutcome
+	defer func() { s.finishSidecarAgentWait(wait, cfgJSON, waitOutcome) }()
+
 	ctx, cancel := context.WithTimeout(parentCtx, managerutil.GetEnv(parentCtx).AgentArrivalTimeout)
 	defer cancel()
+
+	if managerutil.GetEnv(ctx).CachedPodChecks {
+		if sc, encoded, as := s.cachedSidecarAgents(ctx, wl, spec, extended, rp); len(as) > 0 {
+			cfgJSON, waitOutcome = encoded, sidecarAgentWaitSucceeded
+			s.sidecarPodChecks.hit.Add(1)
+			return sc, as, nil
+		}
+		s.sidecarPodChecks.fallback.Add(1)
+	} else {
+		s.sidecarPodChecks.disabled.Add(1)
+	}
 
 	failedCreateCh, err := eventwatch.WatchWarnings(ctx, k8sapi.GetK8sInterface(ctx), wl.GetNamespace(), wl.GetName())
 	if err != nil {
@@ -1261,20 +1304,22 @@ func (s *State) ensureAgent(parentCtx context.Context, wl k8sapi.Workload, exten
 	if err != nil {
 		return nil, nil, err
 	}
+	cfgJSON, err = agentconfig.MarshalTight(sc)
+	if err != nil {
+		return nil, nil, err
+	}
+	waitOutcome = sidecarAgentWaitPreserve
 	err = mutator.GetMap(ctx).EvictPodsWithAgentConfigMismatch(ctx, wl, sc)
 	if err != nil {
 		clog.Errorf(ctx, "failed to inactivate pods: %v", err)
 		return nil, nil, err
 	}
-	// The injector puts exactly one traffic-agent in each pod it just
-	// evicted, so this wait always expects a single arrival.
-	as, err := s.waitForAgents(ctx, sc.AgentName, sc.Namespace, false, 1, failedCreateCh)
+	as, err := s.waitForSidecarAgent(ctx, wl, sc.AgentName, sc.Namespace, cfgJSON, failedCreateCh)
 	if err != nil {
-		// If no agent arrives, then drop its entry from the configmap. This ensures that there
-		// are no false positives the next time an intercept is attempted.
-		s.dropAgentConfig(parentCtx, wl)
+		waitOutcome = sidecarAgentWaitFailed
 		return nil, nil, err
 	}
+	waitOutcome = sidecarAgentWaitSucceeded
 	sortAgents(as)
 	return sc, as, nil
 }
@@ -1314,7 +1359,7 @@ func (s *State) waitForNodeAgent(parentCtx context.Context, name, namespace stri
 		expected = 1
 	}
 
-	as, err := s.waitForAgents(ctx, name, namespace, true, expected, failedCreateCh)
+	as, err := s.waitForAgents(ctx, name, namespace, expected, failedCreateCh)
 	if err != nil && ctx.Err() == context.DeadlineExceeded {
 		if missing := missingNodeAgentTargets(jobTargets, as); len(missing) > 0 {
 			err = errcat.User.Newf("%s\nNo agent registered for target pod(s): %s", err.Error(), strings.Join(missing, ", "))
@@ -1359,20 +1404,14 @@ func (s *State) ValidateAgentImage(agentImage string, extended bool) (err error)
 	return err
 }
 
-func (s *State) dropAgentConfig(
-	ctx context.Context,
-	wl k8sapi.Workload,
-) {
-	mutator.GetMap(ctx).Delete(wl.GetName(), wl.GetNamespace())
-}
-
 func (s *State) restoreAppContainer(ctx context.Context, ii *rpc.InterceptInfo, wl k8sapi.Workload) error {
 	clog.Debugf(ctx, "Restoring app container for %s", ii.Id)
 	spec := ii.Spec
 	n := spec.Agent
 	ns := spec.Namespace
 	mm := mutator.GetMap(ctx)
-	_, err := mm.Update(n, ns, func(sc *agentconfig.Sidecar) (*agentconfig.Sidecar, error) {
+	changed := false
+	config, err := mm.Update(n, ns, func(sc *agentconfig.Sidecar) (*agentconfig.Sidecar, error) {
 		if sc == nil {
 			return nil, nil
 		}
@@ -1393,14 +1432,13 @@ func (s *State) restoreAppContainer(ctx context.Context, ii *rpc.InterceptInfo, 
 			return sc, nil
 		}
 		cn.Replace = desiredPolicy
-
-		// The pods for this workload will be killed once the new updated sidecar
-		// reaches the configmap. We inactivate them now, so that they don't continue to
-		// review intercepts.
-		err = mm.EvictPodsWithAgentConfigMismatch(ctx, wl, sc)
-		return sc, err
+		changed = true
+		return sc, nil
 	})
-	return err
+	if err != nil || !changed {
+		return err
+	}
+	return mm.EvictPodsWithAgentConfigMismatch(ctx, wl, config)
 }
 
 func (s *State) GetOrGenerateAgentConfig(ctx context.Context, name, namespace string) (*agentconfig.Sidecar, error) {
@@ -1486,12 +1524,7 @@ func (s *State) getOrCreateAgentConfig(
 		}
 
 		if spec != nil {
-			var cn *agentconfig.Container
-			if spec.NoDefaultPort {
-				cn, err = icept.FindContainer(sc, spec)
-			} else {
-				cn, _, err = icept.FindIntercept(sc, spec)
-			}
+			cn, err := interceptConfigContainer(sc, spec)
 			if err != nil {
 				return nil, err
 			}
@@ -1499,6 +1532,14 @@ func (s *State) getOrCreateAgentConfig(
 		}
 		return sc, nil
 	})
+}
+
+func interceptConfigContainer(sc *agentconfig.Sidecar, spec *rpc.InterceptSpec) (*agentconfig.Container, error) {
+	if spec.NoDefaultPort {
+		return icept.FindContainer(sc, spec)
+	}
+	cn, _, err := icept.FindIntercept(sc, spec)
+	return cn, err
 }
 
 func checkInterceptAnnotations(ctx context.Context, wl k8sapi.Workload) (bool, error) {
@@ -1594,22 +1635,36 @@ func terminalEventMessage(ctx context.Context, fe *events.Event, podNamespace st
 	return msg
 }
 
-// waitForAgents waits for expected distinct agent sessions matching name,
-// namespace and nodeAgent to register, accumulating matching, non-
+// waitForAgents waits for expected distinct node-agent sessions matching name
+// and namespace to register, accumulating matching, non-
 // blacklisted sessions by PodUid across every delta (including the initial
 // snapshot Subscribe delivers of agents already registered) until that many
 // are present.
 func (s *State) waitForAgents(
 	ctx context.Context,
 	name, namespace string,
+	expected int,
+	failedCreateCh <-chan *events.Event,
+) ([]*AgentSession, error) {
+	return s.waitForAgentsMatching(ctx, name, namespace, true, expected, failedCreateCh, nil)
+}
+
+func (s *State) waitForAgentsMatching(
+	ctx context.Context,
+	name, namespace string,
 	nodeAgent bool,
 	expected int,
 	failedCreateCh <-chan *events.Event,
+	sidecar *sidecarAgentArrival,
 ) ([]*AgentSession, error) {
 	clog.Debugf(ctx, "Waiting for %d agent(s) %s.%s", expected, name, namespace)
 	deltaCh := s.WatchAgents(ctx, func(_ tunnel.SessionID, agent *AgentSession) bool {
 		return agentSessionMatches(agent, name, namespace, nodeAgent)
 	})
+	var retryCh <-chan time.Time
+	if sidecar != nil {
+		retryCh = sidecar.retryCh
+	}
 	// podNamespace is where the pods behind failure events live: the
 	// workload's namespace for a sidecar, but the traffic-manager's own
 	// namespace for a node-agent Job.
@@ -1645,23 +1700,29 @@ func (s *State) waitForAgents(
 			return nil, errcat.User.New(terminalEventMessage(ctx, fe, podNamespace, failedContainerRx, nodeAgent))
 		case delta, ok := <-deltaCh:
 			if !ok {
-				// The request has been canceled.
-				return nil, status.Error(codes.Canceled, fmt.Sprintf("channel closed while waiting for agent %s.%s to arrive", name, namespace))
-			}
-			for _, a := range delta.Upserts {
-				if mm.IsInactive(k8sTypes.UID(a.PodUid)) {
-					clog.Debugf(ctx, "Agent %s(%s) is blacklisted", a.PodName, a.PodIp)
+				if ctx.Err() != nil {
+					deltaCh = nil
 					continue
 				}
-				clog.Debugf(ctx, "Agent %s(%s) is ready", a.PodName, a.PodIp)
-				arrived[a.PodUid] = a
+				return nil, status.Errorf(codes.Canceled, "channel closed while waiting for agent %s.%s to arrive", name, namespace)
 			}
-			if len(arrived) >= expected {
-				as := make([]*AgentSession, 0, len(arrived))
-				for _, a := range arrived {
-					as = append(as, a)
+			if sidecar != nil {
+				if err := sidecar.apply(ctx, mm, arrived, delta); err != nil {
+					return nil, err
 				}
-				return as, nil
+			} else {
+				for _, a := range delta.Upserts {
+					if mm.IsInactive(k8sTypes.UID(a.PodUid)) {
+						clog.Debugf(ctx, "Agent %s(%s) is blacklisted", a.PodName, a.PodIp)
+						continue
+					}
+					clog.Debugf(ctx, "Agent %s(%s) is ready", a.PodName, a.PodIp)
+					arrived[a.PodUid] = a
+				}
+			}
+		case <-retryCh:
+			if err := sidecar.retry(ctx, mm, arrived); err != nil {
+				return nil, err
 			}
 		case <-ctx.Done():
 			v := "canceled"
@@ -1694,11 +1755,10 @@ func (s *State) waitForAgents(
 							"See https://telepresence.io/docs/troubleshooting#eks-calico-and-traffic-agent-injection-timeouts")
 				}
 			}
-			as := make([]*AgentSession, 0, len(arrived))
-			for _, a := range arrived {
-				as = append(as, a)
-			}
-			return as, errcat.User.New(bf.String())
+			return maps.Values(arrived), errcat.User.Errorf(ctx.Err(), "%s", bf.String())
+		}
+		if len(arrived) >= expected {
+			return maps.Values(arrived), nil
 		}
 	}
 }

@@ -2,7 +2,9 @@ package state
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
@@ -289,6 +292,71 @@ func TestServiceInterceptPrunesDroppedSelectorParticipantWithoutAgent(t *testing
 	require.Contains(t, updated.participants, participantKey("default", "Deployment", "example-service"))
 	require.NotContains(t, updated.participants, participantKey("default", "Deployment", "example-service-canary"))
 	require.Len(t, updated.ServiceWorkloads, 1)
+}
+
+func TestServiceInterceptReselectsAfterPruningAllParticipants(t *testing.T) {
+	stable := serviceAgent("example-service", "stable-pod", "10.0.0.1")
+	canary := serviceAgent("example-service-canary", "canary-pod", "10.0.0.2")
+	svc := &core.Service{
+		ObjectMeta: meta.ObjectMeta{
+			Name:      "example-service",
+			Namespace: "default",
+			UID:       k8sTypes.UID("shared-service-uid"),
+		},
+		Spec: core.ServiceSpec{Selector: map[string]string{"app": "example-service"}},
+	}
+	ctx := mutator.WithMap(serviceDiscoveryContext(t, svc,
+		serviceDeployment(stable.Name, map[string]string{"app": "example-service", "track": "stable"}),
+		serviceDeployment(canary.Name, map[string]string{"app": "example-service", "track": "canary"}),
+	), mutator.NewWatcher())
+	_, st := newServiceInterceptState(t)
+	st.backgroundCtx = ctx
+	intercept := activeServiceIntercept(t, ctx, st, stable, canary)
+	serviceStore := informer.GetK8sFactory(ctx, "").Core().V1().Services().Informer().GetStore()
+
+	svc.Spec.Selector = map[string]string{"track": "none"}
+	require.NoError(t, serviceStore.Update(svc.DeepCopy()))
+	st.reconcileServiceInterceptWorkloads(ctx, intercept.Id)
+	pruned, ok := st.GetIntercept(intercept.Id)
+	require.True(t, ok)
+	require.Empty(t, pruned.participants)
+	require.Empty(t, pruned.ServiceWorkloads)
+	require.Equal(t, rpc.InterceptDispositionType_NO_AGENT, pruned.Disposition)
+
+	svc.Spec.Selector = map[string]string{"track": "stable"}
+	require.NoError(t, serviceStore.Update(svc.DeepCopy()))
+	st.reconcileServiceInterceptWorkloads(ctx, intercept.Id)
+	reselected, ok := st.GetIntercept(intercept.Id)
+	require.True(t, ok)
+	require.Equal(t, sharedServiceWorkloads(stable.Name), reselected.ServiceWorkloads)
+	require.Equal(t, rpc.InterceptDispositionType_WAITING, reselected.Disposition)
+	require.Empty(t, reselected.PodName)
+	require.False(t, AgentMatchesInterceptInfo(canary.AgentInfo, reselected))
+	require.Empty(t, pruned.participants)
+
+	active := st.ApplyAgentReview(ctx, intercept.Id, stable, &rpc.ReviewInterceptRequest{
+		Disposition: rpc.InterceptDispositionType_ACTIVE,
+		PodIp:       stable.PodIp,
+	})
+	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, active.Disposition)
+	require.Equal(t, stable.PodName, active.PodName)
+}
+
+func TestServiceParticipantReconciliationAfterFallback(t *testing.T) {
+	ctx, st := newServiceInterceptState(t)
+	stable := serviceAgent("example-service", "stable-pod", "10.0.0.1")
+	canary := serviceAgent("example-service-canary", "canary-pod", "10.0.0.2")
+	intercept := activeServiceIntercept(t, ctx, st, stable, canary)
+	selected := map[string]*interceptParticipant{
+		agentParticipantKey(stable.AgentInfo): {namespace: stable.Namespace, kind: stable.Kind, name: stable.Name},
+	}
+	st.fallbackServiceInterceptToSingleWorkload(intercept.Id, "selection cannot be expanded")
+	fallback, ok := st.GetIntercept(intercept.Id)
+	require.True(t, ok)
+	require.False(t, serviceScopedIntercept(fallback.Spec))
+
+	updated := st.reconcileServiceParticipantsWithSelection(intercept.Id, intercept, selected, true, true)
+	require.Same(t, fallback, updated)
 }
 
 func TestServiceInterceptFallsBackWhenServiceIdentityChanges(t *testing.T) {
@@ -598,7 +666,7 @@ func TestServiceInterceptFallsBackForPodOnlySelectionAtCreation(t *testing.T) {
 	st.backgroundCtx = ctx
 
 	spec := sharedServiceSpec()
-	workloads := st.ensureServiceWorkloads(
+	workloads, err := st.ensureServiceWorkloads(
 		ctx,
 		spec,
 		k8sapi.Deployment(stable),
@@ -608,6 +676,7 @@ func TestServiceInterceptFallsBackForPodOnlySelectionAtCreation(t *testing.T) {
 		nil,
 	)
 
+	require.NoError(t, err)
 	require.Nil(t, workloads)
 	require.False(t, serviceScopedIntercept(spec))
 	require.Nil(t, mutator.GetMap(ctx).Get(canary.Name, canary.Namespace))
@@ -818,7 +887,7 @@ func TestServiceInterceptChecksSecondaryConflictsBeforeChangingConfig(t *testing
 	}})
 	client := newClientSessionState(ctx, "alice", &rpc.ClientInfo{Name: "alice"}, time.Now())
 
-	workloads := st.ensureServiceWorkloads(
+	workloads, err := st.ensureServiceWorkloads(
 		ctx,
 		spec,
 		k8sapi.Deployment(stable),
@@ -828,6 +897,7 @@ func TestServiceInterceptChecksSecondaryConflictsBeforeChangingConfig(t *testing
 		client,
 	)
 
+	require.NoError(t, err)
 	require.Nil(t, workloads)
 	require.False(t, serviceScopedIntercept(spec))
 	config := mutator.GetMap(ctx).Get(canary.Name, canary.Namespace)
@@ -1061,6 +1131,166 @@ func TestServiceInterceptWaitsForEveryWorkload(t *testing.T) {
 	require.Equal(t, map[string]string{"TRACK": "stable"}, updated.Environment)
 	require.True(t, st.IsInterceptedBy(stable, "client"))
 	require.True(t, st.IsInterceptedBy(canary, "client"))
+}
+
+func TestServiceInterceptElectsOneReviewerPerWorkload(t *testing.T) {
+	ctx, st := newServiceInterceptState(t)
+	agents := []*AgentSession{
+		serviceAgent("example-service", "stable-pod-1", "10.0.0.1"),
+		serviceAgent("example-service", "stable-pod-2", "10.0.0.2"),
+		serviceAgent("example-service-canary", "canary-pod", "10.0.0.3"),
+	}
+	for _, agent := range agents {
+		st.agents.Store(tunnel.SessionID(agent.PodName), agent)
+	}
+	intercept := &Intercept{InterceptInfo: &rpc.InterceptInfo{
+		Id:               "client:example-service",
+		Spec:             sharedServiceSpec(),
+		Disposition:      rpc.InterceptDispositionType_WAITING,
+		ClientSession:    &rpc.SessionInfo{SessionId: "client"},
+		ServiceWorkloads: sharedServiceWorkloads(agents[0].Name, agents[2].Name),
+	}}
+	st.initializeParticipants(intercept)
+	st.intercepts.Store(intercept.Id, intercept)
+
+	approve := func(agent *AgentSession) *Intercept {
+		return st.ApplyAgentReview(ctx, intercept.Id, agent, &rpc.ReviewInterceptRequest{
+			Disposition: rpc.InterceptDispositionType_ACTIVE,
+			PodIp:       agent.PodIp,
+		})
+	}
+	start := make(chan struct{})
+	results := make(chan *Intercept, 2)
+	for _, agent := range agents[:2] {
+		go func() {
+			<-start
+			results <- approve(agent)
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	require.Same(t, first, second, "competing approvals must publish only one revision")
+	require.Equal(t, rpc.InterceptDispositionType_WAITING, first.Disposition)
+
+	key := agentParticipantKey(agents[0].AgentInfo)
+	elected, replacement := agents[0], agents[1]
+	if first.participants[key].podName == agents[1].PodName {
+		elected, replacement = replacement, elected
+	}
+	require.Equal(t, elected.PodIp, first.participants[key].review.PodIp)
+	st.agents.Delete(tunnel.SessionID(elected.PodName))
+	st.consolidateAgentSessionIntercepts(elected)
+	invalidated, ok := st.intercepts.Load(intercept.Id)
+	require.True(t, ok)
+	require.Nil(t, invalidated.participants[key].review)
+	require.Equal(t, replacement.PodName, approve(replacement).participants[key].podName)
+	active := approve(agents[2])
+	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, active.Disposition)
+	require.Equal(t, replacement.PodName, active.PodName)
+	require.Equal(t, replacement.PodIp, active.PodIp)
+}
+
+func TestLateServiceReviewPreservesUnavailableParticipants(t *testing.T) {
+	for _, cause := range []string{"expired participant", "replica without target"} {
+		t.Run(cause, func(t *testing.T) {
+			ctx, st := newServiceInterceptState(t)
+			now := time.Now()
+			register := func(id tunnel.SessionID, info *rpc.AgentInfo) *AgentSession {
+				t.Helper()
+				_, err := st.RestoreAgent(ctx, id, info, nil, now)
+				require.NoError(t, err)
+				agent := st.GetAgent(id)
+				require.NotNil(t, agent)
+				return agent
+			}
+			stable := register("stable", serviceAgent("example-service", "stable", "10.0.0.1").AgentInfo)
+			canary := register("canary", serviceAgent("example-service-canary", "canary", "10.0.0.2").AgentInfo)
+			sibling := register("sibling", serviceAgent(stable.Name, "sibling", "10.0.0.3").AgentInfo)
+			intercept := activeServiceIntercept(t, ctx, st, stable, canary)
+			review := func(agent *AgentSession) *Intercept {
+				return st.ApplyAgentReview(ctx, intercept.Id, agent, &rpc.ReviewInterceptRequest{
+					Disposition: rpc.InterceptDispositionType_ACTIVE,
+					PodIp:       agent.PodIp,
+				})
+			}
+
+			if cause == "expired participant" {
+				st.expireAgentSession(canary, now.Add(time.Second))
+				require.Nil(t, st.GetAgent("canary"))
+			} else {
+				legacy := serviceAgent(canary.Name, "legacy", "10.0.0.4")
+				legacy.InterceptTargets = nil
+				register("legacy", legacy.AgentInfo)
+			}
+			unavailable, ok := st.intercepts.Load(intercept.Id)
+			require.True(t, ok)
+			require.Equal(t, rpc.InterceptDispositionType_NO_AGENT, unavailable.Disposition)
+			code, _ := st.checkAgentsForIntercept(unavailable)
+			require.Equal(t, rpc.InterceptDispositionType_NO_AGENT, code)
+
+			// These RPCs could already have been in flight when the agent set changed.
+			for _, agent := range []*AgentSession{sibling, stable, sibling} {
+				updated := review(agent)
+				require.Same(t, unavailable, updated, "late review from %s", agent.PodName)
+			}
+
+			if cause == "expired participant" {
+				canary = register("canary", canary.AgentInfo)
+			} else {
+				st.RemoveSession(ctx, "legacy")
+			}
+			waiting, ok := st.intercepts.Load(intercept.Id)
+			require.True(t, ok)
+			require.Equal(t, rpc.InterceptDispositionType_WAITING, waiting.Disposition)
+			require.Equal(t, rpc.InterceptDispositionType_ACTIVE, review(canary).Disposition)
+		})
+	}
+}
+
+func TestExpiredServiceReviewerCannotApproveAfterReplacementArrives(t *testing.T) {
+	ctx, st := newServiceInterceptState(t)
+	now := time.Now()
+	stable := serviceAgent("example-service", "stable", "10.0.0.1")
+	canaryInfo := serviceAgent("example-service-canary", "old-canary", "10.0.0.2").AgentInfo
+	_, err := st.RestoreAgent(ctx, "canary", canaryInfo, nil, now)
+	require.NoError(t, err)
+	old := st.GetAgent("canary")
+	require.NotNil(t, old)
+	intercept := activeServiceIntercept(t, ctx, st, stable, old)
+	review := func(agent *AgentSession) *Intercept {
+		return st.ApplyAgentReview(ctx, intercept.Id, agent, &rpc.ReviewInterceptRequest{
+			Disposition: rpc.InterceptDispositionType_ACTIVE,
+			PodIp:       agent.PodIp,
+		})
+	}
+	// Each worker resolved the same session before expiry. Its review can
+	// overlap removal and registration, or arrive after the replacement does.
+	start := make(chan struct{})
+	var overlapping sync.WaitGroup
+	for range 8 {
+		overlapping.Go(func() {
+			<-start
+			review(old)
+		})
+	}
+	close(start)
+	st.expireAgentSession(old, now.Add(time.Second))
+	replacementInfo := serviceAgent(old.Name, "new-canary", "10.0.0.3").AgentInfo
+	_, err = st.RestoreAgent(ctx, "replacement", replacementInfo, nil, now.Add(time.Second))
+	overlapping.Wait()
+	require.NoError(t, err)
+	replacement := st.GetAgent("replacement")
+	require.NotNil(t, replacement)
+
+	waiting, ok := st.intercepts.Load(intercept.Id)
+	require.True(t, ok)
+	require.Equal(t, rpc.InterceptDispositionType_WAITING, waiting.Disposition)
+	// The RPC resolved the old session before expiry and is only now applying its review.
+	got := review(old)
+	require.Same(t, waiting, got, "review from expired %s", old.PodName)
+	active := review(replacement)
+	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, active.Disposition)
+	require.Equal(t, replacement.PodName, active.participants[agentParticipantKey(replacement.AgentInfo)].podName)
 }
 
 func TestServiceInterceptPublishesLateWorkload(t *testing.T) {
@@ -1711,6 +1941,13 @@ func TestServiceInterceptRequeuesWhenNonClaimingParticipantLeaves(t *testing.T) 
 	code, message := st.checkAgentsForIntercept(updated)
 	require.Equal(t, rpc.InterceptDispositionType_UNSPECIFIED, code)
 	require.Empty(t, message)
+
+	updated = st.ApplyAgentReview(ctx, intercept.Id, canary, &rpc.ReviewInterceptRequest{
+		Disposition: rpc.InterceptDispositionType_ACTIVE,
+		PodIp:       canary.PodIp,
+	})
+	require.Equal(t, rpc.InterceptDispositionType_ACTIVE, updated.Disposition)
+	require.Equal(t, stable.PodName, updated.PodName)
 }
 
 func TestNonServiceSiblingRemovalDoesNotResetActiveIntercept(t *testing.T) {
@@ -1792,7 +2029,8 @@ func TestUnsupportedSharedServiceModeFallsBackToRequestedWorkload(t *testing.T) 
 	spec := sharedServiceSpec()
 	spec.Mechanism = "tcp"
 
-	st.ensureServiceWorkloads(ctx, spec, nil, nil, nil, agentconfig.ReplacePolicyIntercept, nil)
+	_, err := st.ensureServiceWorkloads(ctx, spec, nil, nil, nil, agentconfig.ReplacePolicyIntercept, nil)
+	require.NoError(t, err)
 
 	require.False(t, serviceScopedIntercept(spec))
 	require.Equal(t, "shared-service-uid", spec.ServiceUid)
@@ -1858,7 +2096,9 @@ func ensureSharedServiceForAlice(ctx context.Context, t *testing.T, st *State, s
 	require.NoError(t, err)
 	client := newClientSessionState(ctx, "client", &rpc.ClientInfo{Name: "alice"}, time.Now())
 	st.clients.Store("client", client)
-	return st.ensureServiceWorkloads(ctx, spec, k8sapi.Deployment(stable), primaryConfig, nil, agentconfig.ReplacePolicyIntercept, client)
+	wls, err := st.ensureServiceWorkloads(ctx, spec, k8sapi.Deployment(stable), primaryConfig, nil, agentconfig.ReplacePolicyIntercept, client)
+	require.NoError(t, err)
+	return wls
 }
 
 func TestServiceInterceptFallsBackWhenSecondaryIsNotAuthorized(t *testing.T) {
@@ -1990,7 +2230,8 @@ func TestServiceInterceptSecondaryIgnoresPrimaryContainerName(t *testing.T) {
 
 	client := newClientSessionState(ctx, "alice", &rpc.ClientInfo{Name: "alice"}, time.Now())
 	// The canary has no ready replicas, so this covers the getOrCreateAgentConfig branch.
-	workloads := st.ensureServiceWorkloads(ctx, spec, k8sapi.Deployment(stable), primaryConfig, nil, agentconfig.ReplacePolicyIntercept, client)
+	workloads, err := st.ensureServiceWorkloads(ctx, spec, k8sapi.Deployment(stable), primaryConfig, nil, agentconfig.ReplacePolicyIntercept, client)
+	require.NoError(t, err)
 
 	require.Len(t, workloads, 2)
 	require.True(t, serviceScopedIntercept(spec))
@@ -2002,4 +2243,77 @@ func TestServiceInterceptSecondaryIgnoresPrimaryContainerName(t *testing.T) {
 	}
 	require.Equal(t, agentconfig.ReplacePolicyContainer, replace["app"])
 	require.Equal(t, agentconfig.ReplacePolicyIntercept, replace["backend"])
+}
+
+func TestSharedServiceVerificationFailureKeepsScope(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		code codes.Code
+	}{
+		{"throttled", apierrors.NewTooManyRequests("retry", 1), codes.ResourceExhausted},
+		{"server timeout", apierrors.NewTimeoutError("pod list", 1), codes.DeadlineExceeded},
+		{"deadline", context.DeadlineExceeded, codes.DeadlineExceeded},
+		{"canceled", context.Canceled, codes.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := sharedServiceSpec()
+			stable := serviceDeployment(spec.Agent, map[string]string{"app": "shared", "track": "stable"})
+			canary := serviceDeployment(spec.Agent+"-canary", map[string]string{"app": "shared", "track": "canary"})
+			svc := &core.Service{
+				ObjectMeta: meta.ObjectMeta{Name: spec.ServiceName, Namespace: spec.Namespace, UID: k8sTypes.UID(spec.ServiceUid)},
+				Spec:       core.ServiceSpec{Selector: map[string]string{"app": "shared"}, Ports: []core.ServicePort{{Name: "http", Port: 80, TargetPort: intstr.FromInt(8080)}}},
+			}
+			ctx := serviceDiscoveryContext(t, svc, stable, canary)
+			ctx = managerutil.WithResolvedAgentImageRetriever(ctx, managerutil.ImageFromEnv(sidecarArrivalImage))
+			_, st := newServiceInterceptState(t)
+			client := newClientSessionState(ctx, "client", &rpc.ClientInfo{Name: "client"}, time.Now())
+			mm := &sidecarRestoreObserver{Map: mutator.NewWatcher()}
+			ctx = mutator.WithMap(ctx, mm)
+			st.backgroundCtx = ctx
+			wl := k8sapi.Deployment(stable)
+			cfg, err := st.getOrCreateAgentConfig(ctx, wl, false, true, spec, agentconfig.ReplacePolicyIntercept)
+			require.NoError(t, err)
+			agents := []*AgentSession{serviceAgent(stable.Name, "primary", "10.0.0.1")}
+			mm.dispatch = func(context.Context, k8sapi.Workload, *agentconfig.Sidecar) error {
+				return errors.Join(errors.New("checking pods"), tc.err)
+			}
+			targets, err := st.ensureServiceWorkloads(ctx, spec, wl, cfg, agents, agentconfig.ReplacePolicyIntercept, client)
+			require.Equal(t, tc.code, status.Code(err))
+			require.ErrorContains(t, err, canary.Name)
+			require.Empty(t, targets)
+			require.Equal(t, sharedServiceSpec().ServiceUid, spec.ServiceUid)
+			require.Equal(t, sharedServiceSpec().ServicePort, spec.ServicePort)
+			require.Equal(t, sharedServiceSpec().ServicePortName, spec.ServicePortName)
+			mm.dispatch = func(context.Context, k8sapi.Workload, *agentconfig.Sidecar) error { return nil }
+			targets, err = st.ensureServiceWorkloads(ctx, spec, wl, cfg, agents, agentconfig.ReplacePolicyIntercept, client)
+			require.NoError(t, err)
+			require.Len(t, targets, 2)
+		})
+	}
+}
+
+func TestSharedServiceUnknownSelectionKeepsScope(t *testing.T) {
+	ctx, s := newServiceInterceptState(t)
+	spec := sharedServiceSpec()
+	deployment := serviceDeployment(spec.Agent, map[string]string{"app": "echo"})
+	targets, err := s.ensureServiceWorkloads(ctx, spec, k8sapi.Deployment(deployment), nil, nil, agentconfig.ReplacePolicyIntercept, nil)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Empty(t, targets)
+	require.True(t, serviceScopedIntercept(spec))
+}
+
+func TestSharedServiceAgentWaitDistinguishesDeadlineFromCancellation(t *testing.T) {
+	ctx, st := newServiceInterceptState(t)
+	expired, stop := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+	defer stop()
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	for _, tc := range []struct {
+		ctx  context.Context
+		code codes.Code
+	}{{expired, codes.DeadlineExceeded}, {canceled, codes.Canceled}} {
+		_, err := st.waitForAgentsMatching(tc.ctx, "echo", "default", false, 1, nil, nil)
+		require.Equal(t, tc.code, status.Code(serviceVerificationFailure(err, "echo")))
+	}
 }

@@ -177,18 +177,20 @@ func WatchAllowlist(ctx context.Context, address string, allowlist *Allowlist) e
 	// seconds rather than whenever TCP eventually gives up: WatchWithRetry can only
 	// resubscribe once the dead stream errors, and until it does the allowlist keeps
 	// the departed pod's IP, so a manager-bound QUIC dial routes to a dead backend.
-	conn, err := grpc.NewClient(address,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second,
-			Timeout:             5 * time.Second,
-			PermitWithoutStream: true,
-		}))
+	newConn := func() (*grpc.ClientConn, error) {
+		return grpc.NewClient(address,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithKeepaliveParams(keepalive.ClientParameters{
+				Time:                10 * time.Second,
+				Timeout:             5 * time.Second,
+				PermitWithoutStream: true,
+			}))
+	}
+	conn, err := newConn()
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
-	manager := rpc.NewManagerClient(conn)
+	defer func() { _ = conn.Close() }()
 
 	// retries counts repair invocations, i.e. attempts after the first. While
 	// allowlist has never received a snapshot, this warns on the 3rd retry and
@@ -196,19 +198,30 @@ func WatchAllowlist(ctx context.Context, address string, allowlist *Allowlist) e
 	// allowlistWatchRetryInterval), so a persistently unreachable manager is
 	// visible instead of silently dropping every datagram. Once a snapshot has
 	// been received, it never warns again: further retries are ordinary
-	// reconnects already logged by the watcher.
+	// reconnects handled by the watcher.
 	retries := 0
 	repair := func() error {
 		retries++
 		if !allowlist.Ready() && retries%12 == 3 {
 			clog.Warnf(ctx, "quic-forwarder: still no backend allowlist snapshot after %d attempts; all datagrams are dropped until one arrives", retries)
 		}
+		// The manager Service is headless. A transparent proxy can keep its local
+		// HTTP/2 connection healthy while returning an RPC error for a departed
+		// manager Pod. gRPC does not refresh successful DNS resolution for an RPC
+		// error alone. Rebuild the channel so every failed watch can resolve the
+		// current manager address, keeping the last allowlist until a new snapshot.
+		_ = conn.Close()
+		fresh, err := newConn()
+		if err != nil {
+			return err
+		}
+		conn = fresh
 		return nil
 	}
 
 	return watcher.WatchWithRetry(ctx, "WatchQuicBackends", allowlistWatchRetryInterval,
 		func(ctx context.Context) (grpc.ServerStreamingClient[rpc.QuicBackendSnapshot], error) {
-			return manager.WatchQuicBackends(ctx, &empty.Empty{})
+			return rpc.NewManagerClient(conn).WatchQuicBackends(ctx, &empty.Empty{})
 		},
 		func(snap *rpc.QuicBackendSnapshot) error {
 			allowlist.update(ctx, snap.Backends)
