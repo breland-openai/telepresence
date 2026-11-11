@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	k8sVersion "k8s.io/apimachinery/pkg/version"
 	fakeDiscovery "k8s.io/client-go/discovery/fake"
 	clientfeatures "k8s.io/client-go/features"
@@ -40,8 +42,10 @@ import (
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/mutator"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/namespaces"
+	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/state"
 	testdata "github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/test"
 	"github.com/telepresenceio/telepresence/v2/pkg/agentconfig"
+	"github.com/telepresenceio/telepresence/v2/pkg/cache"
 	"github.com/telepresenceio/telepresence/v2/pkg/grpc/server"
 	"github.com/telepresenceio/telepresence/v2/pkg/informer"
 	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
@@ -1442,4 +1446,56 @@ func Test_hasDomainSuffix(t *testing.T) {
 			}
 		})
 	}
+}
+
+type projectionPodMap struct {
+	mutator.Map
+	inactive atomic.Bool
+}
+
+func (m *projectionPodMap) IsInactive(k8stypes.UID) bool { return m.inactive.Load() }
+
+func TestAgentPodWatchWithdrawsAndRestoresInactivePod(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	ctx, cancel := context.WithTimeout(testutil.NewContext(t, true), 10*time.Second)
+	defer cancel()
+	conn, mgr, ctx := getTestClientConnAndService(ctx, t, nil)
+	defer conn.Close()
+	projection := (&service{state: mgr.State()}).newAgentPodProjection(ctx, "client")
+	pods := &projectionPodMap{Map: projection.m}
+	projection.m = pods
+	agents := make(chan cache.Delta[tunnel.SessionID, *state.AgentSession], 1)
+	intercepts := make(chan cache.Delta[string, *state.Intercept], 1)
+	projection.run(ctx, ctx.Done(), agents, intercepts)
+	deltas := projection.subscribe(ctx.Done())
+	next := func() cache.Delta[string, *rpc.AgentPodInfo] {
+		t.Helper()
+		select {
+		case d := <-deltas:
+			return d
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for the projected agent-pod change")
+			return cache.Delta[string, *rpc.AgentPodInfo]{}
+		}
+	}
+	_ = next() // initial snapshot
+	const id = "agent:pod-uid"
+	agent := &state.AgentSession{AgentInfo: &rpc.AgentInfo{
+		Name: "api", Namespace: "default", PodName: "api-0", PodUid: "pod-uid", PodIp: "10.0.0.3",
+	}}
+	upsert := cache.Delta[tunnel.SessionID, *state.AgentSession]{Upserts: map[tunnel.SessionID]*state.AgentSession{id: agent}}
+	agents <- upsert
+	require.Equal(t, "api-0", next().Upserts[id].GetPodName())
+
+	pods.inactive.Store(true)
+	intercepts <- cache.Delta[string, *state.Intercept]{}
+	require.Contains(t, next().Removals, id)
+
+	pods.inactive.Store(false)
+	intercepts <- cache.Delta[string, *state.Intercept]{}
+	require.Equal(t, "api-0", next().Upserts[id].GetPodName())
+
+	pods.inactive.Store(true)
+	agents <- upsert
+	require.Contains(t, next().Removals, id)
 }

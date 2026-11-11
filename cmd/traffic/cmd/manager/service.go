@@ -18,7 +18,6 @@ import (
 	"github.com/blang/semver/v4"
 	"github.com/google/uuid"
 	dns2 "github.com/miekg/dns"
-	"github.com/puzpuzpuz/xsync/v4"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -898,67 +897,78 @@ func (s *service) newAgentPodProjection(ctx context.Context, clientSessionID tun
 	}
 }
 
-// run starts the goroutine that folds agentsCh deltas into the projection.
-// It exits when ctx is done or sessionDone is closed.
-func (p *agentPodProjection) run(ctx context.Context, sessionDone <-chan struct{}, agentsCh <-chan cache.Delta[tunnel.SessionID, *state.AgentSession]) {
+// Keep the watched sessions even while their pods are inactive. An eviction
+// can be withdrawn, making the same session eligible for routing again.
+func (p *agentPodProjection) run(ctx context.Context, sessionDone <-chan struct{},
+	agentsCh <-chan cache.Delta[tunnel.SessionID, *state.AgentSession], interceptsCh <-chan cache.Delta[string, *state.Intercept],
+) {
 	go func() {
+		agents := make(map[tunnel.SessionID]*state.AgentSession)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-sessionDone:
 				return
-			case delta := <-agentsCh:
-				for k, a := range delta.Upserts {
-					if p.m.IsInactive(types.UID(a.PodUid)) {
-						continue
-					}
-					aip, parseErr := netip.ParseAddr(a.PodIp)
-					if parseErr != nil {
-						clog.Errorf(ctx, "error parsing agent pod ip %q: %v", a.PodIp, parseErr)
-						continue
-					}
-					ap := &rpc.AgentPodInfo{
-						WorkloadName: a.Name,
-						PodId:        a.PodUid,
-						PodName:      a.PodName,
-						Namespace:    a.Namespace,
-						PodIp:        aip.AsSlice(),
-						ApiPort:      a.ApiPort,
-						Intercepted:  p.s.state.IsInterceptedBy(a, p.clientSessionID),
-						NodeAgent:    a.NodeAgent,
-						QuicSni:      quicSNIForAgent(a.QuicPort, a.PodUid),
-						Version:      a.Version,
-					}
-					p.agentPodInfos.Store(string(k), ap)
+			case delta, ok := <-agentsCh:
+				if !ok {
+					return
 				}
-				for k := range delta.Removals {
-					p.agentPodInfos.Delete(string(k))
+				for id, a := range delta.Upserts {
+					agents[id] = a
+					p.updateAgent(ctx, string(id), a, nil)
+				}
+				for id := range delta.Removals {
+					delete(agents, id)
+					p.agentPodInfos.Delete(string(id))
+				}
+			case _, ok := <-interceptsCh:
+				if !ok {
+					return
+				}
+				for id, a := range agents {
+					key := string(id)
+					previous, _ := p.agentPodInfos.Load(key)
+					p.updateAgent(ctx, key, a, previous)
 				}
 			}
 		}
 	}()
 }
 
-// refreshIntercepted recomputes the Intercepted flag for every projected
-// pod, updating (and thereby re-notifying) only the ones whose flag
-// actually flipped.
-func (p *agentPodProjection) refreshIntercepted() {
-	p.agentPodInfos.Range(func(k string, a *rpc.AgentPodInfo) bool {
-		if p.m.IsInactive(types.UID(a.PodId)) {
-			return true
+// On an intercept change, only the pod's eligibility and Intercepted flag
+// can change. An agent update supplies fresh pod information.
+func (p *agentPodProjection) updateAgent(ctx context.Context, key string, a *state.AgentSession, previous *rpc.AgentPodInfo) {
+	if p.m.IsInactive(types.UID(a.PodUid)) {
+		p.agentPodInfos.Delete(key)
+		return
+	}
+	intercepted := p.s.state.IsInterceptedBy(a, p.clientSessionID)
+	if previous != nil {
+		if previous.Intercepted != intercepted {
+			ap := proto.CloneOf(previous)
+			ap.Intercepted = intercepted
+			p.agentPodInfos.Store(key, ap)
 		}
-		agent := p.s.state.GetAgent(tunnel.SessionID(state.AgentSessionIDPrefix + a.PodId))
-		intercepted := p.s.state.IsInterceptedBy(agent, p.clientSessionID)
-		p.agentPodInfos.Compute(k, func(a *rpc.AgentPodInfo, loaded bool) (*rpc.AgentPodInfo, xsync.ComputeOp) {
-			if loaded && a.Intercepted != intercepted {
-				a := proto.Clone(a).(*rpc.AgentPodInfo)
-				a.Intercepted = intercepted
-				return a, xsync.UpdateOp
-			}
-			return a, xsync.CancelOp
-		})
-		return true
+		return
+	}
+	ip, err := netip.ParseAddr(a.PodIp)
+	if err != nil {
+		clog.Errorf(ctx, "error parsing agent pod ip %q: %v", a.PodIp, err)
+		p.agentPodInfos.Delete(key)
+		return
+	}
+	p.agentPodInfos.Store(key, &rpc.AgentPodInfo{
+		WorkloadName: a.Name,
+		PodId:        a.PodUid,
+		PodName:      a.PodName,
+		Namespace:    a.Namespace,
+		PodIp:        ip.AsSlice(),
+		ApiPort:      a.ApiPort,
+		Intercepted:  intercepted,
+		NodeAgent:    a.NodeAgent,
+		QuicSni:      quicSNIForAgent(a.QuicPort, a.PodUid),
+		Version:      a.Version,
 	})
 }
 
@@ -971,7 +981,7 @@ func (s *service) watchAgentPodsDelta(ctx context.Context, namespaces []string, 
 	clientSessionID := managerutil.GetSessionID(ctx)
 	agentsCh, interceptsCh, sessionDone := s.createAgentPodWatchers(ctx, namespaces)
 	proj := s.newAgentPodProjection(ctx, clientSessionID)
-	proj.run(ctx, sessionDone, agentsCh)
+	proj.run(ctx, sessionDone, agentsCh, interceptsCh)
 
 	agentPodInfosCh := proj.subscribe(ctx.Done())
 	for {
@@ -980,8 +990,6 @@ func (s *service) watchAgentPodsDelta(ctx context.Context, namespaces []string, 
 			return nil
 		case <-sessionDone:
 			return nil
-		case <-interceptsCh:
-			proj.refreshIntercepted()
 		case delta := <-agentPodInfosCh:
 			if err := stream.Send(&rpc.AgentPodInfoDelta{Upserts: delta.Upserts, Removals: maps2.KeySlice(delta.Removals)}); err != nil {
 				return err
@@ -1417,7 +1425,7 @@ func (s *service) WatchSessionEvents(request *rpc.SessionEventsRequest, stream g
 	clientSessionID := managerutil.GetSessionID(ctx)
 	agentsCh, refreshCh, sessionDone := s.createAgentPodWatchers(ctx, namespaces)
 	proj := s.newAgentPodProjection(ctx, clientSessionID)
-	proj.run(ctx, sessionDone, agentsCh)
+	proj.run(ctx, sessionDone, agentsCh, refreshCh)
 	agentPodInfosCh := proj.subscribe(ctx.Done())
 
 	interceptsCh, _, err := s.watchIntercepts(ctx, request.Session)
@@ -1431,8 +1439,6 @@ func (s *service) WatchSessionEvents(request *rpc.SessionEventsRequest, stream g
 			return nil
 		case <-sessionDone:
 			return nil
-		case <-refreshCh:
-			proj.refreshIntercepted()
 		case delta := <-agentPodInfosCh:
 			clog.Debugf(ctx, "Sending %d agent-pod upserts and %d agent-pod removals", len(delta.Upserts), len(delta.Removals))
 			apid := &rpc.AgentPodInfoDelta{Upserts: delta.Upserts, Removals: maps2.KeySlice(delta.Removals)}
