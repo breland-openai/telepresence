@@ -277,15 +277,13 @@ func (ac *client) dialAgentQUIC(ctx context.Context, ep *quicEndpoint, sni strin
 	return newQuicStreamConn(stream, conn), nil
 }
 
-// closeQuicConn closes and clears this agent's cached QUIC connection, if any. Called when
-// the agent client is torn down (pod removed, replaced, or the connection cancelled) and
-// when refresh gives a dead QUIC path a fresh chance following an AgentPodInfo update.
+// Detach the exact connection before a new agent dial can install its replacement.
 func (ac *client) closeQuicConn() {
 	ac.quicConnMu.Lock()
 	conn := ac.quicConn
 	ac.quicConn = nil
 	ac.quicConnMu.Unlock()
 	if conn != nil {
-		_ = conn.CloseWithError(0, "agent client closed")
+		go func() { _ = conn.CloseWithError(0, "agent client closed") }()
 	}
 }

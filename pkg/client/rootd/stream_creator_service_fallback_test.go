@@ -3,6 +3,7 @@ package rootd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -333,6 +334,20 @@ func TestOrdinaryServiceFallsBackWhenPhysicalAgentStreamCannotOpen(t *testing.T)
 	generic, workloads := clients.selected()
 	require.Equal(t, []netip.Addr{effective.DestinationAddr()}, generic)
 	require.Empty(t, workloads)
+}
+
+func TestOrdinaryServiceFallsBackWhenAgentPortForwardTimesOut(t *testing.T) {
+	mgr := &serviceNativeOpen{}
+	fixture := newServiceNativeSession(t, &serviceNativeOpen{}, mgr)
+	agent := &fakeTunnelProvider{errs: []error{fmt.Errorf("dial agent: %w", context.DeadlineExceeded)}}
+	fixture.observed.Provider = agent
+	ctx, cancel := context.WithTimeout(fixture.session, 5*time.Second)
+	defer cancel()
+
+	id := serviceFallbackID("10.96.67.127:8080")
+	requireServiceManagerRoundtrip(t, fixture.session, ctx, id, id, mgr)
+	require.NoError(t, ctx.Err())
+	require.Equal(t, 1, agent.calls)
 }
 
 func TestOrdinaryServiceFallsBackWhenRetiringPhysicalAgentDiesBeforeStreamOK(t *testing.T) {

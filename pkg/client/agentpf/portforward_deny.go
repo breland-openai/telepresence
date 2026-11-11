@@ -11,7 +11,7 @@ import (
 	"github.com/telepresenceio/clog"
 )
 
-// errNoDirectAccess is ensureConnectLocked's connectErr when a dial fails for a pod
+// errNoDirectAccess is the cached connection error when a dial fails for a pod
 // already known to refuse pods/portforward: a retry would only repeat the same refusal.
 var errNoDirectAccess = errors.New("direct agent access refused (pods/portforward)")
 

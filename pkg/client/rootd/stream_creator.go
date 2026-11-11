@@ -170,7 +170,8 @@ func (s *session) streamCreator() tunnel.StreamCreator {
 			if err != nil {
 				stopAgentCancel()
 				cancelAgent()
-				if c.Err() == nil && (status.Code(err) == codes.Unavailable || errors.Is(err, io.EOF)) {
+				agentUnavailable := status.Code(err) == codes.Unavailable || errors.Is(err, io.EOF) || errors.Is(err, context.DeadlineExceeded)
+				if c.Err() == nil && agentUnavailable {
 					clog.Debugf(c, "Traffic-agent unavailable for cluster Service id %s; opening traffic-manager tunnel: %v", id, err)
 					cs, err = s.openTunnelStream(c, s.managerTunnelProvider(), id, false, &activityMarked)
 				}

@@ -33,21 +33,23 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
 )
 
+type agentConnectAttempt struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+}
+
 type client struct {
-	// Mutex protects the following fields (the rest is immutable)
-	//   info.intercepted
-	//   cli
-	//   cancelClient
-	//   cancelDialWatch
-	// cli and cancelClient are both safe to use without a mutex once the ready channel is closed.
 	*k8s.Cluster
+	// Protects pod information, the connection and its dial watcher. Network
+	// I/O runs outside this lock so an unreachable pod cannot stall the watch.
 	sync.RWMutex
 	cli             agent.AgentClient
+	conn            *grpc.ClientConn
+	connecting      *agentConnectAttempt
 	session         *manager.SessionInfo
 	info            *manager.AgentPodInfo
 	remove          func()
 	owner           *clients
-	cancelClient    context.CancelFunc
 	cancelDialWatch context.CancelFunc
 	connectErr      error
 	dialWatchID     uint64
@@ -95,7 +97,7 @@ func (ac *client) String() string {
 	if ac == nil {
 		return "<nil>"
 	}
-	ai := ac.info
+	ai := ac.podInfo()
 	return fmt.Sprintf("%s(%s), port %d", ai.PodName, net.IP(ai.PodIp), ai.ApiPort)
 }
 
@@ -105,23 +107,23 @@ func (ac *client) Tunnel(ctx context.Context, opts ...grpc.CallOption) (tunnel.G
 		return nil, err
 	}
 	start := time.Now()
-	clog.Tracef(ctx, "%s(%s) creating Tunnel over gRPC", ac, net.IP(ac.info.PodIp))
+	clog.Tracef(ctx, "%s creating Tunnel over gRPC", ac)
 	tc, err := cli.Tunnel(ctx, opts...)
 	elapsed := time.Since(start)
 	if err != nil {
-		clog.Warnf(ctx, "%s(%s) failed to create Tunnel over gRPC after %s: %v", ac, net.IP(ac.info.PodIp), elapsed.Round(time.Millisecond), err)
+		clog.Warnf(ctx, "%s failed to create Tunnel over gRPC after %s: %v", ac, elapsed.Round(time.Millisecond), err)
 		return nil, err
 	}
 	if elapsed > time.Second {
-		clog.Warnf(ctx, "%s(%s) created Tunnel over gRPC slowly in %s", ac, net.IP(ac.info.PodIp), elapsed.Round(time.Millisecond))
+		clog.Warnf(ctx, "%s created Tunnel over gRPC slowly in %s", ac, elapsed.Round(time.Millisecond))
 	}
 	atomic.AddInt32(&ac.tunnelCount, 1)
-	clog.Tracef(ctx, "%s(%s) have %d active tunnels", ac, net.IP(ac.info.PodIp), atomic.LoadInt32(&ac.tunnelCount))
+	clog.Tracef(ctx, "%s has %d active tunnels", ac, atomic.LoadInt32(&ac.tunnelCount))
 	go func() {
 		<-ctx.Done()
 		tc := atomic.LoadInt32(&ac.tunnelCount)
 		if tc > 0 && atomic.CompareAndSwapInt32(&ac.tunnelCount, tc, tc-1) {
-			clog.Tracef(ctx, "%s(%s) have %d active tunnels", ac, net.IP(ac.info.PodIp), tc-1)
+			clog.Tracef(ctx, "%s has %d active tunnels", ac, tc-1)
 		}
 	}()
 	atomic.StoreInt64(&ac.lastActive, time.Now().UnixNano())
@@ -130,67 +132,75 @@ func (ac *client) Tunnel(ctx context.Context, opts ...grpc.CallOption) (tunnel.G
 
 func (ac *client) ensureConnect(ctx context.Context) (agent.AgentClient, error) {
 	ac.Lock()
-	defer ac.Unlock()
-	return ac.ensureConnectLocked(ctx)
-}
-
-func (ac *client) ensureConnectLocked(ctx context.Context) (agent.AgentClient, error) {
-	if ac.connectErr != nil {
-		return nil, ac.connectErr
+	for ac.connecting != nil {
+		done := ac.connecting.done
+		ac.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-done:
+		}
+		ac.Lock()
 	}
-	if ac.info.Intercepted {
+	if err := ac.connectErr; err != nil {
+		ac.Unlock()
+		return nil, err
+	}
+	ai := ac.info
+	if ai.Intercepted {
 		ac.startDialWatcherLocked()
 	}
-
-	if ac.cli == nil {
-		dialCtx, dialCancel := ac.dialTimeoutContext(ctx)
-		defer dialCancel()
-
-		ai := ac.info
-		ns := ai.Namespace
-		if ai.NodeAgent {
-			ns = k8s.GetManagerNamespace(ctx)
-		}
-		conn, cli, err := ac.dialAgent(dialCtx, ns, ai)
-		if err != nil {
-			if ac.owner.isPortForwardDenied(ac.podKey()) {
-				// A retry can't succeed: this pod has already refused
-				// pods/portforward, so this dial failure is that refusal.
-				err = errNoDirectAccess
-			}
-			if ac.info.Intercepted && !errors.Is(err, errNoDirectAccess) {
-				// The dial watcher retries with backoff; keep the client.
-				return nil, err
-			}
-			ac.connectErr = err
-
-			// There's a risk for deadlock here, because of the Range iteration of the map that performs cancel. This cancel will block
-			// because we're holding the lock now, and since the Range iteration holds a lock for the entry that we're about to delete,
-			// that delete will block. So we let a potential cancel call continue by unlocking before we delete.
-			ac.Unlock()
-			ac.remove()
-			ac.Lock() // Must of course lock again to prevent panic by the pending unlock.
-			return nil, err
-		}
-
-		ac.cli = cli
-		ac.cancelClient = func() {
-			// Need to run this in a separate thread to avoid deadlock.
-			go func() {
-				conn.Close()
-				ac.closeQuicConn()
-				ac.Lock()
-				atomic.StoreInt32(&ac.tunnelCount, 0)
-				ac.cancelClient = nil
-				ac.cli = nil
-				ac.transport.Store("")
-				ac.Unlock()
-			}()
-		}
+	if cli := ac.cli; cli != nil {
+		atomic.StoreInt64(&ac.lastActive, time.Now().UnixNano())
+		ac.Unlock()
+		return cli, nil
 	}
+	dialCtx, cancel := ac.dialTimeoutContext(ctx)
+	attempt := &agentConnectAttempt{done: make(chan struct{}), cancel: cancel}
+	ac.connecting = attempt
+	ac.Unlock()
 
-	atomic.StoreInt64(&ac.lastActive, time.Now().UnixNano())
-	return ac.cli, nil
+	key := ac.podKey(ai)
+	conn, cli, err := ac.dialAgent(dialCtx, key, ai)
+	ac.Lock()
+	if ac.connectErr != nil {
+		err = ac.connectErr // the pod was removed during the dial
+	} else if err == nil {
+		err = dialCtx.Err()
+	}
+	cancel()
+	remove := false
+	switch {
+	case err == nil:
+		ac.conn, ac.cli = conn, cli
+		atomic.StoreInt64(&ac.lastActive, time.Now().UnixNano())
+	case ac.connectErr == nil && ac.owner.isPortForwardDenied(key):
+		err = errNoDirectAccess
+		remove = true
+	case ac.connectErr == nil && !ac.info.Intercepted:
+		// Intercepted pods already have a watcher that retries transient errors.
+		remove = true
+	}
+	if remove {
+		ac.connectErr = err
+	}
+	if err != nil {
+		ac.transport.Store("")
+		ac.closeQuicConn()
+	}
+	ac.connecting = nil
+	close(attempt.done)
+	ac.Unlock()
+	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if remove {
+			ac.remove()
+		}
+		return nil, err
+	}
+	return cli, nil
 }
 
 // dialTimeoutContext bounds one agent dial by the trafficAgentConnect timeout, or by
@@ -207,11 +217,11 @@ func (ac *client) dialTimeoutContext(ctx context.Context) (context.Context, cont
 // dialer handed to grpc tries QUIC first for every connection attempt -- including the ones
 // grpc's own reconnect machinery makes transparently after a transport failure -- and falls
 // back to the Kubernetes port-forward otherwise.
-func (ac *client) dialAgent(dialCtx context.Context, ns string, ai *manager.AgentPodInfo) (*grpc.ClientConn, agent.AgentClient, error) {
-	pap := portforward.PodAddress{Name: ai.PodName, Namespace: ns, PodID: types.UID(ai.PodId)}
+func (ac *client) dialAgent(dialCtx context.Context, key podKey, ai *manager.AgentPodInfo) (*grpc.ClientConn, agent.AgentClient, error) {
+	pap := portforward.PodAddress{Name: key.name, Namespace: key.namespace, PodID: types.UID(key.uid)}
 	grpcAddr := pap.AddrFor(uint16(ai.ApiPort))
 
-	pfDialer := wrapPortForwardDialer(ac.owner, ac.podKey(), ac.owner.pfDialerFactory(ac.Cluster))
+	pfDialer := wrapPortForwardDialer(ac.owner, key, ac.owner.pfDialerFactory(ac.Cluster))
 	dialer := agentDialer(ai.QuicSni, &ac.quicDead, &ac.transport,
 		ac.owner.quicEndpointFor, ac.dialAgentQUIC, pfDialer,
 		func(err error) { clog.Infof(ac, "%s: QUIC dial failed, falling back to port-forward: %v", ac, err) })
@@ -265,19 +275,11 @@ func (ac *client) podInfo() *manager.AgentPodInfo {
 	return info
 }
 
-func (ac *client) intercepted() bool {
-	ac.RLock()
-	ret := ac.info.Intercepted
-	ac.RUnlock()
-	return ret
-}
-
 // podKey returns the identity used to key the port-forward denial cache for this agent's
 // pod. A node-hosted agent's pod runs in the manager's namespace rather than ac.info's own
 // Namespace (the target workload's namespace), so that case is resolved the same way
 // dialAgent resolves the namespace it actually dials.
-func (ac *client) podKey() podKey {
-	ai := ac.info
+func (ac *client) podKey(ai *manager.AgentPodInfo) podKey {
 	ns := ai.Namespace
 	if ai.NodeAgent {
 		ns = k8s.GetManagerNamespace(ac)
@@ -285,89 +287,55 @@ func (ac *client) podKey() podKey {
 	return podKey{namespace: ns, name: ai.PodName, uid: ai.PodId}
 }
 
-func (ac *client) cancel() bool {
-	ac.RLock()
-	cc := ac.cancelClient
-	cdw := ac.cancelDialWatch
-	ac.RUnlock()
-	didCancel := false
-	if cdw != nil {
-		didCancel = true
-		cdw()
+func (ac *client) cancel(reason error) bool {
+	ac.Lock()
+	defer ac.Unlock()
+	if reason != nil {
+		ac.connectErr = reason
 	}
-	if cc != nil {
-		didCancel = true
-		cc()
+	active := ac.cancelDialWatch != nil || ac.connecting != nil || ac.conn != nil
+	if ac.cancelDialWatch != nil {
+		ac.cancelDialWatch()
+		ac.cancelDialWatch = nil
 	}
-	return didCancel
+	if ac.connecting != nil {
+		ac.connecting.cancel()
+	}
+	ac.closeClientLocked()
+	return active
 }
 
 func (ac *client) refresh(ai *manager.AgentPodInfo) {
-	var cdw context.CancelFunc
-	defer func() {
-		if cdw != nil {
-			cdw()
-		}
-	}()
-
 	ac.Lock()
 	defer ac.Unlock()
-
-	oldStatus := ac.info.Intercepted
 	ac.info = ai
-	// Give a previously failed QUIC path a fresh chance on every watch update for this
-	// pod; a pod restart in particular gets a new attempt this way.
 	ac.quicDead.Store(false)
-	if ai.Intercepted == oldStatus {
-		if ai.Intercepted && ac.cancelDialWatch == nil {
-			clog.Debugf(ac, "Agent %s(%s) is intercepted but has no dial watcher; ensuring connection", ai.PodName, net.IP(ai.PodIp))
-			if _, err := ac.ensureConnectLocked(ac); err != nil {
-				clog.Errorf(ac, "failed to ensure client watcher for %s(%s): %v", ai.PodName, net.IP(ai.PodIp), err)
-			}
-		}
-		return
-	}
 	if ai.Intercepted {
-		clog.Debugf(ac, "Agent %s(%s) changed to intercepted", ai.PodName, net.IP(ai.PodIp))
-		if _, err := ac.ensureConnectLocked(ac); err != nil {
-			clog.Errorf(ac, "failed to start client watcher for %s(%s): %v", ai.PodName, net.IP(ai.PodIp), err)
-		}
-	} else {
-		// This agent is no longer intercepting. Stop the dial watcher
-		clog.Debugf(ac, "Agent %s(%s) changed to not intercepted", ai.PodName, net.IP(ai.PodIp))
-		cdw = ac.cancelDialWatch
+		ac.startDialWatcherLocked()
+	} else if ac.cancelDialWatch != nil {
+		ac.cancelDialWatch()
+		ac.cancelDialWatch = nil
 	}
 }
 
 func (ac *client) startDialWatcherLocked() {
-	if ac.cancelDialWatch != nil {
-		// Already started
+	if ac.cancelDialWatch != nil || ac.connectErr != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(ac)
 	ac.dialWatchID++
 	watchID := ac.dialWatchID
-	ac.cancelDialWatch = func() {
-		ac.Lock()
-		if ac.dialWatchID == watchID {
-			ac.cancelDialWatch = nil
-		}
-		ac.Unlock()
-		cancel()
-	}
-
+	ac.cancelDialWatch = cancel
 	go ac.runDialWatcher(ctx, watchID)
 }
 
-func (ac *client) resetAgentClient() {
-	ac.Lock()
-	cancelClient := ac.cancelClient
-	ac.cancelClient = nil
-	ac.cli = nil
-	atomic.StoreInt32(&ac.tunnelCount, 0)
-	ac.Unlock()
-	if cancelClient != nil {
-		cancelClient()
+func (ac *client) closeClientLocked() {
+	if conn := ac.conn; conn != nil {
+		ac.conn, ac.cli = nil, nil
+		ac.transport.Store("")
+		atomic.StoreInt32(&ac.tunnelCount, 0)
+		go conn.Close()
+		ac.closeQuicConn()
 	}
 }
 
@@ -410,13 +378,17 @@ func (ac *client) runDialWatcher(ctx context.Context, watchID uint64) {
 			}
 			err = watchErr
 		}
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || errors.Is(err, errNoDirectAccess) {
 			return
 		}
 
 		if err != nil {
 			clog.Warnf(ctx, "dial watcher for %s ended; reconnecting: %v", ac, err)
-			ac.resetAgentClient()
+			ac.Lock()
+			if ac.dialWatchID == watchID && ac.cli == cli {
+				ac.closeClientLocked()
+			}
+			ac.Unlock()
 		} else {
 			clog.Warnf(ctx, "dial watcher for %s ended unexpectedly; reconnecting", ac)
 		}
@@ -674,15 +646,18 @@ func (s *clients) GetClient(ip netip.Addr) (pvd tunnel.Provider) {
 	ip = ip.Unmap()
 	var primary, secondary, ternary tunnel.Provider
 	s.clients.Range(func(_ string, c *client) bool {
-		if !c.connected() && s.isPortForwardDenied(c.podKey()) {
+		c.RLock()
+		ai, connected := c.info, c.cli != nil
+		c.RUnlock()
+		if !connected && s.isPortForwardDenied(c.podKey(ai)) {
 			return true
 		}
-		podIP, ok := agentPodIP(c.podInfo())
+		podIP, ok := agentPodIP(ai)
 		switch {
 		case ok && ip == podIP:
 			primary = c
-		case !c.connected():
-		case c.intercepted():
+		case !connected:
+		case ai.Intercepted:
 			secondary = c
 		default:
 			ternary = c
@@ -971,7 +946,7 @@ func (s *clients) RunDeltaSink(rmc manager.ManagerClient) error {
 func (s *clients) teardown() {
 	activeCount := 0
 	s.clients.Range(func(_ string, ac *client) bool {
-		if ac.cancel() {
+		if ac.cancel(s.Err()) {
 			activeCount++
 		}
 		return true
@@ -980,21 +955,12 @@ func (s *clients) teardown() {
 	s.disabled.Store(true)
 }
 
-func (ac *client) notify(waiter chan struct{}) {
-	// a client must be connected to be able to notify
-	if _, err := ac.ensureConnect(ac); err != nil {
-		ai := ac.podInfo()
-		clog.Errorf(ac, "notifyWaiters %s (%s), ensureConnect failed: %v", ai.WorkloadName, net.IP(ai.PodIp), err)
-	}
-	close(waiter)
-}
-
 func (s *clients) notifyWaiters() {
 	s.clients.Range(func(name string, ac *client) bool {
 		ai := ac.podInfo()
 		if podIP, ok := agentPodIP(ai); ok {
 			if waiter, ok := s.ipWaiters.LoadAndDelete(ipWaitKey{namespace: ai.Namespace, ip: podIP}); ok {
-				ac.notify(waiter)
+				close(waiter)
 			}
 		}
 		if ai.Namespace == s.Namespace && !ai.NodeAgent {
@@ -1224,15 +1190,11 @@ func (s *clients) updateClients(ais []*manager.AgentPodInfo) error {
 	// flushed - a recreated workload may have a recreated Service with a new ClusterIP.
 	changed := false
 	deleteClient := func(k string) {
-		s.clients.Compute(k, func(oldValue *client, loaded bool) (*client, xsync.ComputeOp) {
-			if loaded {
-				clog.Debugf(s, "Deleting agent %s", k)
-				oldValue.cancel()
-				changed = true
-				return nil, xsync.DeleteOp
-			}
-			return nil, xsync.CancelOp
-		})
+		if ac, ok := s.clients.LoadAndDelete(k); ok {
+			clog.Debugf(s, "Deleting agent %s", k)
+			ac.cancel(status.Error(codes.Unavailable, "agent pod is no longer available"))
+			changed = true
+		}
 	}
 
 	// Cancel clients that no longer exist.
@@ -1243,29 +1205,12 @@ func (s *clients) updateClients(ais []*manager.AgentPodInfo) error {
 		return true
 	})
 
-	// Refresh current clients
-	for k, ai := range aim {
-		if ac, ok := s.clients.Load(k); ok {
-			ac.refresh(ai)
-		}
-	}
-
-	addClient := func(k string, ai *manager.AgentPodInfo) {
+	for _, ai := range aim {
 		ac, loaded := s.loadAgentClient(ai)
 		if !loaded {
 			changed = true
 		}
-		if !loaded && ai.Intercepted {
-			clog.Debugf(s, "Newly discovered intercepted agent pod %s (%s); eagerly starting dial watcher", k, net.IP(ai.PodIp))
-			if _, err := ac.ensureConnect(s); err != nil {
-				clog.Errorf(s, "failed to eagerly start client watcher for %s (%s): %v", k, net.IP(ai.PodIp), err)
-			}
-		}
-	}
-
-	// Add clients for newly arrived agents.
-	for k, ai := range aim {
-		addClient(k, ai)
+		ac.refresh(ai)
 	}
 
 	// Terminate all dormant agents except the last one.
@@ -1276,7 +1221,7 @@ func (s *clients) updateClients(ais []*manager.AgentPodInfo) error {
 			dormantCount++
 			if dormantCount > 1 {
 				clog.Debugf(s, "Deleting dormant agent %s", k)
-				ac.cancel()
+				ac.cancel(nil)
 			}
 		}
 		return true

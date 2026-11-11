@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -867,4 +868,71 @@ func TestWaitForIP_PlainDialError_RetriesUntilDeadline(t *testing.T) {
 		"a plain dial error must not be treated as a permission refusal")
 	assert.Greater(t, calls.Load(), int32(1), "a plain error must keep retrying (and redialing), not stop after one attempt")
 	assert.NotEqual(t, codes.Unavailable, status.Code(err))
+}
+
+// Snapshot consumers and routing must make progress while a vanished pod's
+// port-forward is still trying to connect.
+func TestAgentSnapshotWhileInterceptedPodIsUnreachable(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cs := newTestClients(ctx, "alpha")
+	dialStarted := make(chan struct{})
+	dialStopped := make(chan struct{})
+	var started, stopped sync.Once
+	var calls atomic.Int32
+	cs.pfDialerFactory = fakePFDialerFactory(func(ctx context.Context, _ string) (net.Conn, error) {
+		started.Do(func() { close(dialStarted) })
+		<-ctx.Done()
+		stopped.Do(func() { close(dialStopped) })
+		return nil, ctx.Err()
+	}, &calls)
+	old := podInfo("departing", "alpha", "10.0.0.10")
+	old.Intercepted = true
+	old.PodId = "11111111-1111-1111-1111-111111111111"
+	old.ApiPort = 48101
+	reachable := podInfo("replacement", "alpha", "10.0.0.11")
+	healthy := &workloadReadyTestClient{}
+	updated := make(chan struct{})
+	go func() {
+		_ = cs.ApplyPodsDelta(true, map[string]*manager.AgentPodInfo{"old": old}, nil)
+		seedWorkloadTestClient(cs, reachable, healthy)
+		_ = cs.ApplyPodsDelta(false, map[string]*manager.AgentPodInfo{"new": reachable}, nil)
+		close(updated)
+	}()
+	await := func(done <-chan struct{}, message string) {
+		t.Helper()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal(message)
+		}
+	}
+	await(dialStarted, "the intercepted pod must start its reverse-dial watcher")
+	await(updated, "a stalled pod held up the next snapshot")
+	waitCtx, stopWaiting := context.WithCancel(ctx)
+	stopWaiting()
+	_, err := cs.loadOrAddClient(old).ensureConnect(waitCtx)
+	require.ErrorIs(t, err, context.Canceled)
+	select {
+	case <-dialStopped:
+		t.Fatal("canceling a waiter stopped the shared dial")
+	default:
+	}
+
+	routed := make(chan struct{})
+	go func() {
+		defer close(routed)
+		assert.Same(t, healthy, cs.GetRandomAgent(ctx))
+		assert.NotNil(t, cs.GetClient(netip.MustParseAddr("10.0.0.11")))
+		assert.NoError(t, cs.WaitForIP(ctx, time.Second, "alpha", netip.MustParseAddr("10.0.0.11")))
+	}()
+	await(routed, "a stalled pod blocked routing to a healthy agent")
+	removed := make(chan struct{})
+	go func() {
+		_ = cs.ApplyPodsDelta(false, nil, []string{"old"})
+		close(removed)
+	}()
+	await(removed, "retiring the pod waited for its connection timeout")
+	await(dialStopped, "the removed pod's port-forward was not canceled")
+	require.Nil(t, cs.snapshotInfoForIP("alpha", netip.MustParseAddr("10.0.0.10")))
 }
