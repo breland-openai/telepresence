@@ -112,7 +112,7 @@ func TestReviewAdmission_InternalMode(t *testing.T) {
 		{name: "disabled routing observer", mode: ModeDisabled, method: watchInterceptRoutesMethod, wantCode: codes.ResourceExhausted},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := NewAuthenticator(fake.NewClientset(), WithInternalReviewAdmission())
+			a := NewAuthenticator(fake.NewClientset(), WithInternalReviewAdmission(DefaultInternalReviewLimits()))
 			a.reviewer.limiter = rate.NewLimiter(0, 0)
 			i := NewInterceptor(a, tc.mode)
 
@@ -129,7 +129,7 @@ func TestInternalReviewAdmissionWaitsForCapacity(t *testing.T) {
 	k8sapi.InstallFakeTokenReviews(ci, func(string, []string) *authnv1.TokenReviewStatus {
 		return &authnv1.TokenReviewStatus{Authenticated: true, User: authnv1.UserInfo{Username: "test-user"}}
 	})
-	a := NewAuthenticator(ci, WithInternalReviewAdmission())
+	a := NewAuthenticator(ci, WithInternalReviewAdmission(DefaultInternalReviewLimits()))
 	r := a.reviewer
 	r.sem = make(chan struct{}, 1)
 	r.sem <- struct{}{}
@@ -148,7 +148,7 @@ func TestInternalReviewAdmissionWaitsForCapacity(t *testing.T) {
 }
 
 func TestInternalReviewAdmissionReleasesWaiters(t *testing.T) {
-	r := NewAuthenticator(fake.NewClientset(), WithInternalReviewAdmission()).reviewer
+	r := NewAuthenticator(fake.NewClientset(), WithInternalReviewAdmission(DefaultInternalReviewLimits())).reviewer
 	r.sem = make(chan struct{}, 1)
 	r.waiters = make(chan struct{}, 1)
 	r.sem <- struct{}{}
@@ -166,12 +166,12 @@ func TestInternalReviewAdmissionReleasesWaiters(t *testing.T) {
 
 func TestInternalReviewAdmissionBoundsWaitingTime(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		r := NewAuthenticator(fake.NewClientset(), WithInternalReviewAdmission()).reviewer
-		r.sem = make(chan struct{}, 1)
+		limits := InternalReviewLimits{QPS: 15, Burst: 20, MaxConcurrent: 1, MaxWaiting: 2, MaxWait: 250 * time.Millisecond}
+		r := NewAuthenticator(fake.NewClientset(), WithInternalReviewAdmission(limits)).reviewer
 		r.sem <- struct{}{}
 		start := time.Now()
 		require.ErrorIs(t, r.acquireInternalVerification(t.Context()), errTooManyReviews)
-		require.Equal(t, internalReviewMaxWait, time.Since(start))
+		require.Equal(t, limits.MaxWait, time.Since(start))
 		require.Empty(t, r.waiters)
 		<-r.sem
 	})
@@ -180,7 +180,7 @@ func TestInternalReviewAdmissionBoundsWaitingTime(t *testing.T) {
 func TestInternalReviewAdmissionReleasesActiveSlotOnCancel(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ci := fake.NewClientset()
-		r := NewAuthenticator(ci, WithInternalReviewAdmission()).reviewer
+		r := NewAuthenticator(ci, WithInternalReviewAdmission(DefaultInternalReviewLimits())).reviewer
 		r.limiter = rate.NewLimiter(rate.Every(time.Second), 1)
 		require.True(t, r.limiter.Allow())
 		ctx, cancel := context.WithCancel(t.Context())
@@ -205,7 +205,7 @@ func TestInternalReviewAdmissionFinishesBothAudiences(t *testing.T) {
 		k8sapi.InstallFakeTokenReviews(ci, func(_ string, audiences []string) *authnv1.TokenReviewStatus {
 			return &authnv1.TokenReviewStatus{Authenticated: len(audiences) == 0, User: authnv1.UserInfo{Username: "test-user"}}
 		})
-		a := NewAuthenticator(ci, WithInternalReviewAdmission())
+		a := NewAuthenticator(ci, WithInternalReviewAdmission(DefaultInternalReviewLimits()))
 		a.reviewer.sem = make(chan struct{}, 1)
 		const interval = 400 * time.Millisecond
 		a.reviewer.limiter = rate.NewLimiter(rate.Every(interval), 1)

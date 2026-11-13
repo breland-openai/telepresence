@@ -33,9 +33,6 @@ const (
 
 	successCacheTTL = 2 * time.Minute
 	failureCacheTTL = 10 * time.Second
-
-	// Bound the backlog before an internal credential check starts.
-	internalReviewMaxWait = time.Second
 )
 
 // Authenticator validates bearer tokens using cached Kubernetes TokenReviews, or,
@@ -69,29 +66,39 @@ func WithMetrics(m *Metrics) Option {
 	}
 }
 
-// WithReviewAdmission bounds the rate and concurrency of TokenReviews -- the
-// expensive, API-server-bound step -- with the external admission constants.
-// Cached tokens never enter admission; only a review pays it.
+// InternalReviewLimits bounds TokenReviews from uncached internal credentials.
+type InternalReviewLimits struct {
+	QPS           float32       `env:"QPS"`
+	Burst         int           `env:"BURST"`
+	MaxConcurrent int           `env:"MAX_CONCURRENT"`
+	MaxWaiting    int           `env:"MAX_WAITING"`
+	MaxWait       time.Duration `env:"MAX_WAIT"`
+}
+
+// DefaultInternalReviewLimits returns the Traffic Manager startup defaults.
+func DefaultInternalReviewLimits() InternalReviewLimits {
+	return InternalReviewLimits{
+		QPS: 100, Burst: 200, MaxConcurrent: 128, MaxWaiting: 200, MaxWait: time.Second,
+	}
+}
+
+// WithReviewAdmission bounds TokenReviews from the external listener.
 func WithReviewAdmission() Option {
-	return withReviewAdmission(0)
-}
-
-// WithInternalReviewAdmission bounds the queue of uncached internal
-// credentials. Each admitted credential holds a concurrency slot through
-// its audience checks. Each TokenReview consumes a rate token.
-func WithInternalReviewAdmission() Option {
-	return withReviewAdmission(externalAuthBurst)
-}
-
-func withReviewAdmission(maxWaiting int) Option {
 	return func(a *Authenticator) {
 		t := a.reviewer
 		t.limiter = rate.NewLimiter(rate.Limit(externalAuthQPS), externalAuthBurst)
 		t.sem = make(chan struct{}, externalMaxConcurrentAuth)
-		t.waiters = nil
-		if maxWaiting > 0 {
-			t.waiters = make(chan struct{}, maxWaiting)
-		}
+	}
+}
+
+// WithInternalReviewAdmission holds a slot through a credential's audience checks.
+func WithInternalReviewAdmission(limits InternalReviewLimits) Option {
+	return func(a *Authenticator) {
+		t := a.reviewer
+		t.limiter = rate.NewLimiter(rate.Limit(limits.QPS), limits.Burst)
+		t.sem = make(chan struct{}, limits.MaxConcurrent)
+		t.waiters = make(chan struct{}, limits.MaxWaiting)
+		t.maxWait = limits.MaxWait
 	}
 }
 
@@ -190,6 +197,7 @@ type tokenReviewer struct {
 	limiter *rate.Limiter
 	sem     chan struct{}
 	waiters chan struct{} // non-nil for the internal listener
+	maxWait time.Duration
 }
 
 func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
@@ -308,7 +316,7 @@ func (t *tokenReviewer) acquireInternalVerification(ctx context.Context) error {
 	default:
 		return errTooManyReviews
 	}
-	timer := time.NewTimer(internalReviewMaxWait)
+	timer := time.NewTimer(t.maxWait)
 	defer timer.Stop()
 	select {
 	case t.sem <- struct{}{}:

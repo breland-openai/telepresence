@@ -38,11 +38,11 @@ func TestTokenReviewClientHasIndependentRateLimiter(t *testing.T) {
 	cfg := &rest.Config{Host: server.URL, QPS: 50, Burst: 100, RateLimiter: bulkLimiter}
 	bulkClient, err := kubernetes.NewForConfig(cfg)
 	require.NoError(t, err)
-	authClient, err := newTokenReviewClient(cfg)
+	authClient, err := newTokenReviewClient(cfg, 110, 180)
 	require.NoError(t, err)
 	authLimiter := authClient.AuthenticationV1().RESTClient().GetRateLimiter()
 	require.NotSame(t, bulkLimiter, authLimiter)
-	require.Equal(t, float32(tokenReviewQPS), authLimiter.QPS())
+	require.Equal(t, float32(110), authLimiter.QPS())
 	require.Same(t, bulkLimiter, cfg.RateLimiter)
 	require.Equal(t, float32(50), cfg.QPS)
 	require.Equal(t, 100, cfg.Burst)

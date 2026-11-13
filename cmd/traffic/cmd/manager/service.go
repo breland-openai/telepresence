@@ -141,10 +141,11 @@ func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, 
 		authorizer:    auth.NewAuthorizer(k8sapi.GetK8sInterface(ctx)),
 		mintedTokens:  auth.NewMintedTokens(),
 	}
+	env := managerutil.GetEnv(ctx)
 	ret.authenticator = auth.NewAuthenticator(tokenReviewClient,
 		auth.WithMintedTokens(ret.mintedTokens),
 		auth.WithMetrics(auth.NewMetrics("internal")),
-		auth.WithInternalReviewAdmission(),
+		auth.WithInternalReviewAdmission(env.InternalTokenReviewLimits()),
 	)
 
 	// These are context-dependent, so build them once the pool is up
@@ -154,7 +155,6 @@ func NewService(ctx context.Context, g log.Group, configWatcher config.Watcher, 
 		clog.Errorf(ctx, "unable to initialize cluster info: %v", err)
 		return nil, err
 	}
-	env := managerutil.GetEnv(ctx)
 	ns := env.ManagerNamespace
 	ret.authMode = env.AuthenticationMode
 	ret.authGrant = env.AuthorizationRequiredGrant

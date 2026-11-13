@@ -57,10 +57,19 @@ To enable Prometheus metrics for your traffic manager, follow these steps:
    | `telepresence_auth_invalid_tokens`       | Counter  | Authentication attempts rejected as invalid, including cached decisions.        | `listener`                               |
    | `telepresence_auth_api_failures`         | Counter  | `TokenReview` calls that failed for infrastructure reasons.                    | `listener`                               |
 
-   The internal listener runs up to 64 uncached credential checks at once.
-   Up to 100 more can wait for one second to start. An admitted credential
-   keeps its slot through both audience checks. Every TokenReview uses the
-   same 50-per-second budget with a burst of 100.
+   Set the internal listener's TokenReview limits on the Traffic Manager using
+   Helm's `extraEnv`. The manager reads these settings at startup.
+
+   | Environment variable          | Default | Controls |
+   |--------------------------------|---------|----------|
+   | `TOKEN_REVIEW_QPS`             | `100`   | TokenReviews per second, including fallback audience checks. |
+   | `TOKEN_REVIEW_BURST`           | `200`   | TokenReview burst capacity. |
+   | `TOKEN_REVIEW_MAX_CONCURRENT`  | `128`   | Active uncached credential checks, each holding its slot through both audiences. |
+   | `TOKEN_REVIEW_MAX_WAITING`     | `200`   | Credential checks allowed to wait for an active slot. |
+   | `TOKEN_REVIEW_MAX_WAIT`        | `1s`    | Maximum time to wait for an active slot. |
+
+   The internal admission limiter and its dedicated Kubernetes client use the
+   same QPS and burst settings. The values must be positive.
    If admission rejects a check, the token cache
    can reuse that result for ten seconds. Check
    `telepresence_auth_rate_limited{listener="internal"}` alongside

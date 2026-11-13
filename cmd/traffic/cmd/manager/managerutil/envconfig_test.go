@@ -71,6 +71,7 @@ func TestEnvconfig(t *testing.T) {
 		MutatorWebhookPort:           8443,
 		TunnelQuicAgentPort:          7787,
 		AuthenticationMode:           auth.ModePermissive,
+		InternalTokenReview:          auth.DefaultInternalReviewLimits(),
 		AuthorizationRequiredGrant:   auth.GrantAny,
 		LogStreamChunkSize:           resource.MustParse("64Ki"),
 		LogStreamPodConcurrency:      4,
@@ -92,6 +93,20 @@ func TestEnvconfig(t *testing.T) {
 			},
 			Output: func(e *managerutil.Env) {
 				e.AgentRegistry = "ghcr.io/telepresenceio"
+			},
+		},
+		"token reviews": {
+			Input: map[string]string{
+				"TOKEN_REVIEW_QPS":            "75.5",
+				"TOKEN_REVIEW_BURST":          "125",
+				"TOKEN_REVIEW_MAX_CONCURRENT": "80",
+				"TOKEN_REVIEW_MAX_WAITING":    "120",
+				"TOKEN_REVIEW_MAX_WAIT":       "750ms",
+			},
+			Output: func(e *managerutil.Env) {
+				e.InternalTokenReview = auth.InternalReviewLimits{
+					QPS: 75.5, Burst: 125, MaxConcurrent: 80, MaxWaiting: 120, MaxWait: 750 * time.Millisecond,
+				}
 			},
 		},
 		"complex": {
@@ -341,6 +356,26 @@ func TestEnvHostNetwork(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, tt.env.HostNetwork())
+		})
+	}
+}
+
+func TestInvalidInternalTokenReviewLimits(t *testing.T) {
+	for key, value := range map[string]string{
+		"TOKEN_REVIEW_QPS":            "+Inf",
+		"TOKEN_REVIEW_BURST":          "0",
+		"TOKEN_REVIEW_MAX_CONCURRENT": "-1",
+		"TOKEN_REVIEW_MAX_WAITING":    "0",
+		"TOKEN_REVIEW_MAX_WAIT":       "-1s",
+	} {
+		t.Run(key, func(t *testing.T) {
+			_, err := managerutil.LoadEnv(t.Context(), map[string]string{
+				"REGISTRY":    "ghcr.io/telepresenceio",
+				"LOG_LEVEL":   "info",
+				"SERVER_PORT": "8081",
+				key:           value,
+			})
+			require.ErrorContains(t, err, key)
 		})
 	}
 }

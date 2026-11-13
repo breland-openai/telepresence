@@ -5,6 +5,7 @@ import (
 	"encoding/json/v2"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -192,6 +193,8 @@ type Env struct {
 	// caller authentication (disabled, permissive, or enforcing).
 	AuthenticationMode auth.Mode `default:"permissive"`
 
+	InternalTokenReview auth.InternalReviewLimits `envPrefix:"TOKEN_REVIEW_"`
+
 	// AuthorizationRequiredGrant is the grant a client must hold to be
 	// authorized to connect and to attach to a workload: pods/portforward
 	// ("portforward"), the telepresence.io group's own attributes
@@ -291,7 +294,7 @@ func (e *Env) QualifiedAgentImage() string {
 type envKey struct{}
 
 func LoadEnv(ctx context.Context, envMap map[string]string) (context.Context, error) {
-	envStruct := new(Env)
+	envStruct := &Env{InternalTokenReview: auth.DefaultInternalReviewLimits()}
 	err := env.ParseWithOptions(envStruct, env.Options{
 		Environment:           envMap,
 		DefaultValueTagName:   "default",
@@ -345,7 +348,30 @@ func LoadEnv(ctx context.Context, envMap map[string]string) (context.Context, er
 	if envStruct.AgentPreStopDrainTimeout < 0 {
 		return ctx, fmt.Errorf("AGENT_PRE_STOP_DRAIN_TIMEOUT must not be negative: %s", envStruct.AgentPreStopDrainTimeout)
 	}
+	limits := envStruct.InternalTokenReview
+	for _, field := range []struct {
+		name  string
+		valid bool
+	}{
+		{"TOKEN_REVIEW_QPS", limits.QPS > 0 && !math.IsInf(float64(limits.QPS), 0)},
+		{"TOKEN_REVIEW_BURST", limits.Burst > 0},
+		{"TOKEN_REVIEW_MAX_CONCURRENT", limits.MaxConcurrent > 0},
+		{"TOKEN_REVIEW_MAX_WAITING", limits.MaxWaiting > 0},
+		{"TOKEN_REVIEW_MAX_WAIT", limits.MaxWait > 0},
+	} {
+		if !field.valid {
+			return ctx, fmt.Errorf("%s must be finite and greater than zero", field.name)
+		}
+	}
 	return WithEnv(ctx, envStruct), nil
+}
+
+// InternalTokenReviewLimits also supplies defaults for a programmatically constructed Env.
+func (e *Env) InternalTokenReviewLimits() auth.InternalReviewLimits {
+	if e.InternalTokenReview == (auth.InternalReviewLimits{}) {
+		return auth.DefaultInternalReviewLimits()
+	}
+	return e.InternalTokenReview
 }
 
 func WithEnv(ctx context.Context, env *Env) context.Context {

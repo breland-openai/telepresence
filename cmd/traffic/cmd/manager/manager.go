@@ -94,10 +94,13 @@ func MainWithEnv(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("unable to create the Kubernetes Interface from InClusterConfig: %w", err)
 	}
-	tokenReviewClient, err := newTokenReviewClient(cfg)
+	limits := env.InternalTokenReviewLimits()
+	tokenReviewClient, err := newTokenReviewClient(cfg, limits.QPS, limits.Burst)
 	if err != nil {
 		return fmt.Errorf("unable to create the Kubernetes TokenReview client: %w", err)
 	}
+	clog.Infof(ctx, "Internal TokenReview limits: QPS=%g burst=%d maxConcurrent=%d maxWaiting=%d maxWait=%s",
+		limits.QPS, limits.Burst, limits.MaxConcurrent, limits.MaxWaiting, limits.MaxWait)
 	ari, err := argorollouts.NewForConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("unable to create the Argo Rollouts Interface from InClusterConfig: %w", err)
