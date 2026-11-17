@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -75,23 +76,37 @@ func (e Syntax) Type() string {
 
 //goland:noinspection GoMixedReceiverTypes
 func (e Syntax) writeFile(fileName string, env map[string]string) error {
-	var file *os.File
 	if fileName == "-" {
-		file = os.Stdout
-	} else {
-		var err error
-		file, err = os.Create(fileName)
-		if err != nil {
-			return errcat.NoDaemonLogs.Errorf(err, "failed to create environment file %q", fileName)
-		}
+		return e.WriteToFileAndClose(os.Stdout, env)
 	}
-	return e.WriteToFileAndClose(file, env)
+
+	dir, _ := filepath.Split(fileName)
+	if dir == "" {
+		dir = "."
+	}
+	file, err := os.CreateTemp(dir, ".telepresence-env-*")
+	if err != nil {
+		return errcat.NoDaemonLogs.Errorf(err, "failed to create environment file %q", fileName)
+	}
+	defer os.Remove(file.Name())
+
+	if err = e.WriteToFileAndClose(file, env); err != nil {
+		return err
+	}
+	if err = os.Rename(file.Name(), fileName); err != nil {
+		return errcat.NoDaemonLogs.Errorf(err, "failed to publish environment file %q", fileName)
+	}
+	return nil
 }
 
 //goland:noinspection GoMixedReceiverTypes
 func (e Syntax) WriteToFileAndClose(file *os.File, env map[string]string) (err error) {
 	if file != os.Stdout {
-		defer file.Close()
+		defer func() {
+			if closeErr := file.Close(); err == nil {
+				err = closeErr
+			}
+		}()
 	}
 	if e == SyntaxJSON {
 		data, err := json.Marshal(env, jsontext.WithIndent("  "))
