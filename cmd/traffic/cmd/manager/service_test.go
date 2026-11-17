@@ -584,6 +584,24 @@ func TestArriveAsAgentIsIdempotent(t *testing.T) {
 	req.Equal(1, mgr.State().CountAgents())
 }
 
+func TestArriveAsAgentRejectsDoneContext(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	ctx := testutil.NewContext(t, true)
+	_, mgr, sctx := getTestClientConnAndService(ctx, t, nil)
+	agent := proto.Clone(testdata.GetTestAgents(t)["hello"]).(*rpc.AgentInfo)
+
+	canceled, cancel := context.WithCancel(sctx)
+	cancel()
+	_, err := mgr.ArriveAsAgent(canceled, agent)
+	require.Equal(t, codes.Canceled, status.Code(err))
+
+	expired, cancel := context.WithDeadline(sctx, time.Now().Add(-time.Second))
+	defer cancel()
+	_, err = mgr.ArriveAsAgent(expired, agent)
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	require.Zero(t, mgr.State().CountAgents())
+}
+
 // TestAgentSessionBinding covers the pod-identity binding established at agent
 // arrival and enforced by ensureAgentSession on later agent-session RPCs: matching
 // claims bind the session and lock out every other identity (including no identity
