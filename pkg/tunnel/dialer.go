@@ -76,7 +76,6 @@ type halfCloser interface {
 // streamReader is implemented by the dialer and udpListener so that they can share the
 // readLoop function.
 type streamReader interface {
-	Idle() <-chan time.Time
 	ResetIdle() bool
 	Stop(context.Context)
 	getStream() Stream
@@ -89,6 +88,9 @@ type dialer struct {
 	TimedHandler
 	stream    Stream
 	cancel    context.CancelFunc
+	stopped   context.Context
+	stop      context.CancelFunc
+	stopOnce  sync.Once
 	conn      net.Conn
 	connected int32
 	done      chan struct{}
@@ -135,10 +137,13 @@ func NewConnEndpointTTL(
 	if conn != nil {
 		state = connecting
 	}
+	stopped, stop := context.WithCancel(context.Background())
 	return &dialer{
 		TimedHandler: NewTimedHandler(stream.ID(), ttl, nil),
 		stream:       stream,
-		cancel:       cancel,
+		cancel:       sync.OnceFunc(cancel),
+		stopped:      stopped,
+		stop:         stop,
 		conn:         conn,
 		connected:    state,
 		done:         make(chan struct{}),
@@ -148,13 +153,23 @@ func NewConnEndpointTTL(
 	}
 }
 
-func (h *dialer) Start(ctx context.Context) {
-	sr := GetSyntheticIPResolver(ctx)
+func (h *dialer) Start(parent context.Context) {
+	sr := GetSyntheticIPResolver(parent)
 	go func() {
 		defer close(h.done)
+		defer h.cancel()
+		defer h.stop()
+
+		ctx, cancel := context.WithCancel(parent)
+		defer cancel()
+		detachStop := context.AfterFunc(h.stopped, cancel)
+		defer detachStop()
+		detachParent := context.AfterFunc(parent, func() { h.Stop(parent) })
+		defer detachParent()
 
 		id := h.stream.ID()
 		tag := h.stream.Tag()
+		dialed := h.conn == nil
 
 		switch h.connected {
 		case notConnected:
@@ -208,12 +223,6 @@ func (h *dialer) Start(ctx context.Context) {
 				h.connected = notConnected
 				return
 			}
-			if err = h.stream.Send(ctx, NewMessage(DialOK, nil)); err != nil {
-				_ = conn.Close()
-				clog.Errorf(ctx, "!> %s %s, failed to send DialOK: %v", tag, id, err)
-				return
-			}
-			clog.Debugf(ctx, "<- %s %s, dial answered", tag, id)
 			h.conn = conn
 
 		case connecting:
@@ -222,8 +231,33 @@ func (h *dialer) Start(ctx context.Context) {
 			return
 		}
 
-		// Set up the idle timer to close and release this endpoint when it's been idle for a while.
+		// Close the socket when the tunnel finishes, including when cancellation
+		// needs to interrupt a blocked socket read or write before the loops exit.
+		closeConn := sync.OnceFunc(func() { _ = h.conn.Close() })
+		detachClose := context.AfterFunc(ctx, closeConn)
+		defer detachClose()
+		defer closeConn()
+
 		h.TimedHandler.Start(ctx)
+		defer h.idleTimer.Stop()
+		go func() {
+			// Keep the timer active after either direction half-closes and
+			// while both directions are blocked on I/O.
+			select {
+			case <-ctx.Done():
+			case <-h.Idle():
+				h.Stop(ctx)
+			}
+		}()
+
+		if dialed {
+			if err := h.stream.Send(ctx, NewMessage(DialOK, nil)); err != nil {
+				clog.Errorf(ctx, "!> %s %s, failed to send DialOK: %v", tag, id, err)
+				h.Stop(ctx)
+				return
+			}
+			clog.Debugf(ctx, "<- %s %s, dial answered", tag, id)
+		}
 		h.connected = connected
 
 		wg := sync.WaitGroup{}
@@ -231,7 +265,6 @@ func (h *dialer) Start(ctx context.Context) {
 		go h.connToStreamLoop(ctx, &wg)
 		go h.streamToConnLoop(ctx, &wg)
 		wg.Wait()
-		h.Stop(ctx)
 	}()
 }
 
@@ -239,11 +272,15 @@ func (h *dialer) Done() <-chan struct{} {
 	return h.done
 }
 
-// Stop will close the underlying TCP/UDP connection.
-func (h *dialer) Stop(ctx context.Context) {
-	h.startDisconnect(ctx, "explicit close", true)
-	h.startDisconnect(ctx, "explicit close", false)
-	h.cancel()
+// Stop cancels the tunnel and releases its socket.
+func (h *dialer) Stop(_ context.Context) {
+	h.stopOnce.Do(func() {
+		h.stop()
+		if s, ok := h.stream.(interface{ abort() }); ok {
+			s.abort()
+		}
+		h.cancel()
+	})
 }
 
 func (h *dialer) startDisconnect(ctx context.Context, reason string, isReader bool) {
@@ -307,7 +344,7 @@ func (h *dialer) connToStreamLoop(ctx context.Context, wg *sync.WaitGroup) {
 	}()
 
 	wg.Add(1)
-	WriteLoop(ctx, h.stream, outgoing, wg, h.egressBytesProbe)
+	writeLoop(ctx, h.stream, outgoing, wg, h.egressBytesProbe, func() { h.Stop(ctx) })
 
 	buf := make([]byte, 0x80000)
 	clog.Tracef(ctx, "-> %s %s conn-to-stream loop started", tag, id)
@@ -366,7 +403,7 @@ func (h *dialer) streamToConnLoop(ctx context.Context, wg *sync.WaitGroup) {
 	defer func() {
 		wg.Done()
 	}()
-	readLoop(ctx, h.stream.Tag(), h, h.ingressBytesProbe)
+	readLoop(ctx, h.stream.Tag(), h, nil, h.ingressBytesProbe)
 }
 
 func handleControl(ctx context.Context, h streamReader, cm Message) {
@@ -388,7 +425,7 @@ func handleControl(ctx context.Context, h streamReader, cm Message) {
 	}
 }
 
-func readLoop(ctx context.Context, tag Tag, h streamReader, trafficProbe *CounterProbe) {
+func readLoop(ctx context.Context, tag Tag, h streamReader, idle <-chan time.Time, trafficProbe *CounterProbe) {
 	var endReason string
 	endLevel := clog.LevelTrace
 	id := h.getStream().ID()
@@ -404,7 +441,7 @@ func readLoop(ctx context.Context, tag Tag, h streamReader, trafficProbe *Counte
 		case <-ctx.Done():
 			endReason = ctx.Err().Error()
 			return
-		case <-h.Idle():
+		case <-idle:
 			endReason = "it was idle for too long"
 			return
 		case err, ok := <-errCh:

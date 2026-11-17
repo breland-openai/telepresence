@@ -1155,10 +1155,25 @@ func (s *State) Tunnel(ctx context.Context, stream tunnel.Stream) error {
 }
 
 func (s *State) clientTunnel(ctx context.Context, client *ClientSession, stream tunnel.Stream) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	atomic.AddInt32(&s.tunnelCounter, 1)
+	defer atomic.AddInt32(&s.tunnelCounter, -1)
+
 	scm := client.ConsumptionMetrics()
-	endPoint := tunnel.NewDialer(stream, func() {}, scm.FromClientBytes, scm.ToClientBytes)
+	streamDone := make(chan struct{})
+	endPoint := tunnel.NewDialer(stream, func() { close(streamDone) }, scm.FromClientBytes, scm.ToClientBytes)
 	endPoint.Start(ctx)
-	<-endPoint.Done()
+
+	// Returning after the dialer stops also releases blocked gRPC stream I/O.
+	select {
+	case <-streamDone:
+	case <-client.done():
+		cancel()
+		<-streamDone
+	case <-ctx.Done():
+	}
 	return nil
 }
 

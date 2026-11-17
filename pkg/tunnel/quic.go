@@ -126,6 +126,11 @@ func (s *quicStream) CloseRecv() {
 	s.stream.CancelRead(0)
 }
 
+func (s *quicStream) abort() {
+	s.stream.CancelRead(0)
+	s.stream.CancelWrite(0)
+}
+
 // quicClientStream is the client side of a QUIC tunnel stream.
 type quicClientStream struct {
 	quicStream
