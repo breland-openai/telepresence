@@ -180,6 +180,16 @@ func WriteLoop(
 	wg *sync.WaitGroup,
 	p *CounterProbe,
 ) {
+	writeLoop(ctx, s, msgCh, wg, p, nil)
+}
+
+func writeLoop(
+	ctx context.Context,
+	s Stream, msgCh <-chan Message,
+	wg *sync.WaitGroup,
+	p *CounterProbe,
+	onSendError func(),
+) {
 	clog.Tracef(ctx, "-> %s %s, WriteLoop starting", s.Tag(), s.ID())
 	go func() {
 		var endReason string
@@ -213,6 +223,9 @@ func WriteLoop(
 				default:
 					endReason = err.Error()
 					clog.Errorf(ctx, "!! %s %s, Send failed: %v", s.Tag(), s.ID(), err)
+				}
+				if onSendError != nil {
+					onSendError()
 				}
 			}
 			break
@@ -390,6 +403,12 @@ func (s *stream) Send(ctx context.Context, m Message) error {
 	}
 	clog.Tracef(ctx, "-> %s %s, %s", s.tag, s.id, m)
 	return nil
+}
+
+func (s *stream) abort() {
+	if transport, ok := s.grpcStream.(interface{ abort() }); ok {
+		transport.abort()
+	}
 }
 
 func (s *stream) CloseSend(ctx context.Context) error {

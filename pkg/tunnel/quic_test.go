@@ -125,7 +125,10 @@ func TestQuicE2E(t *testing.T) {
 		InsecureSkipVerify: true, // no CA to verify against in this test
 		NextProtos:         []string{QuicALPN},
 	}
-	conn, err := quic.DialAddr(ctx, ln.Addr().String(), clientTLSConf, nil)
+	conn, err := quic.DialAddr(ctx, ln.Addr().String(), clientTLSConf, &quic.Config{
+		InitialStreamReceiveWindow: 4 << 10,
+		MaxStreamReceiveWindow:     4 << 10,
+	})
 	require.NoError(t, err)
 	defer func() {
 		_ = conn.CloseWithError(0, "")
@@ -166,6 +169,19 @@ func TestQuicE2E(t *testing.T) {
 	require.NoError(t, client.CloseSend(ctx))
 	_, err = server.Receive(ctx)
 	assert.ErrorIs(t, err, io.EOF)
+
+	t.Run("idle timeout interrupts a backpressured QUIC send", func(t *testing.T) {
+		socket, peer := openCleanupTCPPair(t)
+		endpoint := NewConnEndpointTTL(server, socket, func() {}, 250*time.Millisecond, nil, nil)
+		endpoint.Start(ctx)
+
+		// The client has half-closed its request and stopped consuming the
+		// response. Send more than the stream's receive window.
+		_, err := peer.Write(make([]byte, 64<<10))
+		require.NoError(t, err)
+		requireCleanupDone(t, endpoint, socket)
+		require.NoError(t, conn.Context().Err())
+	})
 }
 
 // TestQuicE2E_Datagrams exercises a UDP flow whose transport negotiated RFC 9221
