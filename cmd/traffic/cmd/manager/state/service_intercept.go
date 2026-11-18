@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"sort"
@@ -140,6 +141,16 @@ func (s *State) initializeParticipants(intercept *Intercept) {
 	if !serviceScopedIntercept(intercept.Spec) {
 		return
 	}
+	ctx, cancel := context.WithTimeout(s.backgroundCtx, agentWorkloadLookupTimeout)
+	defer cancel()
+	selected, known := selectedServiceParticipants(ctx, intercept)
+	s.initializeParticipantsWithSelection(intercept, selected, known)
+}
+
+func (s *State) initializeParticipantsWithSelection(intercept *Intercept, selected map[string]*interceptParticipant, selectionKnown bool) {
+	if !serviceScopedIntercept(intercept.Spec) {
+		return
+	}
 	intercept.participants = make(map[string]*interceptParticipant)
 	// Restored intercepts already carry the workload identities that took
 	// part before the manager restarted. Seed those first so a reconnecting
@@ -204,7 +215,7 @@ func (s *State) initializeParticipants(intercept *Intercept) {
 	}
 	publishedUnknown := hasPublishedPod && publishedKey == ""
 	prunedPublished := false
-	for _, key := range s.staleServiceParticipantKeys(intercept) {
+	for _, key := range s.staleServiceParticipantKeysWithSelection(intercept, selected, selectionKnown) {
 		prunedPublished = prunedPublished || key == publishedKey
 		delete(intercept.participants, key)
 	}
@@ -332,10 +343,10 @@ func serviceParticipantsFromWorkloads(workloads []k8sapi.Workload) map[string]*i
 	return selected
 }
 
-func (s *State) selectedServiceParticipants(intercept *Intercept) (map[string]*interceptParticipant, bool) {
-	workloads, known, err := discoverServiceWorkloads(s.backgroundCtx, intercept.Spec)
+func selectedServiceParticipants(ctx context.Context, intercept *Intercept) (map[string]*interceptParticipant, bool) {
+	workloads, known, err := discoverServiceWorkloads(ctx, intercept.Spec)
 	if err != nil {
-		clog.Debugf(s.backgroundCtx, "Unable to reconcile participants for intercept %q: %v", intercept.Id, err)
+		clog.Debugf(ctx, "Unable to reconcile participants for intercept %q: %v", intercept.Id, err)
 		return nil, false
 	}
 	if !known {
@@ -344,16 +355,7 @@ func (s *State) selectedServiceParticipants(intercept *Intercept) (map[string]*i
 	return serviceParticipantsFromWorkloads(workloads), true
 }
 
-// staleServiceParticipantKeys retains zero-agent workloads only while their
-// templates still match the Service selector.
-func (s *State) staleServiceParticipantKeys(intercept *Intercept) []string {
-	if !serviceScopedIntercept(intercept.Spec) || len(intercept.participants) == 0 {
-		return nil
-	}
-	selected, selectionKnown := s.selectedServiceParticipants(intercept)
-	return s.staleServiceParticipantKeysWithSelection(intercept, selected, selectionKnown)
-}
-
+// Keep zero-agent workloads only while their templates match the Service.
 func (s *State) staleServiceParticipantKeysWithSelection(
 	intercept *Intercept,
 	selected map[string]*interceptParticipant,
@@ -400,7 +402,7 @@ func (s *State) staleServiceParticipantKeysWithSelection(
 // Service. Newly selected workloads are added only by the Service watcher
 // after it has preflighted the exact selection snapshot.
 func (s *State) reconcileServiceParticipants(interceptID string, intercept *Intercept) *Intercept {
-	selected, selectionKnown := s.selectedServiceParticipants(intercept)
+	selected, selectionKnown := selectedServiceParticipants(s.backgroundCtx, intercept)
 	return s.reconcileServiceParticipantsWithSelection(interceptID, intercept, selected, selectionKnown, false)
 }
 
@@ -425,40 +427,42 @@ func (s *State) reconcileServiceParticipantsWithSelection(
 		return intercept
 	}
 	return s.UpdateIntercept(interceptID, func(intercept *Intercept) {
-		if !serviceScopedIntercept(intercept.Spec) {
-			return
-		}
-		added := false
-		published := intercept.publishedServiceParticipant()
-		publishedKey := ""
-		if published != nil {
-			publishedKey = participantKey(published.namespace, published.kind, published.name)
-		}
-		if allowAdds && selectionKnown {
-			for key, participant := range selected {
-				if _, ok := intercept.participants[key]; !ok {
-					if intercept.participants == nil {
-						intercept.participants = make(map[string]*interceptParticipant, len(selected))
-					}
-					intercept.participants[key] = participant
-					added = true
+		s.applyServiceParticipantSelection(intercept, selected, selectionKnown, allowAdds)
+	})
+}
+
+func (s *State) applyServiceParticipantSelection(intercept *Intercept, selected map[string]*interceptParticipant, selectionKnown, allowAdds bool) {
+	if !serviceScopedIntercept(intercept.Spec) {
+		return
+	}
+	added := false
+	published := intercept.publishedServiceParticipant()
+	publishedKey := ""
+	if published != nil {
+		publishedKey = participantKey(published.namespace, published.kind, published.name)
+	}
+	if allowAdds && selectionKnown {
+		for key, participant := range selected {
+			if _, ok := intercept.participants[key]; !ok {
+				if intercept.participants == nil {
+					intercept.participants = make(map[string]*interceptParticipant, len(selected))
 				}
+				intercept.participants[key] = participant
+				added = true
 			}
 		}
-		prunedPublished := false
-		for _, key := range s.staleServiceParticipantKeysWithSelection(intercept, selected, selectionKnown) {
-			prunedPublished = prunedPublished || key == publishedKey
-			delete(intercept.participants, key)
-		}
-		intercept.syncServiceWorkloads()
-		if prunedPublished {
-			intercept.reselectServiceReview()
-		} else if added && intercept.Disposition == rpc.InterceptDispositionType_ACTIVE {
-			intercept.Disposition = rpc.InterceptDispositionType_WAITING
-			intercept.Message = fmt.Sprintf("Waiting for Agent approval from workloads: %s",
-				strings.Join(intercept.pendingParticipants(), ", "))
-		}
-	})
+	}
+	prunedPublished := false
+	for _, key := range s.staleServiceParticipantKeysWithSelection(intercept, selected, selectionKnown) {
+		prunedPublished = prunedPublished || key == publishedKey
+		delete(intercept.participants, key)
+	}
+	intercept.syncServiceWorkloads()
+	if prunedPublished {
+		intercept.reselectServiceReview()
+	} else if added && intercept.Disposition == rpc.InterceptDispositionType_ACTIVE {
+		waitForAgentApproval(intercept)
+	}
 }
 
 func (is *Intercept) publishedServiceParticipant() *interceptParticipant {
